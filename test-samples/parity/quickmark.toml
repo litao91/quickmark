@@ -1,0 +1,4 @@
+# Config used by the markdownlint parity suite (crates/quickmark-cli/tests/parity_tests.rs).
+#
+# Every rule keeps its default, which is intended to match markdownlint's own default, so this file
+# stays empty until a rule genuinely needs a non-default parameter to line up.

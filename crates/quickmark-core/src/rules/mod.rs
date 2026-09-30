@@ -54,6 +54,7 @@ pub mod md055;
 pub mod md056;
 pub mod md058;
 pub mod md059;
+pub mod md060;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleType {
@@ -131,4 +132,5 @@ pub const ALL_RULES: &[Rule] = &[
     md056::MD056,
     md058::MD058,
     md059::MD059,
+    md060::MD060,
 ];

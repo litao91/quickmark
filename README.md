@@ -546,3 +546,4 @@ If no `default` is specified, rules without explicit configuration use `"err"` (
 - **[MD056](docs/rules/md056.md)** *table-column-count* - Table column count
 - **[MD058](docs/rules/md058.md)** *blanks-around-tables* - Tables should be surrounded by blank lines
 - **[MD059](docs/rules/md059.md)** *descriptive-link-text* - Link text should be descriptive
+- **[MD060](docs/rules/md060.md)** *table-column-style* - Table column style

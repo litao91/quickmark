@@ -70,13 +70,17 @@ impl MD010Linter {
                 continue;
             }
 
-            // Find all hard tabs in the line and create violations.
+            // markdownlint matches /\t+/g, so a contiguous run of tabs is a single violation while
+            // tabs separated by other content are reported separately.
+            let mut previous_was_tab = false;
             for (char_index, ch) in line.char_indices() {
-                if ch == '\t' {
+                let is_tab = ch == '\t';
+                if is_tab && !previous_was_tab {
                     let violation =
                         self.create_violation(line_index, char_index, settings.spaces_per_tab);
                     self.violations.push(violation);
                 }
+                previous_was_tab = is_tab;
             }
         }
     }
@@ -260,13 +264,34 @@ mod test {
     }
 
     #[test]
-    fn test_multiple_hard_tabs() {
+    fn test_contiguous_tabs_are_one_violation() {
+        let input = "\t\t\tindented";
+
+        let config = test_config();
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        // markdownlint matches /\t+/g, so a run counts once
+        assert_eq!(1, violations.len());
+    }
+
+    #[test]
+    fn test_separated_tabs_are_separate_violations() {
         let input = "Line with\ttabs\tin\tmultiple places";
 
         let config = test_config();
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
-        assert_eq!(3, violations.len()); // Should report one violation per tab (3 tabs in the line)
+        assert_eq!(3, violations.len());
+    }
+
+    #[test]
+    fn test_hard_tabs_counted_per_run_across_lines() {
+        let input = "first\tline\nno tabs\n\tsecond\tline";
+
+        let config = test_config();
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        assert_eq!(3, violations.len());
     }
 
     #[test]

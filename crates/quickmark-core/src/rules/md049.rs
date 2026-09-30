@@ -49,7 +49,7 @@ static UNDERSCORE_EMPHASIS_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"_([^_\n]+?)_").expect("Invalid underscore emphasis regex"));
 
 // Regex to find code spans (to exclude from emphasis checking)
-static CODE_SPAN_REGEX: Lazy<Regex> =
+pub(crate) static CODE_SPAN_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"`[^`\n]*`").expect("Invalid code span regex"));
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -139,8 +139,7 @@ impl MD049Linter {
         &mut self,
         text: &str,
         start_offset: usize,
-        regex: &Regex,
-        style: DetectedEmphasisStyle,
+        matches: &[(usize, usize, DetectedEmphasisStyle)],
     ) {
         // Find code span ranges to exclude
         let code_span_ranges: Vec<(usize, usize)> = CODE_SPAN_REGEX
@@ -148,9 +147,7 @@ impl MD049Linter {
             .map(|m| (m.start(), m.end()))
             .collect();
 
-        for capture in regex.find_iter(text) {
-            let match_start = capture.start();
-            let match_end = capture.end();
+        for &(match_start, match_end, style) in matches {
 
             // Check if this match overlaps with any code span
             let in_code_span = code_span_ranges
@@ -198,23 +195,27 @@ impl MD049Linter {
                     DetectedEmphasisStyle::Underscore => "underscore",
                 };
 
-                // Convert text offset to byte offset
-                let global_start = start_offset + match_start;
-                let global_end = start_offset + match_end;
+                // markdownlint reports the opening and the closing marker separately, since each is
+                // its own edit; match that so the violation counts agree.
+                let message = format!("Expected: {expected_style}; Actual: {actual_style}");
+                for marker_start in [match_start, match_end - 1] {
+                    let global_start = start_offset + marker_start;
+                    let global_end = global_start + 1;
 
-                let range = tree_sitter::Range {
-                    start_byte: global_start,
-                    end_byte: global_end,
-                    start_point: self.byte_to_point(global_start),
-                    end_point: self.byte_to_point(global_end),
-                };
+                    let range = tree_sitter::Range {
+                        start_byte: global_start,
+                        end_byte: global_end,
+                        start_point: self.byte_to_point(global_start),
+                        end_point: self.byte_to_point(global_end),
+                    };
 
-                self.violations.push(RuleViolation::new(
-                    &MD049,
-                    format!("Expected: {expected_style}; Actual: {actual_style}"),
-                    self.context.file_path.clone(),
-                    range_from_tree_sitter(&range),
-                ));
+                    self.violations.push(RuleViolation::new(
+                        &MD049,
+                        message.clone(),
+                        self.context.file_path.clone(),
+                        range_from_tree_sitter(&range),
+                    ));
+                }
             }
         }
     }
@@ -232,21 +233,23 @@ impl MD049Linter {
 
         // eprintln!("DEBUG MD049: Processing text: '{}'", text);
 
-        // Check for asterisk emphasis
-        self.process_emphasis_matches(
-            &text,
-            start_byte,
-            &ASTERISK_EMPHASIS_REGEX,
-            DetectedEmphasisStyle::Asterisk,
-        );
+        // Both marker kinds have to be considered in a single document-order pass: whichever
+        // emphasis comes first defines the "consistent" style. Running the asterisk regex to
+        // completion first would let a later `*x*` set the style over an earlier `_y_`.
+        let mut matches: Vec<(usize, usize, DetectedEmphasisStyle)> = ASTERISK_EMPHASIS_REGEX
+            .find_iter(&text)
+            .filter(|m| is_plausible_emphasis(&text, m.start(), m.end(), b'*'))
+            .map(|m| (m.start(), m.end(), DetectedEmphasisStyle::Asterisk))
+            .chain(
+                UNDERSCORE_EMPHASIS_REGEX
+                    .find_iter(&text)
+                    .filter(|m| is_plausible_emphasis(&text, m.start(), m.end(), b'_'))
+                    .map(|m| (m.start(), m.end(), DetectedEmphasisStyle::Underscore)),
+            )
+            .collect();
+        matches.sort_by_key(|(start, _, _)| *start);
 
-        // Check for underscore emphasis
-        self.process_emphasis_matches(
-            &text,
-            start_byte,
-            &UNDERSCORE_EMPHASIS_REGEX,
-            DetectedEmphasisStyle::Underscore,
-        );
+        self.process_emphasis_matches(&text, start_byte, &matches);
     }
 
     fn byte_to_point(&self, byte_pos: usize) -> tree_sitter::Point {
@@ -268,6 +271,27 @@ impl MD049Linter {
 
         tree_sitter::Point { row: line, column }
     }
+}
+
+/// Whether a regex hit is plausibly real emphasis rather than an artifact of scanning raw text.
+/// micromark settles this with the full flanking rules; quickmark never parses the inline tree, so
+/// these are the two cheap conditions that remove the common false positives — a `**strong**` run,
+/// which is MD050's business, and markers used as ordinary punctuation, as in `a * b * c`.
+fn is_plausible_emphasis(text: &str, start: usize, end: usize, marker: u8) -> bool {
+    let bytes = text.as_bytes();
+
+    // Not one emphasis inside a longer run of the same marker.
+    if start > 0 && bytes[start - 1] == marker {
+        return false;
+    }
+    if bytes.get(end) == Some(&marker) {
+        return false;
+    }
+
+    // An opener must be followed by content and a closer preceded by it, so whitespace either side
+    // of the enclosed text means these were never delimiter runs.
+    !matches!(bytes.get(start + 1), Some(b' ') | Some(b'\t'))
+        && !matches!(bytes.get(end - 2), Some(b' ') | Some(b'\t'))
 }
 
 impl RuleLinter for MD049Linter {
@@ -379,5 +403,56 @@ mod test {
             .collect();
         // Should find violations for the inconsistent nested emphasis
         assert!(!md049_violations.is_empty());
+    }
+
+    fn md049_messages(input: &str) -> Vec<String> {
+        let config = test_config();
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        linter
+            .analyze()
+            .iter()
+            .filter(|v| v.rule().id == "MD049")
+            .map(|v| v.message().to_string())
+            .collect()
+    }
+
+    // Every expectation below was checked against markdownlint-cli2 v0.23.3 (markdownlint v0.41.1).
+
+    #[test]
+    fn test_reports_both_markers_of_an_offending_emphasis() {
+        let messages = md049_messages("This has *emphasis* and _inconsistent_.");
+        assert_eq!(
+            vec![
+                "Expected: asterisk; Actual: underscore",
+                "Expected: asterisk; Actual: underscore"
+            ],
+            messages.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_consistent_style_follows_document_order() {
+        // The first emphasis in the document sets the style, so `_first_` wins over the later
+        // `*second*` even though the asterisk regex is the one that runs first.
+        let messages = md049_messages("_first_ then *second*");
+        assert_eq!(2, messages.len());
+        assert!(
+            messages
+                .iter()
+                .all(|m| m == "Expected: underscore; Actual: asterisk"),
+            "unexpected messages: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_strong_is_not_counted_as_emphasis() {
+        // `**strong**` is MD050's business, so `_emph_` is the only emphasis and sets the style.
+        assert!(md049_messages("**strong** and _emph_").is_empty());
+    }
+
+    #[test]
+    fn test_spaced_markers_are_not_emphasis() {
+        // Neither `*` is a delimiter run here, so `_real_` sets the style unopposed.
+        assert!(md049_messages("a * b * c and _real_").is_empty());
     }
 }

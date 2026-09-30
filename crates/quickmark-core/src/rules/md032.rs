@@ -71,58 +71,51 @@ impl MD032Linter {
         true // No parent list found, this is top-level
     }
 
-    /// Find the visual end line of the list by examining actual content
-    /// This approach looks at the lines themselves rather than relying solely on tree-sitter boundaries
+    /// Whether a line opens a block that interrupts a paragraph — thematic break, ATX heading or
+    /// code fence — at the first column of its container. Such a line can be neither list item
+    /// content (which has to be indented) nor a lazy continuation, so when tree-sitter folds it
+    /// into the range of the list above it, that trailing line does not belong to the list.
+    fn is_interrupting_block_start(line: &str) -> bool {
+        let after_quote = line.trim_start_matches('>');
+        let content = after_quote.strip_prefix(' ').unwrap_or(after_quote);
+        if content.is_empty() || content.starts_with([' ', '\t']) {
+            return false;
+        }
+
+        if content.starts_with('#') || content.starts_with("```") || content.starts_with("~~~") {
+            return true;
+        }
+
+        content.len() >= 3
+            && (content.chars().all(|c| c == '-')
+                || content.chars().all(|c| c == '*')
+                || content.chars().all(|c| c == '_'))
+    }
+
+    /// Find the last line of the list that carries content, skipping trailing blank lines.
     fn find_visual_end_line(&self, node: &Node) -> usize {
         let start_line = node.start_position().row;
-        let tree_sitter_end_line = node.end_position().row;
+        // tree-sitter end positions are exclusive, so a list that ends at the start of a line does
+        // not include that line. Without this the backward scan walks past the list and latches
+        // onto the first line of whatever block follows it.
+        let end = node.end_position();
+        let last_line = if end.column == 0 {
+            end.row.saturating_sub(1)
+        } else {
+            end.row
+        }
+        .max(start_line);
 
-        // Borrow lines to examine content
         let lines = self.context.lines.borrow();
 
-        // For blockquoted lists, we need to handle them differently
-        // If this is a blockquoted list, trust tree-sitter more
-        if lines
-            .get(start_line)
-            .is_some_and(|line| line.trim_start().starts_with('>'))
-        {
-            // This is a blockquoted list - be more conservative with tree-sitter boundaries
-            // but still exclude trailing blank blockquote lines
-            for line_idx in (start_line..=tree_sitter_end_line).rev() {
-                if line_idx < lines.len() {
-                    let line = &lines[line_idx];
-                    let after_quote = line.trim_start_matches('>').trim();
-
-                    // If this line has meaningful content within the blockquote
-                    if !after_quote.is_empty() {
-                        return line_idx;
-                    }
-                }
-            }
-        } else {
-            // Regular list - use the existing content-based detection
-            for line_idx in (start_line..=tree_sitter_end_line).rev() {
-                if line_idx < lines.len() {
-                    let line = &lines[line_idx];
-                    let trimmed = line.trim();
-
-                    // If this line has content and looks like it could be part of a list item
-                    if !trimmed.is_empty() {
-                        // Check if it's definitely NOT a block element
-                        let is_thematic_break = trimmed.len() >= 3
-                            && (trimmed.chars().all(|c| c == '-')
-                                || trimmed.chars().all(|c| c == '*')
-                                || trimmed.chars().all(|c| c == '_'));
-
-                        let is_block_element = trimmed.starts_with('#') || // headings
-                            trimmed.starts_with("```") || trimmed.starts_with("~~~") || // code blocks
-                            is_thematic_break; // thematic breaks
-
-                        if !is_block_element {
-                            return line_idx;
-                        }
-                    }
-                }
+        for line_idx in (start_line..=last_line).rev() {
+            let Some(line) = lines.get(line_idx) else {
+                continue;
+            };
+            if !self.is_line_blank_cached(line_idx, &lines)
+                && !Self::is_interrupting_block_start(line)
+            {
+                return line_idx;
             }
         }
 
@@ -484,6 +477,85 @@ More text";
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         // List spans entire document - no violations expected
+        assert_eq!(0, violations.len());
+    }
+
+    #[test]
+    fn test_no_violation_before_multiline_paragraph() {
+        let config = test_config_default();
+
+        let input = "- a
+- b
+
+para one
+para two
+
+tail";
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        assert_eq!(0, violations.len());
+    }
+
+    #[test]
+    fn test_no_violation_before_multiline_blockquote() {
+        let config = test_config_default();
+
+        let input = "- a
+- b
+
+> quote one
+> quote two
+
+tail";
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        assert_eq!(0, violations.len());
+    }
+
+    #[test]
+    fn test_no_violation_nested_list_before_blockquote() {
+        let config = test_config_default();
+
+        let input = "- a
+  - nested
+
+> quote
+
+tail";
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        assert_eq!(0, violations.len());
+    }
+
+    #[test]
+    fn test_no_violation_item_ending_with_indented_code_fence() {
+        let config = test_config_default();
+
+        let input = "- item
+
+  ```
+  code
+  ```
+
+More text";
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        // The indented closing fence is the list's real last line, not a following block
+        assert_eq!(0, violations.len());
+    }
+
+    #[test]
+    fn test_no_violation_multiple_blank_lines_after_list() {
+        let config = test_config_default();
+
+        let input = "- a
+- b
+
+
+para one
+para two";
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
         assert_eq!(0, violations.len());
     }
 }

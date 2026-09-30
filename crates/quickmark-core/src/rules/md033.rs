@@ -16,9 +16,13 @@ pub struct MD033InlineHtmlTable {
     pub allowed_elements: Vec<String>,
 }
 
-// Memoized regex patterns for HTML tag detection
+// Memoized regex patterns for HTML tag detection.
+// What may follow the tag name is what keeps autolinks out: CommonMark allows only whitespace or
+// `/` there, so `<https://example.com>` and `<foo@example.com>` are links, not HTML, and
+// markdownlint never reports them here. (`regex` has no lookahead, hence the optional group.)
+// Tag names may contain hyphens, as in `<ne-text>`.
 static HTML_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)[^>]*/?>").expect("Invalid HTML tag regex")
+    Regex::new(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)(?:[\s/][^>]*)?>").expect("Invalid HTML tag regex")
 });
 
 static CODE_SPAN_REGEX: Lazy<Regex> =
@@ -493,5 +497,56 @@ Content
         assert_eq!(md033_violations.len(), 2);
         assert!(md033_violations.iter().any(|v| v.message().contains("p")));
         assert!(md033_violations.iter().any(|v| v.message().contains("div")));
+    }
+
+    // Both expectations below were checked against markdownlint-cli2 v0.23.3.
+
+    #[test]
+    fn test_autolinks_are_not_inline_html() {
+        let config = test_config_default();
+        let input = "See <https://example.com/a?b=c&d=e> and <foo@example.com> here.";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md033_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD033")
+            .collect();
+
+        // CommonMark allows only whitespace or `/` after a tag name, so these are links
+        assert_eq!(md033_violations.len(), 0);
+    }
+
+    #[test]
+    fn test_real_tags_still_reported_beside_autolinks() {
+        let config = test_config_default();
+        let input = "<https://example.com> then <div>raw</div> and <br/>";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md033_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD033")
+            .collect();
+
+        assert_eq!(md033_violations.len(), 2);
+    }
+
+    #[test]
+    fn test_hyphenated_tag_names_are_html() {
+        let config = test_config_default();
+        let input = "<ne-text>content</ne-text> and <my-widget/>";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md033_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD033")
+            .collect();
+
+        // markdownlint reports ne-text and my-widget, not the closing tag
+        assert_eq!(md033_violations.len(), 2);
+        assert!(md033_violations.iter().any(|v| v.message().contains("ne-text")));
+        assert!(md033_violations.iter().any(|v| v.message().contains("my-widget")));
     }
 }

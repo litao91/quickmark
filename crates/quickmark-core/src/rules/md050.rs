@@ -8,6 +8,8 @@ use crate::{
     rules::{Rule, RuleType},
 };
 
+use super::md049::CODE_SPAN_REGEX;
+
 // MD050-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
 pub enum StrongStyle {
@@ -107,6 +109,23 @@ impl MD050Linter {
         let mut i = 0;
         let chars: Vec<char> = text.chars().collect();
 
+        // Byte offset of each char, so a marker found at char `i` can be tested against the
+        // code span ranges below without re-walking the string.
+        let mut char_offsets: Vec<usize> = Vec::with_capacity(chars.len() + 1);
+        let mut acc = 0;
+        for c in &chars {
+            char_offsets.push(acc);
+            acc += c.len_utf8();
+        }
+        char_offsets.push(acc);
+
+        // Markers inside a code span are literal text, not emphasis, so they must neither set nor
+        // violate the document's consistent style.
+        let code_span_ranges: Vec<(usize, usize)> = CODE_SPAN_REGEX
+            .find_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+
         while i < chars.len() {
             if i + 1 < chars.len() {
                 let current_char = chars[i];
@@ -116,6 +135,16 @@ impl MD050Linter {
                 if (current_char == '*' && next_char == '*')
                     || (current_char == '_' && next_char == '_')
                 {
+                    let marker_start = char_offsets[i];
+                    let marker_end = char_offsets[i + 2];
+                    if code_span_ranges
+                        .iter()
+                        .any(|(s, e)| marker_start < *e && marker_end > *s)
+                    {
+                        i += 2;
+                        continue;
+                    }
+
                     // Skip if this is part of a longer sequence that would make it invalid
                     // e.g., ____ should not be detected as __ + __
                     if i + 2 < chars.len() && chars[i + 2] == current_char {
@@ -410,5 +439,38 @@ mod test {
 
         // Should find 2 violations for the inconsistent strong emphasis (opening and closing)
         assert_eq!(md050_violations.len(), 2);
+    }
+
+    #[test]
+    fn test_code_span_does_not_set_consistent_style() {
+        let config = test_config_with_style(StrongStyle::Consistent);
+        let input = "# `a__b`
+
+**bold**";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md050_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD050")
+            .collect();
+
+        // The only real strong emphasis is `**bold**`, so it defines the style and nothing violates
+        assert_eq!(md050_violations.len(), 0);
+    }
+
+    #[test]
+    fn test_code_span_marker_is_not_a_violation() {
+        let config = test_config_with_style(StrongStyle::Consistent);
+        let input = "**bold** and `__literal__`";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md050_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD050")
+            .collect();
+
+        assert_eq!(md050_violations.len(), 0);
     }
 }

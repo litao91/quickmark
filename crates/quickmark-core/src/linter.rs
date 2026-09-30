@@ -326,7 +326,7 @@ impl MultiRuleLinter {
         // Create rule linters for active rules only
         let linters = active_rules
             .iter()
-            .map(|r| ((r.new_linter)(context.clone())))
+            .map(|r| (r.new_linter)(context.clone()))
             .collect();
 
         Self {

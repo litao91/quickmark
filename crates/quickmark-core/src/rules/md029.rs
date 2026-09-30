@@ -139,7 +139,7 @@ impl MD029Linter {
         for logical_list in logical_lists {
             match configured_style {
                 OlPrefixStyle::OneOrOrdered => {
-                    self.check_list_with_document_style(&logical_list);
+                    self.check_list_one_or_ordered(&logical_list);
                 }
                 OlPrefixStyle::One => {
                     self.check_list_with_fixed_style(&logical_list, OlPrefixStyle::One);
@@ -248,53 +248,34 @@ impl MD029Linter {
         next != current + 1
     }
 
-    /// Check if a list follows a valid ordered pattern (either 1,2,3... or 0,1,2...)
-    fn is_valid_ordered_pattern(&self, list_items_with_values: &[(Node, u32)]) -> bool {
-        if list_items_with_values.is_empty() {
-            return true; // Empty list is vacuously valid
-        }
-
-        let start_value = list_items_with_values[0].1;
-
-        // Valid ordered patterns must start with 0 or 1 (not arbitrary numbers like 5)
-        if start_value > 1 {
-            return false;
-        }
-
-        // Check if all values follow the expected sequence from start_value
-        let expected_sequence = (0..list_items_with_values.len()).map(|i| start_value + i as u32);
-        list_items_with_values
-            .iter()
-            .map(|(_, value)| *value)
-            .eq(expected_sequence)
-    }
-
-    fn check_list_with_document_style(&mut self, list_items_with_values: &[(Node, u32)]) {
-        // Track if this is the first multi-item list (style-establishing list)
-        let is_first_multi_item_list =
-            self.document_style.is_none() && list_items_with_values.len() >= 2;
-
-        // For OneOrOrdered mode, establish document-wide style from the first logical list with 2+ items
-        if is_first_multi_item_list {
-            // Determine document style from the first multi-item list
+    /// Validate a list under the `one_or_ordered` style.
+    ///
+    /// markdownlint decides the style per list, never per document: a list is "ordered" when its
+    /// second item is not 1 (or it starts at 0), and "one" otherwise. Latching a document-wide
+    /// style from the first multi-item list makes an early all-`1.` list condemn every later
+    /// 1/2/3 list.
+    fn check_list_one_or_ordered(&mut self, list_items_with_values: &[(Node, u32)]) {
+        let shows_numbering_pattern = list_items_with_values.len() >= 2;
+        if shows_numbering_pattern {
             let first_value = list_items_with_values[0].1;
             let second_value = list_items_with_values[1].1;
 
             if second_value != 1 || first_value == 0 {
-                // Ordered style - also detect if it's zero-based
                 self.document_style = Some(OlPrefixStyle::Ordered);
                 self.is_zero_based = first_value == 0;
             } else {
-                // One style (1/1/...)
                 self.document_style = Some(OlPrefixStyle::One);
-                self.is_zero_based = false; // One style is never zero-based
+                self.is_zero_based = false;
             }
+        } else {
+            // A single item shows no pattern, so markdownlint holds it to "1".
+            self.document_style = Some(OlPrefixStyle::One);
+            self.is_zero_based = false;
         }
 
-        // For single-item lists or before style is established, assume ordered style and enforce proper starts
-        let effective_style = self.document_style.unwrap_or(OlPrefixStyle::Ordered);
+        let effective_style = self.document_style.unwrap_or(OlPrefixStyle::One);
 
-        // For document-wide style, each logical list should follow the style
+        // Each logical list is validated against the style it itself established
         match effective_style {
             OlPrefixStyle::One => {
                 // One style: all items should be "1."
@@ -321,55 +302,9 @@ impl MD029Linter {
                 if !list_items_with_values.is_empty() {
                     let list_start_value = list_items_with_values[0].1;
 
-                    // Special case: single-item lists should follow "one" style (start at 1)
-                    // regardless of document's ordered style
-                    if list_items_with_values.len() == 1 && !is_first_multi_item_list {
-                        // Single item should use "1" regardless of ordered document style
-                        let expected_value = 1;
-                        let actual_value = list_items_with_values[0].1;
-
-                        if actual_value != expected_value {
-                            let message = format!(
-                                "{} [Expected: {}; Actual: {}; Style: {}]",
-                                MD029.description,
-                                expected_value,
-                                actual_value,
-                                "1/1/1" // Single items use one style
-                            );
-
-                            self.violations.push(RuleViolation::new(
-                                &MD029,
-                                message,
-                                self.context.file_path.clone(),
-                                range_from_tree_sitter(&list_items_with_values[0].0.range()),
-                            ));
-                        }
-                        return; // Early return for single items
-                    }
-
-                    // For ordered style, allow both 1-based and 0-based patterns
-                    let expected_start = if is_first_multi_item_list {
-                        // This is the first multi-item list establishing style - allow natural start (0 or 1)
-                        list_start_value
-                    } else {
-                        // For subsequent lists in ordered style, allow valid ordered patterns:
-                        // - 1-based: 1,2,3...
-                        // - 0-based: 0,1,2...
-                        // Check if this list follows a valid ordered pattern
-                        let is_valid_pattern =
-                            self.is_valid_ordered_pattern(list_items_with_values);
-                        let is_zero_based_pattern = list_start_value == 0 && is_valid_pattern;
-
-                        // Special case: if document was established as zero-based,
-                        // separated lists cannot use zero-based patterns (must start at 1)
-                        if is_zero_based_pattern && self.is_zero_based {
-                            1 // Force separated lists to start at 1 in zero-based documents
-                        } else if is_valid_pattern {
-                            list_start_value // Allow the natural start if it's a valid ordered pattern
-                        } else {
-                            1 // Default to 1-based if not a valid pattern
-                        }
-                    };
+                    // markdownlint starts an ordered list at 1, except when the list itself begins
+                    // at 0, which makes it a 0/1/2 sequence. Nothing is remembered across lists.
+                    let expected_start = if list_start_value == 0 { 0 } else { 1 };
 
                     // Check if the first item in this logical list starts with the correct value
                     let mut expected_value = expected_start;
@@ -549,40 +484,27 @@ mod test {
         assert!(violations[0].message().contains("Style: 1/2/3"));
     }
 
-    #[test]
-    fn test_one_or_ordered_document_consistency() {
-        // Edge case: Document with all-ones list first should make ALL lists use ones style
-        let input = "# First (sets style)\n\n1. One\n1. One\n1. One\n\n# Second (must follow)\n\n1. Should pass\n2. Should violate\n3. Should violate\n";
+    /// Lint with the default `one_or_ordered` style and return the violation messages.
+    fn one_or_ordered(input: &str) -> Vec<String> {
         let config = test_config_style(OlPrefixStyle::OneOrOrdered);
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
-
-        assert_eq!(
-            2,
-            violations.len(),
-            "Once 'one' style is established, all lists must follow it"
-        );
-        assert!(violations[0].message().contains("Expected: 1; Actual: 2"));
-        assert!(violations[1].message().contains("Expected: 1; Actual: 3"));
-        // Should show 'one' style was detected
-        assert!(violations[0].message().contains("Style: 1/1/1"));
+        violations.iter().map(|v| v.message().to_string()).collect()
     }
 
     #[test]
-    fn test_ordered_first_then_ones_style_violation() {
-        // Edge case: Document with ordered list first should make ones lists violate
-        let input = "# First (sets ordered style)\n\n1. First\n2. Second\n3. Third\n\n# Second (violates)\n\n1. Should violate\n1. Should violate\n";
-        let config = test_config_style(OlPrefixStyle::OneOrOrdered);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
+    fn test_ones_list_then_ordered_list_are_both_valid() {
+        // markdownlint judges every list on its own, so an all-`1.` list says nothing about a
+        // later 1/2/3 list. This used to latch a document-wide "one" style and flag the second.
+        let input = "# First (sets style)\n\n1. One\n1. One\n1. One\n\n# Second (must follow)\n\n1. Should pass\n2. Should violate\n3. Should violate\n";
+        assert!(one_or_ordered(input).is_empty());
+    }
 
-        assert_eq!(
-            1,
-            violations.len(),
-            "Ones style should violate when ordered style was established"
-        );
-        assert!(violations[0].message().contains("Expected: 2; Actual: 1"));
-        assert!(violations[0].message().contains("Style: 1/2/3"));
+    #[test]
+    fn test_ordered_list_then_ones_list_are_both_valid() {
+        // The mirror image: an ordered list first does not force a later all-`1.` list to increment.
+        let input = "# First (sets ordered style)\n\n1. First\n2. Second\n3. Third\n\n# Second (violates)\n\n1. Should violate\n1. Should violate\n";
+        assert!(one_or_ordered(input).is_empty());
     }
 
     #[test]
@@ -601,85 +523,41 @@ mod test {
     }
 
     #[test]
-    fn test_zero_based_document_separated_lists() {
-        // Edge case: Zero-based document should still have separated lists start at 1
+    fn test_zero_based_lists_are_valid_independently() {
+        // A 0/1/2 list is "ordered" starting at 0, and a later 0/1 list is judged the same way on
+        // its own rather than being forced to start at 1 by the earlier list.
         let input = "# First (zero-based)\n\n0. Zero\n1. One\n2. Two\n\n# Second (should start at 1)\n\n0. Should violate\n1. Should violate\n";
-        let config = test_config_style(OlPrefixStyle::OneOrOrdered);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // The second list should start at 1,2 not 0,1 even though document is zero-based
-        assert_eq!(
-            2,
-            violations.len(),
-            "Zero-based documents should have separated lists start at 1"
-        );
-        assert!(violations[0].message().contains("Expected: 1; Actual: 0"));
-        assert!(violations[1].message().contains("Expected: 2; Actual: 1"));
+        assert!(one_or_ordered(input).is_empty());
     }
 
     #[test]
     fn test_mixed_single_and_multi_item_lists() {
-        // Edge case: Mix of single and multi-item lists in one_or_ordered mode
+        // Only the single-item list that does not start at 1 is wrong; the all-`1.` list and the
+        // 1/2 list are each valid in their own right.
         let input = "# Mix test\n\n5. Single wrong start\n\ntext\n\n1. Multi start\n1. Multi second\n1. Multi third\n\ntext\n\n1. Single correct\n\ntext\n\n1. Multi after\n2. Should violate (ones style established)\n";
-        let config = test_config_style(OlPrefixStyle::OneOrOrdered);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert!(
-            violations.len() >= 2,
-            "Should catch single list wrong start and style violations"
-        );
-        // First violation: single list should start at 1, not 5
-        assert!(violations
-            .iter()
-            .any(|v| v.message().contains("Expected: 1; Actual: 5")));
-        // Later violation: after 'ones' style established, ordered list should violate
-        assert!(violations
-            .iter()
-            .any(|v| v.message().contains("Expected: 1; Actual: 2")
-                && v.message().contains("Style: 1/1/1")));
+        let messages = one_or_ordered(input);
+        assert_eq!(1, messages.len(), "unexpected: {messages:?}");
+        assert!(messages[0].contains("Expected: 1; Actual: 5"));
     }
 
     #[test]
     fn test_large_numbers_separated_lists() {
-        // Edge case: Large numbers in separated lists should still start at 1
+        // Both lists increment, so both are "ordered" — and an ordered list starts at 1 (or 0),
+        // never at an arbitrary number. Three violations for 98/99/100, two for 200/201.
         let input = "# First\n\n98. Large start\n99. Large next\n100. Large third\n\n# Second\n\n200. Should be 1\n201. Should be 2\n";
-        let config = test_config_style(OlPrefixStyle::OneOrOrdered);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(
-            2,
-            violations.len(),
-            "Large numbered separated lists should start at 1"
-        );
-        assert!(violations[0].message().contains("Expected: 1; Actual: 200"));
-        assert!(violations[1].message().contains("Expected: 2; Actual: 201"));
-        assert!(violations[0].message().contains("Style: 1/2/3")); // Generic ordered pattern
+        let messages = one_or_ordered(input);
+        assert_eq!(5, messages.len(), "unexpected: {messages:?}");
+        assert!(messages.iter().any(|m| m.contains("Actual: 98")));
+        assert!(messages.iter().any(|m| m.contains("Actual: 200")));
+        assert!(messages.iter().all(|m| m.contains("Style: 1/2/3")));
     }
 
     #[test]
-    fn test_nested_lists_follow_document_style() {
-        // Edge case: Nested lists must follow the document-wide style in one_or_ordered mode
+    fn test_nested_lists_do_not_inherit_outer_style() {
+        // A nested 1/2 list inside an all-`1.` parent is ordered in its own right, and so is a
+        // later 1/2 list at the top level.
         let input = "# Test\n\n1. Parent one\n1. Parent one\n   1. Nested ordered\n   2. Nested ordered (violates 'one' style)\n1. Parent one\n\n# Separate\n\n1. Should not violate\n2. Should violate (violates 'one' style)\n";
-        let config = test_config_style(OlPrefixStyle::OneOrOrdered);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Once 'one' style is established by parent, nested and separate lists must follow it
-        assert_eq!(
-            2,
-            violations.len(),
-            "Nested and separate lists must follow document-wide style"
-        );
-        // Both violations should be expecting 1 but getting 2 (violating 'one' style)
-        assert!(violations
-            .iter()
-            .any(|v| v.message().contains("Expected: 1; Actual: 2")));
-        assert!(violations
-            .iter()
-            .all(|v| v.message().contains("Style: 1/1/1")));
+        assert!(one_or_ordered(input).is_empty());
     }
 
     #[test]
@@ -968,20 +846,9 @@ mod test {
     }
 
     #[test]
-    fn test_document_wide_one_style() {
-        // First list establishes "one" style (1/1/1)
-        // Subsequent lists should also use all 1s
+    fn test_later_list_is_not_bound_by_earlier_style() {
         let input = "# First section\n\n1. First item\n1. Second item\n1. Third item\n\n# Second section\n\n1. Should pass\n2. Should violate - expected 1\n";
-        let config = test_config_style(OlPrefixStyle::OneOrOrdered);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(
-            1,
-            violations.len(),
-            "Should have 1 violation for not following 'one' style"
-        );
-        assert!(violations[0].message().contains("Expected: 1; Actual: 2"));
+        assert!(one_or_ordered(input).is_empty());
     }
 
     #[test]

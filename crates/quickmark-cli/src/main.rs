@@ -1,9 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
 use glob::glob;
-use ignore::{
-    types::TypesBuilder, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState,
-};
+use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 use quickmark_core::config::{
     config_from_env_path_or_default, discover_config_or_default, QuickmarkConfig, RuleSeverity,
 };
@@ -40,8 +38,7 @@ impl ParallelVisitor for FileCollector {
     fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> WalkState {
         if let Ok(entry) = entry {
             let path = entry.path();
-            if path.is_file() {
-                // The type filtering in WalkBuilder should ensure we only get markdown files
+            if path.is_file() && is_markdown_file(path) {
                 if let Ok(mut files) = self.files.lock() {
                     files.push(path.to_path_buf());
                 }
@@ -85,17 +82,15 @@ fn discover_markdown_files(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
                 files.lock().unwrap().push(path);
             }
         } else if path.is_dir() {
-            let mut types_builder = TypesBuilder::new();
-            types_builder.add_defaults();
-            types_builder.select("markdown");
-            let types = types_builder.build()?;
-
+            // No `types` filter here: `is_markdown_file` is the single definition of what counts as
+            // markdown, so that a directory walk accepts exactly the same files as an explicit path
+            // or a glob. The `ignore` markdown type is case-sensitive and also covers `.mdx` and
+            // `.mdwn`, which the other two branches reject.
             let walker = WalkBuilder::new(&path)
                 .hidden(false)
                 .git_ignore(true)
                 .git_exclude(true)
                 .git_global(true)
-                .types(types)
                 .build_parallel();
 
             let mut builder = FileCollectorBuilder::new(Arc::clone(&files));

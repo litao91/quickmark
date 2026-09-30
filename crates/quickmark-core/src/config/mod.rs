@@ -50,6 +50,7 @@ pub use crate::rules::md053::MD053LinkImageReferenceDefinitionsTable;
 pub use crate::rules::md054::MD054LinkImageStyleTable;
 pub use crate::rules::md055::{MD055TablePipeStyleTable, TablePipeStyle};
 pub use crate::rules::md059::MD059DescriptiveLinkTextTable;
+pub use crate::rules::md060::{MD060TableColumnStyleTable, TableColumnStyle};
 
 #[derive(Debug, Default, PartialEq, Clone, Deserialize)]
 pub struct LintersSettingsTable {
@@ -149,6 +150,9 @@ pub struct LintersSettingsTable {
     #[serde(rename = "descriptive-link-text")]
     #[serde(default)]
     pub descriptive_link_text: MD059DescriptiveLinkTextTable,
+    #[serde(rename = "table-column-style")]
+    #[serde(default)]
+    pub table_column_style: MD060TableColumnStyleTable,
 }
 
 #[derive(Debug, Default, PartialEq, Clone, Deserialize)]
@@ -427,7 +431,8 @@ mod test {
         MD046CodeBlockStyleTable, MD048CodeFenceStyleTable, MD049EmphasisStyleTable,
         MD050StrongStyleTable, MD051LinkFragmentsTable, MD052ReferenceLinksImagesTable,
         MD053LinkImageReferenceDefinitionsTable, MD054LinkImageStyleTable,
-        MD055TablePipeStyleTable, MD059DescriptiveLinkTextTable, RuleSeverity,
+        MD055TablePipeStyleTable, MD059DescriptiveLinkTextTable, MD060TableColumnStyleTable,
+        RuleSeverity,
     };
 
     use super::{normalize_severities, QuickmarkConfig};
@@ -528,6 +533,7 @@ mod test {
                 link_image_style: MD054LinkImageStyleTable::default(),
                 table_pipe_style: MD055TablePipeStyleTable::default(),
                 descriptive_link_text: MD059DescriptiveLinkTextTable::default(),
+                table_column_style: MD060TableColumnStyleTable::default(),
             },
         });
 
