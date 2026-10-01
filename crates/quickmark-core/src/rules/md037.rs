@@ -9,7 +9,7 @@ use crate::{
     rules::{Rule, RuleLinter, RuleType},
 };
 
-use super::md049::literal_ranges;
+use super::md049::{literal_ranges, marker_in_literal};
 
 // Regex patterns to find emphasis markers with spaces
 static ASTERISK_EMPHASIS_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -114,16 +114,15 @@ impl MD037Linter {
                 capture.get(4),
                 capture.get(5),
             ) {
-                // Check if this match overlaps with any code span
-                let match_start = capture.get(0).unwrap().start();
-                let match_end = capture.get(0).unwrap().end();
-
-                let in_literal = literal_spans.iter().any(|(span_start, span_end)| {
-                    match_start < *span_end && match_end > *span_start
-                });
-
-                if in_literal {
-                    continue; // Skip this match as it's inside literal content
+                // Only the markers have to sit outside literal content; what is between them may
+                // contain code spans, links or math.
+                if marker_in_literal(
+                    &literal_spans,
+                    opening_marker.start(),
+                    opening_marker.end(),
+                ) || marker_in_literal(&literal_spans, closing_marker.start(), closing_marker.end())
+                {
+                    continue;
                 }
 
                 if is_escaped(text, opening_marker.start())

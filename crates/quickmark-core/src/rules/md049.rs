@@ -42,11 +42,14 @@ impl Default for MD049EmphasisStyleTable {
 }
 
 // Regex patterns to find emphasis
+// The content class allows newlines: emphasis routinely spans a wrapped line, and excluding `\n`
+// made every such emphasis invisible. Runaway matches across a paragraph are held off by
+// `is_plausible_emphasis`, which rejects markers that are not adjacent to content.
 static ASTERISK_EMPHASIS_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\*([^*\n]+?)\*").expect("Invalid asterisk emphasis regex"));
+    Lazy::new(|| Regex::new(r"\*([^*]+?)\*").expect("Invalid asterisk emphasis regex"));
 
 static UNDERSCORE_EMPHASIS_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"_([^_\n]+?)_").expect("Invalid underscore emphasis regex"));
+    Lazy::new(|| Regex::new(r"_([^_]+?)_").expect("Invalid underscore emphasis regex"));
 
 // Regex to find code spans (to exclude from emphasis checking). The inline tree is never parsed, so
 // there are no code_span nodes to consult. Runs of one, two or three backticks are matched longest
@@ -72,6 +75,13 @@ pub(crate) static MATH_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\$\$[\s\S]*?\$\$|\$(?:[^$\s\n]\$|[^$\s\n][^$\n]*[^$\s\n]\$)")
         .expect("Invalid math regex")
 });
+
+/// Whether a delimiter marker at `start..end` falls inside literal content. Only the markers
+/// matter: an emphasis that merely *contains* a code span, link or math region is still real
+/// emphasis, so `_170 cases, 20 deep-dived `161570`_` must not be discarded whole.
+pub(crate) fn marker_in_literal(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
+    spans.iter().any(|(s, e)| start < *e && end > *s)
+}
 
 /// Byte ranges within `text` that hold literal content, where emphasis markers do not count.
 pub(crate) fn literal_ranges(text: &str) -> Vec<(usize, usize)> {
@@ -132,36 +142,22 @@ impl MD049Linter {
 
     fn is_intraword_emphasis(
         &self,
-        _text: &str,
-        start_offset: usize,
+        text: &str,
         emphasis_start: usize,
         emphasis_end: usize,
     ) -> bool {
-        let emphasis_global_start = start_offset + emphasis_start;
-        let emphasis_global_end = start_offset + emphasis_end;
-        let source = self.context.get_document_content();
+        // `emphasis_start` and `emphasis_end` are byte offsets into `text`. Indexing the document's
+        // characters with a byte offset lands on the wrong character as soon as anything upstream is
+        // multi-byte — an em dash alone was enough to make real emphasis look intraword.
+        let before_is_word_char = text[..emphasis_start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
 
-        // Check character before emphasis start
-        let before_is_word_char = if emphasis_global_start > 0 {
-            if let Some(ch) = source.chars().nth(emphasis_global_start - 1) {
-                ch.is_alphanumeric() || ch == '_'
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // Check character after emphasis end
-        let after_is_word_char = if emphasis_global_end < source.len() {
-            if let Some(ch) = source.chars().nth(emphasis_global_end) {
-                ch.is_alphanumeric() || ch == '_'
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let after_is_word_char = text[emphasis_end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
 
         before_is_word_char || after_is_word_char
     }
@@ -178,16 +174,16 @@ impl MD049Linter {
         for &(match_start, match_end, style) in matches {
 
             // Check if this match overlaps with any code span
-            let in_literal = literal_spans
-                .iter()
-                .any(|(span_start, span_end)| match_start < *span_end && match_end > *span_start);
-
-            if in_literal {
-                continue; // Skip this match as it's inside literal content
+            // Only the markers have to sit outside literal content; what is between them may
+            // contain code spans, links or math.
+            if marker_in_literal(&literal_spans, match_start, match_start + 1)
+                || marker_in_literal(&literal_spans, match_end - 1, match_end)
+            {
+                continue;
             }
 
             // Check if this is intraword emphasis
-            if self.is_intraword_emphasis(text, start_offset, match_start, match_end) {
+            if self.is_intraword_emphasis(text, match_start, match_end) {
                 // Intraword emphasis is always allowed regardless of configured style
                 continue;
             }
@@ -518,5 +514,33 @@ mod test {
         assert!(messages
             .iter()
             .all(|m| m == "Expected: underscore; Actual: asterisk"));
+    }
+
+    #[test]
+    fn test_multibyte_characters_do_not_shift_the_intraword_check() {
+        // The em dash is three bytes but one character. Indexing characters with a byte offset put
+        // the intraword test on the wrong character and discarded both emphases entirely.
+        let messages = md049_messages("plain \u{2014} text _a_ and *b*");
+        assert_eq!(2, messages.len(), "unexpected: {messages:?}");
+        assert!(messages
+            .iter()
+            .all(|m| m == "Expected: underscore; Actual: asterisk"));
+    }
+
+    #[test]
+    fn test_emphasis_spanning_a_wrapped_line() {
+        let messages = md049_messages("Some *emphasis\nspanning lines* and _other_");
+        assert_eq!(2, messages.len(), "unexpected: {messages:?}");
+        assert!(messages
+            .iter()
+            .all(|m| m == "Expected: asterisk; Actual: underscore"));
+    }
+
+    #[test]
+    fn test_emphasis_may_contain_a_code_span() {
+        // Only the markers have to sit outside literal content, not the whole span
+        let messages =
+            md049_messages("_170 case(s) slower than baseline `161570`, 20 deep-dived_\n\nlater *emph* here");
+        assert_eq!(2, messages.len(), "unexpected: {messages:?}");
     }
 }
