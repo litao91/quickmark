@@ -76,8 +76,7 @@ impl MD060Linter {
     /// glyphs count double and two rows that look aligned really compare equal. This mirrors
     /// markdownlint, which uses `string-width` for the same reason.
     fn effective_column(&self, line: &str, byte_column: usize) -> usize {
-        line.get(..byte_column)
-            .map_or(0, UnicodeWidthStr::width)
+        line.get(..byte_column).map_or(0, UnicodeWidthStr::width)
     }
 
     /// Every pipe after the header row that does not sit at one of the header's columns.
@@ -145,13 +144,15 @@ impl MD060Linter {
                     if left == 0 {
                         compact.push(PipeError {
                             node: pipe,
-                            message: "Table pipe is missing space to the left for style \"compact\"",
+                            message:
+                                "Table pipe is missing space to the left for style \"compact\"",
                         });
                     } else {
                         if left > 1 {
                             compact.push(PipeError {
                                 node: pipe,
-                                message: "Table pipe has extra space to the left for style \"compact\"",
+                                message:
+                                    "Table pipe has extra space to the left for style \"compact\"",
                             });
                         }
                         tight.push(PipeError {
@@ -170,13 +171,15 @@ impl MD060Linter {
                     if right == 0 {
                         compact.push(PipeError {
                             node: pipe,
-                            message: "Table pipe is missing space to the right for style \"compact\"",
+                            message:
+                                "Table pipe is missing space to the right for style \"compact\"",
                         });
                     } else {
                         if right > 1 {
                             compact.push(PipeError {
                                 node: pipe,
-                                message: "Table pipe has extra space to the right for style \"compact\"",
+                                message:
+                                    "Table pipe has extra space to the right for style \"compact\"",
                             });
                         }
                         tight.push(PipeError {
@@ -193,9 +196,18 @@ impl MD060Linter {
 
     fn check_table(&mut self, table: &Node) {
         let config = &self.context.config.linters.settings.table_column_style;
-        let aligned_allowed = matches!(config.style, TableColumnStyle::Any | TableColumnStyle::Aligned);
-        let compact_allowed = matches!(config.style, TableColumnStyle::Any | TableColumnStyle::Compact);
-        let tight_allowed = matches!(config.style, TableColumnStyle::Any | TableColumnStyle::Tight);
+        let aligned_allowed = matches!(
+            config.style,
+            TableColumnStyle::Any | TableColumnStyle::Aligned
+        );
+        let compact_allowed = matches!(
+            config.style,
+            TableColumnStyle::Any | TableColumnStyle::Compact
+        );
+        let tight_allowed = matches!(
+            config.style,
+            TableColumnStyle::Any | TableColumnStyle::Tight
+        );
 
         let mut cursor = table.walk();
         let children: Vec<Node> = table.children(&mut cursor).collect();
@@ -258,7 +270,8 @@ impl MD060Linter {
         if compact_allowed && (errors_if_compact.len() < chosen.len() || !aligned_allowed) {
             chosen = std::mem::take(&mut errors_if_compact);
         }
-        if tight_allowed && (errors_if_tight.len() < chosen.len() || (!aligned_allowed && !compact_allowed))
+        if tight_allowed
+            && (errors_if_tight.len() < chosen.len() || (!aligned_allowed && !compact_allowed))
         {
             chosen = std::mem::take(&mut errors_if_tight);
         }

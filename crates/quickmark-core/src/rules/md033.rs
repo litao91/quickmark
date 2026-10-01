@@ -546,7 +546,11 @@ Content
 
         // markdownlint reports ne-text and my-widget, not the closing tag
         assert_eq!(md033_violations.len(), 2);
-        assert!(md033_violations.iter().any(|v| v.message().contains("ne-text")));
-        assert!(md033_violations.iter().any(|v| v.message().contains("my-widget")));
+        assert!(md033_violations
+            .iter()
+            .any(|v| v.message().contains("ne-text")));
+        assert!(md033_violations
+            .iter()
+            .any(|v| v.message().contains("my-widget")));
     }
 }

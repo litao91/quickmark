@@ -55,16 +55,14 @@ static UNDERSCORE_EMPHASIS_REGEX: Lazy<Regex> =
 // there are no code_span nodes to consult. Runs of one, two or three backticks are matched longest
 // first, and a span may cross lines — CommonMark allows both, and a URL like `l_orderkey__0` inside
 // a span is literal text rather than strong emphasis.
-pub(crate) static CODE_SPAN_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?s)```.*?```|``.*?``|`[^`]*`").expect("Invalid code span regex")
-});
+pub(crate) static CODE_SPAN_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?s)```.*?```|``.*?``|`[^`]*`").expect("Invalid code span regex"));
 
 // Link and image destinations, and autolinks. Emphasis markers inside a URL are literal text —
 // `http://example.com/s?__biz=1` is not strong emphasis. markdownlint never sees them because
 // micromark tokenises a destination separately from inline content.
-pub(crate) static LINK_DESTINATION_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\]\([^)\n]*\)|<[^<>\n]*>").expect("Invalid link destination regex")
-});
+pub(crate) static LINK_DESTINATION_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\]\([^)\n]*\)|<[^<>\n]*>").expect("Invalid link destination regex"));
 
 /// Math regions. markdownlint's micromark tokenises `$...$` and `$$...$$` as math, so their content
 /// never becomes inline text and no emphasis rule sees it. quickmark has no math tokeniser, so the
@@ -172,7 +170,6 @@ impl MD049Linter {
         let literal_spans = literal_ranges(text);
 
         for &(match_start, match_end, style) in matches {
-
             // Check if this match overlaps with any code span
             // Only the markers have to sit outside literal content; what is between them may
             // contain code spans, links or math.
@@ -539,8 +536,9 @@ mod test {
     #[test]
     fn test_emphasis_may_contain_a_code_span() {
         // Only the markers have to sit outside literal content, not the whole span
-        let messages =
-            md049_messages("_170 case(s) slower than baseline `161570`, 20 deep-dived_\n\nlater *emph* here");
+        let messages = md049_messages(
+            "_170 case(s) slower than baseline `161570`, 20 deep-dived_\n\nlater *emph* here",
+        );
         assert_eq!(2, messages.len(), "unexpected: {messages:?}");
     }
 }

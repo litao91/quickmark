@@ -41,7 +41,9 @@ fn linted(root: &Path, args: &[&str]) -> BTreeSet<String> {
     stderr
         .lines()
         .filter_map(|line| {
-            let rest = line.strip_prefix("ERR: ").or_else(|| line.strip_prefix("WARN: "))?;
+            let rest = line
+                .strip_prefix("ERR: ")
+                .or_else(|| line.strip_prefix("WARN: "))?;
             let at = rest.rfind(" MD")?;
             let mut parts = rest[..at].rsplitn(3, ':');
             parts.next()?; // column
@@ -163,5 +165,8 @@ fn glob_with_no_matches_exits_zero() {
 
     assert_eq!(output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("ERR: "), "unexpected diagnostics: {stderr}");
+    assert!(
+        !stderr.contains("ERR: "),
+        "unexpected diagnostics: {stderr}"
+    );
 }

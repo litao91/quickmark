@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Rules allowed to disagree, and on how many fixtures, before the suite fails. Every entry is a
 /// known quickmark bug — shrink it as the rule is fixed, and never grow it.
@@ -129,11 +128,7 @@ fn matches_markdownlint_on_migrated_fixtures() {
     // not silently pass if that is ever changed.
     for line in stderr.lines().chain(stdout.lines()) {
         if let Some((path, _line_number, rule)) = parse_diagnostic(line) {
-            *actual
-                .entry(path)
-                .or_default()
-                .entry(rule)
-                .or_insert(0) += 1;
+            *actual.entry(path).or_default().entry(rule).or_insert(0) += 1;
         }
     }
 
@@ -189,7 +184,9 @@ fn matches_markdownlint_on_migrated_fixtures() {
                     .join("\n")
             ));
         } else if *count < limit {
-            beaten.push(format!("{rule}: {count} < baseline {limit} — tighten BASELINE"));
+            beaten.push(format!(
+                "{rule}: {count} < baseline {limit} — tighten BASELINE"
+            ));
         }
     }
     for rule in allowed.keys() {
@@ -199,9 +196,15 @@ fn matches_markdownlint_on_migrated_fixtures() {
     }
 
     let total: usize = mismatching.values().sum();
-    println!("parity: {} fixtures, {total} rule/fixture disagreements", relative.len());
+    println!(
+        "parity: {} fixtures, {total} rule/fixture disagreements",
+        relative.len()
+    );
     for (rule, count) in &mismatching {
-        println!("  {rule}: {count} (baseline {})", allowed.get(rule.as_str()).unwrap_or(&0));
+        println!(
+            "  {rule}: {count} (baseline {})",
+            allowed.get(rule.as_str()).unwrap_or(&0)
+        );
     }
     for line in &beaten {
         println!("  IMPROVED {line}");
