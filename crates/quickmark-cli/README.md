@@ -1,6 +1,6 @@
 # quickmark-cli
 
-Lightning-fast Markdown/CommonMark linter CLI tool with tree-sitter based parsing.
+Lightning-fast Markdown/CommonMark linter CLI tool with comrak based parsing.
 
 ## Overview
 

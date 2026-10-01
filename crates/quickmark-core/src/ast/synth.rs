@@ -1,10 +1,10 @@
 //! The pieces of a tree-sitter-md tree that comrak does not produce, re-derived from raw source.
 //!
-//! Every span here was measured against tree-sitter-md 0.5.3 rather than inferred from its grammar,
-//! and `oracle.rs` is what keeps them honest. Two of comrak's behaviours make this necessary rather
-//! than merely convenient: it detaches paragraphs that turn out to be pure link reference
-//! definitions, and it autocompletes table cells to the header width while dropping the delimiter
-//! row — so neither can be read off its tree.
+//! Every span here was measured against tree-sitter-md 0.5.3 rather than inferred from comrak's
+//! grammar, and `snapshot.rs` is what keeps them from drifting. Two of comrak's behaviours make this
+//! necessary rather than merely convenient: it detaches paragraphs that turn out to be pure link
+//! reference definitions, and it autocompletes table cells to the header width while dropping the
+//! delimiter row — so neither can be read off its tree.
 
 use comrak::nodes::{ListDelimType, ListType, NodeList};
 
@@ -55,18 +55,6 @@ impl<'a> LineIndex<'a> {
             starts,
             ends,
         }
-    }
-
-    /// Whether `source` contains a `\r` that is not part of a `\r\n` pair. tree-sitter-md does not
-    /// treat those as line breaks while comrak and CommonMark do, so the two parses of such a
-    /// document cannot agree and the oracle skips them.
-    #[cfg(test)]
-    pub fn has_bare_carriage_return(source: &str) -> bool {
-        let bytes = source.as_bytes();
-        bytes
-            .iter()
-            .enumerate()
-            .any(|(index, &byte)| byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
     }
 
     pub fn line_count(&self) -> usize {

@@ -1,6 +1,6 @@
 //! Whole-tree traversal in either order. Rules get their nodes from `RuleLinter::feed`, which the
 //! linter drives over the tree in pre-order; this is for callers that want to walk a document
-//! themselves, and for the oracle.
+//! themselves.
 
 use super::{FacadeTree, Node};
 

@@ -22,7 +22,7 @@ pub mod walker;
 pub(crate) mod synth;
 
 #[cfg(test)]
-mod oracle;
+mod snapshot;
 
 /// Every node kind the tree can contain. The discriminant indexes [`KIND_NAMES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

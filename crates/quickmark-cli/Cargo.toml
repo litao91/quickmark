@@ -2,7 +2,8 @@
 name = "quickmark-cli"
 version = "1.1.0"
 edition = "2021"
-description = "Lightning-fast Markdown/CommonMark linter CLI tool with tree-sitter based parsing"
+rust-version = "1.87"
+description = "Lightning-fast Markdown/CommonMark linter CLI tool with comrak based parsing"
 license = "MIT"
 authors = ["Evgeny Kropotin"]
 repository = "https://github.com/ekropotin/quickmark"

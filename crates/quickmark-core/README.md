@@ -1,14 +1,14 @@
 # quickmark-core
 
-Lightning-fast Markdown/CommonMark linter core library with tree-sitter based parsing.
+Lightning-fast Markdown/CommonMark linter core library with comrak based parsing.
 
 ## Overview
 
-`quickmark-core` is the foundational library for QuickMark, providing high-performance Markdown linting capabilities. It features an integrated configuration system, tree-sitter based parsing, and a pluggable rule architecture designed for speed and extensibility.
+`quickmark-core` is the foundational library for QuickMark, providing high-performance Markdown linting capabilities. It features an integrated configuration system, comrak based parsing, and a pluggable rule architecture designed for speed and extensibility.
 
 ## Features
 
-- **Tree-sitter Parsing**: Uses tree-sitter-md for robust Markdown AST generation
+- **comrak Parsing**: CommonMark plus GFM tables, task lists and front matter, translated into a flat node tree that rules walk
 - **Integrated Configuration**: Built-in TOML configuration parsing and validation
 - **Rule System**: Pluggable architecture with 5 rule types for optimal performance
 - **Single-Pass Architecture**: Efficient processing with cached node filtering
@@ -17,17 +17,22 @@ Lightning-fast Markdown/CommonMark linter core library with tree-sitter based pa
 ## Usage
 
 ```rust
-use quickmark_core::{config_in_path_or_default, MultiRuleLinter, Context};
+use std::path::Path;
 
-// Load configuration
-let config = config_in_path_or_default(".")?;
+use quickmark_core::config::config_in_path_or_default;
+use quickmark_core::linter::MultiRuleLinter;
 
-// Create linter and context
-let linter = MultiRuleLinter::new(&config);
-let context = Context::new("example.md", &config);
+let config = config_in_path_or_default(Path::new("."))?;
 
-// Lint markdown content
-let violations = linter.lint(&context, markdown_content)?;
+// One linter per document: `analyze` consumes it, so build a fresh one for the next file.
+let mut linter = MultiRuleLinter::new_for_document(
+    Path::new("example.md").to_path_buf(),
+    config,
+    markdown_content,
+);
+for violation in linter.analyze() {
+    println!("{violation}");
+}
 ```
 
 ## Rule Types

@@ -24,7 +24,7 @@ quickmark/
 │   │   │   ├── linter.rs      # Linting engine
 │   │   │   ├── rules/         # Individual linting rules
 │   │   │   ├── test_utils.rs  # Testing utilities
-│   │   │   └── tree_sitter_walker.rs  # Tree-sitter AST traversal utilities
+│   │   │   └── ast/           # comrak AST -> the node tree rules walk
 │   │   └── tests/
 │   ├── quickmark-cli/         # CLI application
 │   │   ├── Cargo.toml
@@ -63,7 +63,7 @@ quickmark/
 - Core linting logic with integrated configuration system
 - TOML configuration parsing and validation
 - Converts TOML structures to `QuickmarkConfig` objects  
-- Tree-sitter based Markdown parsing
+- comrak based Markdown parsing
 - Rule system with pluggable architecture
 - Rule severity normalization and validation
 - Self-contained design eliminates external configuration dependencies
@@ -90,8 +90,22 @@ quickmark/
 - `MultiRuleLinter`: Orchestrates multiple rule linters
 - `RuleViolation`: Represents a linting error with location and message
 - `Context`: Shared context containing file path and configuration
-- Uses tree-sitter for Markdown parsing with tree-sitter-md grammar
+- Uses comrak for Markdown parsing (CommonMark, plus GFM tables, task lists and `---` front matter)
 - Filters rules based on severity configuration (off/warn/err)
+
+**Node Tree** (`quickmark-core/src/ast/`):
+
+- `build.rs` translates comrak's arena into a flat, pre-order node array; `synth.rs` re-derives from
+  raw source what comrak does not expose (heading and list markers, `inline` wrappers, `section`
+  grouping, table delimiter rows and cells, link reference definitions)
+- Rules see `ast::Node`, whose API mirrors `tree_sitter::Node` so rule code reads the same as before
+  the parser changed
+- Two conventions are load-bearing and easy to break. **Columns are UTF-8 byte offsets, not
+  character counts** — `comrak`'s `parse.sourcepos_chars` must stay off. **A block's end position
+  includes its trailing newline**, so `end_position().row` is the row *after* the block's last line
+  and `end_position().column` is 0; every rule that asks "is the next line blank?" depends on it,
+  and comparing an item's start row to its end row without compensating makes every list look
+  multi-line
 
 **Configuration System** (`quickmark-core/src/config/mod.rs`):
 
@@ -120,7 +134,7 @@ quickmark/
 
 **Performance-Optimized Single-Pass Design**:
 
-QuickMark has evolved from a simple node-based traversal to a sophisticated single-pass architecture that efficiently handles different rule types while maintaining exceptional performance. This design is inspired by the original markdownlint's architecture but leverages Rust's performance advantages and tree-sitter's robust parsing.
+QuickMark has evolved from a simple node-based traversal to a sophisticated single-pass architecture that efficiently handles different rule types while maintaining exceptional performance. This design is inspired by the original markdownlint's architecture but leverages Rust's performance advantages and comrak's CommonMark parsing.
 
 **Rule Type Classification**:
 
@@ -161,7 +175,7 @@ This architecture allows rules like MD013 to work efficiently with raw text whil
 
 **Shared Context**: `Rc<Context>` is passed to all rule linters, containing file path and configuration.
 
-**Hybrid AST + Line Processing**: Uses tree-sitter for structural analysis with cached node filtering, plus direct text line access for line-based rules. Rules receive an enhanced context with multiple optimized data views.
+**Hybrid AST + Line Processing**: Uses comrak for structural analysis with cached node filtering, plus direct text line access for line-based rules. Rules receive an enhanced context with multiple optimized data views.
 
 **Configuration-Driven**: Rule severity and settings are externally configurable via TOML files.
 
@@ -172,8 +186,9 @@ This architecture allows rules like MD013 to work efficiently with raw text whil
 ### quickmark-core
 
 - `anyhow`: Error handling
-- `tree-sitter`: AST parsing  
-- `tree-sitter-md`: Markdown grammar
+- `comrak`: Markdown parsing (CommonMark plus GFM extensions)
+- `once_cell`: Lazy statics
+- `unicode-width`: Display width of East Asian characters
 - `serde`: TOML deserialization
 - `toml`: TOML parsing and configuration
 - `regex`: Pattern matching

@@ -1,0 +1,367 @@
+//! Checked-in renderings of the tree, so a comrak bump is reviewable by reading a diff.
+//!
+//! An oracle that diffed the tree against tree-sitter-md node-for-node is what made the move to
+//! comrak safe: it ran over thirteen hand-written structural cases, the 354 migrated markdownlint
+//! fixtures and all 2747 files of a real vault, and every one was byte-exact. These snapshots are
+//! what is left after it. They are weaker on purpose — thirteen documents rather than three
+//! thousand — but they need no second parser, and a change to any node kind, position or child order
+//! shows up as a line in a diff a human can read.
+//!
+//! Each rendering is `(kind start_row:start_col-end_row:end_col start_byte-end_byte`, indented one
+//! level per parent. Two conventions make the numbers look odd and are the point of pinning them:
+//! columns count UTF-8 bytes, and a block's end includes its trailing newline, so a one-line
+//! paragraph on row 0 ends at `1:0`.
+
+use super::build;
+use super::Node;
+
+fn render(source: &str) -> String {
+    let tree = build::parse(source);
+    let mut out = String::new();
+    push(tree.root_node(), 0, &mut out);
+    out
+}
+
+fn push(node: Node, depth: usize, out: &mut String) {
+    let start = node.start_position();
+    let end = node.end_position();
+    let indent = "  ".repeat(depth);
+    out.push_str(&format!(
+        "{indent}({} {}:{}-{}:{} {}-{}",
+        node.kind(),
+        start.row,
+        start.column,
+        end.row,
+        end.column,
+        node.start_byte(),
+        node.end_byte()
+    ));
+    if node.child_count() == 0 {
+        out.push_str(")\n");
+        return;
+    }
+    out.push('\n');
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index) {
+            push(child, depth + 1, out);
+        }
+    }
+    out.push_str(&indent);
+    out.push_str(")\n");
+}
+
+/// One case per synthesis family. Sources are short on purpose: the rendering is meant to be read.
+const CASES: &[(&str, &str, &str)] = &[
+    (
+        "atx headings",
+        "# One\n\n##  Two  ##\n\n###\n",
+        r#"(document 0:0-5:0 0-24
+  (section 0:0-5:0 0-24
+    (atx_heading 0:0-1:0 0-6
+      (atx_h1_marker 0:0-0:1 0-1)
+      (inline 0:2-0:5 2-5)
+    )
+    (section 2:0-5:0 7-24
+      (atx_heading 2:0-3:0 7-19
+        (atx_h2_marker 2:0-2:2 7-9)
+        (inline 2:4-2:11 11-18)
+      )
+      (section 4:0-5:0 20-24
+        (atx_heading 4:0-5:0 20-24
+          (atx_h3_marker 4:0-4:3 20-23)
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        "setext headings",
+        "Title\n=====\n\nSub\n---\n",
+        r#"(document 0:0-5:0 0-21
+  (section 0:0-5:0 0-21
+    (setext_heading 0:0-2:0 0-12
+      (paragraph 0:0-1:0 0-6
+        (inline 0:0-0:5 0-5)
+      )
+      (setext_h1_underline 1:0-1:5 6-11)
+    )
+    (setext_heading 3:0-5:0 13-21
+      (paragraph 3:0-4:0 13-17
+        (inline 3:0-3:3 13-16)
+      )
+      (setext_h2_underline 4:0-4:3 17-20)
+    )
+  )
+)
+"#,
+    ),
+    (
+        "front matter",
+        "---\ntitle: x\n---\n\n# H\n\n+++\nother: y\n+++\n",
+        r#"(document 0:0-9:0 0-40
+  (minus_metadata 0:0-3:0 0-17)
+  (section 3:0-4:0 17-18)
+  (section 4:0-9:0 18-40
+    (atx_heading 4:0-5:0 18-22
+      (atx_h1_marker 4:0-4:1 18-19)
+      (inline 4:2-4:3 20-21)
+    )
+    (paragraph 6:0-9:0 23-40
+      (inline 6:0-8:3 23-39)
+    )
+  )
+)
+"#,
+    ),
+    (
+        "front matter plus",
+        "+++\ntitle: x\n+++\n\n# H\n",
+        r#"(document 0:0-5:0 0-22
+  (plus_metadata 0:0-3:0 0-17)
+  (section 3:0-4:0 17-18)
+  (section 4:0-5:0 18-22
+    (atx_heading 4:0-5:0 18-22
+      (atx_h1_marker 4:0-4:1 18-19)
+      (inline 4:2-4:3 20-21)
+    )
+  )
+)
+"#,
+    ),
+    (
+        "lists",
+        "- tight\n- items\n\n1. loose\n\n2. items\n\n- [x] task\n",
+        r#"(document 0:0-8:0 0-48
+  (section 0:0-8:0 0-48
+    (list 0:0-3:0 0-17
+      (list_item 0:0-1:0 0-8
+        (list_marker_minus 0:0-0:2 0-2)
+        (paragraph 0:2-1:0 2-8
+          (inline 0:2-0:7 2-7)
+        )
+      )
+      (list_item 1:0-3:0 8-17
+        (list_marker_minus 1:0-1:2 8-10)
+        (paragraph 1:2-2:0 10-16
+          (inline 1:2-1:7 10-15)
+        )
+      )
+    )
+    (list 3:0-7:0 17-37
+      (list_item 3:0-5:0 17-27
+        (list_marker_dot 3:0-3:3 17-20)
+        (paragraph 3:3-4:0 20-26
+          (inline 3:3-3:8 20-25)
+        )
+      )
+      (list_item 5:0-7:0 27-37
+        (list_marker_dot 5:0-5:3 27-30)
+        (paragraph 5:3-6:0 30-36
+          (inline 5:3-5:8 30-35)
+        )
+      )
+    )
+    (list 7:0-8:0 37-48
+      (list_item 7:0-8:0 37-48
+        (list_marker_minus 7:0-7:2 37-39)
+        (paragraph 7:6-8:0 43-48
+          (inline 7:6-7:10 43-47)
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        "nested list",
+        "- outer\n  - inner\n    - deep\n",
+        r#"(document 0:0-3:0 0-29
+  (section 0:0-3:0 0-29
+    (list 0:0-3:0 0-29
+      (list_item 0:0-3:0 0-29
+        (list_marker_minus 0:0-0:2 0-2)
+        (paragraph 0:2-1:2 2-10
+          (inline 0:2-0:7 2-7)
+        )
+        (list 1:2-3:0 10-29
+          (list_item 1:2-3:0 10-29
+            (list_marker_minus 1:2-1:4 10-12)
+            (paragraph 1:4-2:4 12-22
+              (inline 1:4-1:9 12-17)
+            )
+            (list 2:4-3:0 22-29
+              (list_item 2:4-3:0 22-29
+                (list_marker_minus 2:4-2:6 22-24)
+                (paragraph 2:6-3:0 24-29
+                  (inline 2:6-2:10 24-28)
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        "fenced code",
+        "```rust\nlet x = 1;\n```\n\n~~~\nunclosed\n",
+        r#"(document 0:0-6:0 0-37
+  (section 0:0-6:0 0-37
+    (fenced_code_block 0:0-3:0 0-23
+      (code_fence_content 1:0-2:0 8-19)
+    )
+    (fenced_code_block 4:0-6:0 24-37
+      (code_fence_content 5:0-6:0 28-37)
+    )
+  )
+)
+"#,
+    ),
+    (
+        "indented code",
+        "para\n\n    code\n    more\n\ntext\n",
+        r#"(document 0:0-6:0 0-30
+  (section 0:0-6:0 0-30
+    (paragraph 0:0-1:0 0-5
+      (inline 0:0-0:4 0-4)
+    )
+    (indented_code_block 2:0-5:0 6-25)
+    (paragraph 5:0-6:0 25-30
+      (inline 5:0-5:4 25-29)
+    )
+  )
+)
+"#,
+    ),
+    (
+        "block quote",
+        "> quoted\n> more\n>\n> - a list\n",
+        r#"(document 0:0-4:0 0-29
+  (section 0:0-4:0 0-29
+    (block_quote 0:0-4:0 0-29
+      (paragraph 0:2-2:1 2-17
+        (inline 0:2-1:6 2-15)
+      )
+      (list 3:2-4:0 20-29
+        (list_item 3:2-4:0 20-29
+          (list_marker_minus 3:2-3:4 20-22)
+          (paragraph 3:4-4:0 22-29
+            (inline 3:4-3:10 22-28)
+          )
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        "table",
+        "| a | b |\n|:--|--:|\n| 1 |\n",
+        r#"(document 0:0-3:0 0-26
+  (section 0:0-3:0 0-26
+    (pipe_table 0:0-3:0 0-26
+      (pipe_table_header 0:0-0:9 0-9
+        (| 0:0-0:1 0-1)
+        (pipe_table_cell 0:2-0:4 2-4)
+        (| 0:4-0:5 4-5)
+        (pipe_table_cell 0:6-0:8 6-8)
+        (| 0:8-0:9 8-9)
+      )
+      (pipe_table_delimiter_row 1:0-1:9 10-19
+        (| 1:0-1:1 10-11)
+        (pipe_table_delimiter_cell 1:1-1:4 11-14)
+        (| 1:4-1:5 14-15)
+        (pipe_table_delimiter_cell 1:5-1:8 15-18)
+        (| 1:8-1:9 18-19)
+      )
+      (pipe_table_row 2:0-2:5 20-25
+        (| 2:0-2:1 20-21)
+        (pipe_table_cell 2:2-2:4 22-24)
+        (| 2:4-2:5 24-25)
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        "reference definitions",
+        "[a]: /one\n[b]: /two \"t\"\n\nUse [a].\n",
+        r#"(document 0:0-4:0 0-34
+  (section 0:0-4:0 0-34
+    (link_reference_definition 0:0-1:0 0-10)
+    (link_reference_definition 1:0-2:0 10-24)
+    (paragraph 3:0-4:0 25-34
+      (inline 3:0-3:8 25-33)
+    )
+  )
+)
+"#,
+    ),
+    (
+        "html and thematic break",
+        "<div>\n  x\n</div>\n\n***\n",
+        r#"(document 0:0-5:0 0-22
+  (section 0:0-5:0 0-22
+    (html_block 0:0-3:0 0-17)
+    (thematic_break 4:0-5:0 18-22)
+  )
+)
+"#,
+    ),
+    (
+        "no trailing newline",
+        "# H\n\ntext",
+        r#"(document 0:0-2:4 0-9
+  (section 0:0-2:4 0-9
+    (atx_heading 0:0-1:0 0-4
+      (atx_h1_marker 0:0-0:1 0-1)
+      (inline 0:2-0:3 2-3)
+    )
+    (paragraph 2:0-2:4 5-9
+      (inline 2:0-2:4 5-9)
+    )
+  )
+)
+"#,
+    ),
+];
+
+#[test]
+fn snapshots() {
+    let mut failures = Vec::new();
+    for &(label, source, expected) in CASES {
+        let actual = render(source);
+        if actual != expected {
+            failures.push(format!("--- {label} --- {source:?}\n{actual}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} tree snapshots changed. If the new trees are right, replace the expected \
+         rendering; if not, this is a regression.\n\n{}",
+        failures.len(),
+        CASES.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn every_case_has_a_rendering() {
+    let missing: Vec<&str> = CASES
+        .iter()
+        .filter(|&&(_, _, expected)| expected.is_empty())
+        .map(|&(label, _, _)| label)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these cases have no checked-in rendering yet: {missing:?}"
+    );
+}
