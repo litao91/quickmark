@@ -143,20 +143,29 @@ impl MD030Linter {
 
         // Handle unordered lists: *, +, -
         if line.starts_with(['*', '+', '-']) {
-            let after_marker = &line[1..];
-            return Some(after_marker.chars().take_while(|&c| c == ' ').count());
+            return spacing_after_marker(&line[1..]);
         }
 
         // Handle ordered lists: 1., 2., etc.
         if let Some(dot_pos) = line.find('.') {
             let before_dot = &line[..dot_pos];
             if !before_dot.is_empty() && before_dot.chars().all(|c| c.is_ascii_digit()) {
-                let after_marker = &line[dot_pos + 1..];
-                return Some(after_marker.chars().take_while(|&c| c == ' ').count());
+                return spacing_after_marker(&line[dot_pos + 1..]);
             }
         }
 
         None
+    }
+}
+
+/// Spaces between a list marker and its content. An empty item has no spacing to judge, so there is
+/// nothing to report — markdownlint says nothing about a bare `-` used as a spacer, or about `-`
+/// followed by trailing spaces.
+fn spacing_after_marker(after_marker: &str) -> Option<usize> {
+    if after_marker.trim().is_empty() {
+        None
+    } else {
+        Some(after_marker.chars().take_while(|&c| c == ' ').count())
     }
 }
 
@@ -356,5 +365,36 @@ mod test {
             violations.len(),
             "Dash marker with single space should have no violations"
         );
+    }
+
+    // Every expectation below was measured against markdownlint-cli2 v0.23.3.
+
+    #[test]
+    fn test_empty_list_items_are_not_violations() {
+        // A bare marker used as a spacer has no content, so there is no spacing to judge.
+        for input in [
+            "- item\n-\n- item2\n",
+            "- item\n- \n- item2\n",
+            "- item\n-   \n- item2\n",
+            "- item\n1.\n- item2\n",
+            "- item\n1.   \n- item2\n",
+        ] {
+            let config = test_config();
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+            let violations = linter.analyze();
+            assert_eq!(0, violations.len(), "unexpected violations for {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_real_marker_spacing_still_reported() {
+        for input in ["-  two spaces\n- item\n", "1.  two spaces\n1. item\n"] {
+            let config = test_config();
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+            let violations = linter.analyze();
+            assert_eq!(1, violations.len(), "expected one violation for {input:?}");
+        }
     }
 }
