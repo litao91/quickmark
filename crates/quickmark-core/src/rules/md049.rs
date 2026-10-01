@@ -48,9 +48,40 @@ static ASTERISK_EMPHASIS_REGEX: Lazy<Regex> =
 static UNDERSCORE_EMPHASIS_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"_([^_\n]+?)_").expect("Invalid underscore emphasis regex"));
 
-// Regex to find code spans (to exclude from emphasis checking)
-pub(crate) static CODE_SPAN_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"`[^`\n]*`").expect("Invalid code span regex"));
+// Regex to find code spans (to exclude from emphasis checking). The inline tree is never parsed, so
+// there are no code_span nodes to consult. Runs of one, two or three backticks are matched longest
+// first, and a span may cross lines — CommonMark allows both, and a URL like `l_orderkey__0` inside
+// a span is literal text rather than strong emphasis.
+pub(crate) static CODE_SPAN_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?s)```.*?```|``.*?``|`[^`]*`").expect("Invalid code span regex")
+});
+
+// Link and image destinations, and autolinks. Emphasis markers inside a URL are literal text —
+// `http://example.com/s?__biz=1` is not strong emphasis. markdownlint never sees them because
+// micromark tokenises a destination separately from inline content.
+pub(crate) static LINK_DESTINATION_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\]\([^)\n]*\)|<[^<>\n]*>").expect("Invalid link destination regex")
+});
+
+/// Math regions. markdownlint's micromark tokenises `$...$` and `$$...$$` as math, so their content
+/// never becomes inline text and no emphasis rule sees it. quickmark has no math tokeniser, so the
+/// regions are masked instead. Display math may span lines; inline math follows micromark's
+/// constraint that the opening `$` is not followed by whitespace and the closing `$` is not preceded
+/// by whitespace, which is what keeps a price like `$5 and $10` from being read as math.
+pub(crate) static MATH_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\$\$[\s\S]*?\$\$|\$(?:[^$\s\n]\$|[^$\s\n][^$\n]*[^$\s\n]\$)")
+        .expect("Invalid math regex")
+});
+
+/// Byte ranges within `text` that hold literal content, where emphasis markers do not count.
+pub(crate) fn literal_ranges(text: &str) -> Vec<(usize, usize)> {
+    CODE_SPAN_REGEX
+        .find_iter(text)
+        .chain(LINK_DESTINATION_REGEX.find_iter(text))
+        .chain(MATH_REGEX.find_iter(text))
+        .map(|m| (m.start(), m.end()))
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DetectedEmphasisStyle {
@@ -141,21 +172,18 @@ impl MD049Linter {
         start_offset: usize,
         matches: &[(usize, usize, DetectedEmphasisStyle)],
     ) {
-        // Find code span ranges to exclude
-        let code_span_ranges: Vec<(usize, usize)> = CODE_SPAN_REGEX
-            .find_iter(text)
-            .map(|m| (m.start(), m.end()))
-            .collect();
+        // Find ranges of literal content to exclude
+        let literal_spans = literal_ranges(text);
 
         for &(match_start, match_end, style) in matches {
 
             // Check if this match overlaps with any code span
-            let in_code_span = code_span_ranges
+            let in_literal = literal_spans
                 .iter()
-                .any(|(code_start, code_end)| match_start < *code_end && match_end > *code_start);
+                .any(|(span_start, span_end)| match_start < *span_end && match_end > *span_start);
 
-            if in_code_span {
-                continue; // Skip this match as it's inside a code span
+            if in_literal {
+                continue; // Skip this match as it's inside literal content
             }
 
             // Check if this is intraword emphasis
@@ -454,5 +482,41 @@ mod test {
     fn test_spaced_markers_are_not_emphasis() {
         // Neither `*` is a delimiter run here, so `_real_` sets the style unopposed.
         assert!(md049_messages("a * b * c and _real_").is_empty());
+    }
+
+    #[test]
+    fn test_link_destination_is_not_emphasis() {
+        // `_a_` is part of the URL, so `*emph*` is the only emphasis and sets the style.
+        assert!(md049_messages("[doc](http://example.com/s?_a_b_c=1) and *emph*").is_empty());
+    }
+
+    #[test]
+    fn test_longer_backtick_runs_are_code_spans() {
+        assert!(md049_messages("x `a_b_c` y ``d_e_f`` z and *emph*").is_empty());
+    }
+
+    #[test]
+    fn test_inline_math_is_not_emphasis() {
+        // `$a_b_c$` is math, so `*emph*` is the only emphasis and sets the style
+        assert!(md049_messages("text $a_b_c$ more *emph*").is_empty());
+    }
+
+    #[test]
+    fn test_display_math_block_is_not_emphasis() {
+        let messages = md049_messages("text\n\n$$\na_b_c\n$$\n\n*emph* and _other_");
+        assert_eq!(2, messages.len(), "unexpected: {messages:?}");
+        assert!(messages
+            .iter()
+            .all(|m| m == "Expected: asterisk; Actual: underscore"));
+    }
+
+    #[test]
+    fn test_currency_is_not_math() {
+        // A `$` amount is not a math delimiter, so `_first_` still sets the style
+        let messages = md049_messages("price $5 and $10 then _first_ and *second*");
+        assert_eq!(2, messages.len(), "unexpected: {messages:?}");
+        assert!(messages
+            .iter()
+            .all(|m| m == "Expected: underscore; Actual: asterisk"));
     }
 }

@@ -8,7 +8,7 @@ use crate::{
     rules::{Rule, RuleType},
 };
 
-use super::md049::CODE_SPAN_REGEX;
+use super::md049::literal_ranges;
 
 // MD050-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
@@ -119,12 +119,9 @@ impl MD050Linter {
         }
         char_offsets.push(acc);
 
-        // Markers inside a code span are literal text, not emphasis, so they must neither set nor
-        // violate the document's consistent style.
-        let code_span_ranges: Vec<(usize, usize)> = CODE_SPAN_REGEX
-            .find_iter(text)
-            .map(|m| (m.start(), m.end()))
-            .collect();
+        // Markers inside literal content — a code span or a link destination — are not emphasis, so
+        // they must neither set nor violate the document's consistent style.
+        let literal_spans = literal_ranges(text);
 
         while i < chars.len() {
             if i + 1 < chars.len() {
@@ -137,12 +134,27 @@ impl MD050Linter {
                 {
                     let marker_start = char_offsets[i];
                     let marker_end = char_offsets[i + 2];
-                    if code_span_ranges
+                    if literal_spans
                         .iter()
                         .any(|(s, e)| marker_start < *e && marker_end > *s)
                     {
                         i += 2;
                         continue;
+                    }
+
+                    // CommonMark forbids intraword emphasis with `_`, so the `__` in an identifier
+                    // like `ANALYTICDB__29` is not a delimiter run at all.
+                    if current_char == '_' {
+                        let bytes = text.as_bytes();
+                        let intraword = marker_start
+                            .checked_sub(1)
+                            .and_then(|p| bytes.get(p))
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                            && bytes.get(marker_end).is_some_and(u8::is_ascii_alphanumeric);
+                        if intraword {
+                            i += 2;
+                            continue;
+                        }
                     }
 
                     // Skip if this is part of a longer sequence that would make it invalid
@@ -463,6 +475,67 @@ mod test {
     fn test_code_span_marker_is_not_a_violation() {
         let config = test_config_with_style(StrongStyle::Consistent);
         let input = "**bold** and `__literal__`";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md050_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD050")
+            .collect();
+
+        assert_eq!(md050_violations.len(), 0);
+    }
+
+    #[test]
+    fn test_longer_backtick_runs_are_code_spans() {
+        let config = test_config_with_style(StrongStyle::Consistent);
+        let input = "x `a__b` y ``c__d`` z and **bold**";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md050_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD050")
+            .collect();
+
+        assert_eq!(md050_violations.len(), 0);
+    }
+
+    #[test]
+    fn test_link_destination_is_not_strong() {
+        let config = test_config_with_style(StrongStyle::Consistent);
+        // `__biz` is part of the URL, so `**bold**` is the only strong and sets the style
+        let input = "see [doc](http://example.com/s?__biz=ABC&y=1) and **bold**";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md050_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD050")
+            .collect();
+
+        assert_eq!(md050_violations.len(), 0);
+    }
+
+    #[test]
+    fn test_autolink_destination_is_not_strong() {
+        let config = test_config_with_style(StrongStyle::Consistent);
+        let input = "<http://example.com/__a__> and **bold**";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md050_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD050")
+            .collect();
+
+        assert_eq!(md050_violations.len(), 0);
+    }
+
+    #[test]
+    fn test_intraword_underscores_are_not_strong() {
+        let config = test_config_with_style(StrongStyle::Consistent);
+        let input = "shard ANALYTICDB__29 and ckp_batch_ANALYTICDB__29_x.tar with **bold**";
 
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();

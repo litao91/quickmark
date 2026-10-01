@@ -31,18 +31,16 @@ impl MD014Linter {
         // Check fenced code blocks
         if let Some(fenced_blocks) = node_cache.get("fenced_code_block") {
             for node_info in fenced_blocks {
-                if let Some(violation) = self.check_code_block_info(node_info, &lines, true) {
-                    self.violations.push(violation);
-                }
+                let found = self.check_code_block_info(node_info, &lines, true);
+                self.violations.extend(found);
             }
         }
 
         // Check indented code blocks
         if let Some(indented_blocks) = node_cache.get("indented_code_block") {
             for node_info in indented_blocks {
-                if let Some(violation) = self.check_code_block_info(node_info, &lines, false) {
-                    self.violations.push(violation);
-                }
+                let found = self.check_code_block_info(node_info, &lines, false);
+                self.violations.extend(found);
             }
         }
     }
@@ -52,7 +50,7 @@ impl MD014Linter {
         node_info: &crate::linter::NodeInfo,
         lines: &[String],
         is_fenced: bool,
-    ) -> Option<RuleViolation> {
+    ) -> Vec<RuleViolation> {
         let start_line = node_info.line_start;
         let end_line = node_info.line_end;
 
@@ -72,7 +70,13 @@ impl MD014Linter {
         for line_idx in content_start..=content_end {
             if line_idx < lines.len() {
                 let line = &lines[line_idx];
-                if !line.trim().is_empty() {
+                // `line_end` is tree-sitter's exclusive end row, so depending on whether the file
+                // ends in a newline the closing fence can fall inside this range. It is not code.
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                    break;
+                }
+                if !trimmed.is_empty() {
                     // For indented code blocks, filter lines that don't have proper indentation
                     // This works around tree-sitter-md parsing inconsistencies
                     if !is_fenced {
@@ -88,7 +92,7 @@ impl MD014Linter {
 
         // If no non-empty lines, no violation
         if content_lines.is_empty() {
-            return None;
+            return Vec::new();
         }
 
         // Check if ALL non-empty lines start with dollar sign
@@ -97,29 +101,30 @@ impl MD014Linter {
             .all(|(_, line)| self.dollar_regex.is_match(line));
 
         if all_have_dollar {
-            // Report violation on the first line with dollar sign
-            if let Some((first_line_idx, first_line)) = content_lines.first() {
-                let range = Range {
-                    start: CharPosition {
-                        line: *first_line_idx,
-                        character: 0,
-                    },
-                    end: CharPosition {
-                        line: *first_line_idx,
-                        character: first_line.len(),
-                    },
-                };
-
-                return Some(RuleViolation::new(
-                    &MD014,
-                    VIOLATION_MESSAGE.to_string(),
-                    self.context.file_path.clone(),
-                    range,
-                ));
-            }
+            // markdownlint reports every command line in the block, not just the first one.
+            return content_lines
+                .iter()
+                .map(|(line_idx, line)| {
+                    RuleViolation::new(
+                        &MD014,
+                        VIOLATION_MESSAGE.to_string(),
+                        self.context.file_path.clone(),
+                        Range {
+                            start: CharPosition {
+                                line: *line_idx,
+                                character: 0,
+                            },
+                            end: CharPosition {
+                                line: *line_idx,
+                                character: line.len(),
+                            },
+                        },
+                    )
+                })
+                .collect();
         }
 
-        None
+        Vec::new()
     }
 }
 
@@ -176,7 +181,7 @@ $ pwd
 ```";
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
-        assert_eq!(1, violations.len());
+        assert_eq!(3, violations.len());
         assert!(violations[0].message().contains("Dollar signs"));
     }
 
@@ -225,7 +230,7 @@ pwd
 More text.";
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
-        assert_eq!(1, violations.len());
+        assert_eq!(3, violations.len());
         assert!(violations[0].message().contains("Dollar signs"));
     }
 
@@ -254,7 +259,7 @@ $ pwd
 ```";
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
-        assert_eq!(1, violations.len());
+        assert_eq!(3, violations.len());
         assert!(violations[0].message().contains("Dollar signs"));
     }
 
@@ -296,7 +301,7 @@ $ pwd
 ```";
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
-        assert_eq!(1, violations.len());
+        assert_eq!(3, violations.len());
         assert!(violations[0].message().contains("Dollar signs"));
     }
 }

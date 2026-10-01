@@ -80,7 +80,13 @@ impl MD042Linter {
 
     fn is_empty_link_destination(&self, url: &str) -> bool {
         let trimmed = url.trim();
-        trimmed.is_empty() || trimmed == "#"
+        // `[text](# "title")` carries a title after the destination, and markdownlint judges only
+        // the destination. An angle-wrapped destination may itself contain spaces.
+        let destination = match trimmed.strip_prefix('<') {
+            Some(rest) => rest.split('>').next().unwrap_or(rest),
+            None => trimmed.split_whitespace().next().unwrap_or(""),
+        };
+        destination.is_empty() || destination == "#"
     }
 
     fn create_empty_link_violation(&mut self, node: &Node) {
@@ -298,5 +304,19 @@ mod test {
         for violation in &violations {
             assert_eq!("MD042", violation.rule().id);
         }
+    }
+
+    #[test]
+    fn test_title_after_destination_is_not_part_of_it() {
+        // markdownlint judges only the destination, so `# "title"` is still an empty link while a
+        // real URL with a title is fine
+        let input = "[a](# \"title\") and [b](http://example.com \"t\")";
+
+        let config = test_config();
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+
+        assert_eq!(1, violations.len());
+        assert_eq!("MD042", violations[0].rule().id);
     }
 }

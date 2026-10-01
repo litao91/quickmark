@@ -9,6 +9,8 @@ use crate::{
     rules::{Rule, RuleLinter, RuleType},
 };
 
+use super::md049::literal_ranges;
+
 // Regex patterns to find emphasis markers with spaces
 static ASTERISK_EMPHASIS_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(\*{1,3})(\s*)([^*\n]*?)(\s*)(\*{1,3})").expect("Invalid asterisk emphasis regex")
@@ -19,9 +21,17 @@ static UNDERSCORE_EMPHASIS_REGEX: Lazy<Regex> = Lazy::new(|| {
         .expect("Invalid underscore emphasis regex")
 });
 
-// Regex to find code spans
-static CODE_SPAN_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"`[^`\n]*`").expect("Invalid code span regex"));
+/// Whether the byte at `pos` is escaped, i.e. preceded by an odd number of backslashes. An escaped
+/// marker is literal text rather than a delimiter, so `\* a \*` is not emphasis with spaces inside
+/// it and markdownlint does not report it.
+fn is_escaped(text: &str, pos: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut backslashes = 0;
+    while backslashes < pos && bytes[pos - backslashes - 1] == b'\\' {
+        backslashes += 1;
+    }
+    backslashes % 2 == 1
+}
 
 pub(crate) struct MD037Linter {
     context: Rc<Context>,
@@ -63,18 +73,15 @@ impl MD037Linter {
             source[start_byte..node.end_byte()].to_string()
         };
 
-        // Find code span ranges to exclude
-        let code_span_ranges: Vec<(usize, usize)> = CODE_SPAN_REGEX
-            .find_iter(&text)
-            .map(|m| (m.start(), m.end()))
-            .collect();
+        // Literal content — code spans, link destinations, math — has no emphasis markers in it
+        let literal_spans = literal_ranges(&text);
 
         // Check for asterisk emphasis violations
         self.check_emphasis_pattern(
             &text,
             start_byte,
             &ASTERISK_EMPHASIS_REGEX,
-            &code_span_ranges,
+            &literal_spans,
         );
 
         // Check for underscore emphasis violations
@@ -82,7 +89,7 @@ impl MD037Linter {
             &text,
             start_byte,
             &UNDERSCORE_EMPHASIS_REGEX,
-            &code_span_ranges,
+            &literal_spans,
         );
     }
 
@@ -91,7 +98,7 @@ impl MD037Linter {
         text: &str,
         text_start_byte: usize,
         regex: &Regex,
-        code_span_ranges: &[(usize, usize)],
+        literal_spans: &[(usize, usize)],
     ) {
         for capture in regex.captures_iter(text) {
             if let (
@@ -111,13 +118,18 @@ impl MD037Linter {
                 let match_start = capture.get(0).unwrap().start();
                 let match_end = capture.get(0).unwrap().end();
 
-                let in_code_span = code_span_ranges.iter().any(|(code_start, code_end)| {
-                    // Check if the match overlaps with a code span
-                    match_start < *code_end && match_end > *code_start
+                let in_literal = literal_spans.iter().any(|(span_start, span_end)| {
+                    match_start < *span_end && match_end > *span_start
                 });
 
-                if in_code_span {
-                    continue; // Skip this match as it's inside a code span
+                if in_literal {
+                    continue; // Skip this match as it's inside literal content
+                }
+
+                if is_escaped(text, opening_marker.start())
+                    || is_escaped(text, closing_marker.start())
+                {
+                    continue; // An escaped marker is literal text, not a delimiter
                 }
 
                 let opening_text = opening_marker.as_str();
@@ -435,5 +447,70 @@ More text with _valid_ emphasis.";
             .filter(|v| v.rule().id == "MD037")
             .collect();
         assert_eq!(md037_violations.len(), 0);
+    }
+
+    // Both expectations below were checked against markdownlint-cli2 v0.23.3.
+
+    #[test]
+    fn test_no_violations_for_escaped_markers() {
+        let config = test_config();
+        let input = r"a \* not emph \* b";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md037_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD037")
+            .collect();
+
+        // An escaped marker is literal text, so there is no emphasis to have spaces inside
+        assert_eq!(md037_violations.len(), 0);
+    }
+
+    #[test]
+    fn test_escaped_backslash_before_a_real_marker() {
+        let config = test_config();
+        // `\\` is a literal backslash, so the `*` after it is a genuine delimiter
+        let input = r"a \\* real * b";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md037_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD037")
+            .collect();
+
+        assert_eq!(md037_violations.len(), 2);
+    }
+
+    #[test]
+    fn test_no_violations_for_multiplication_in_math() {
+        let config = test_config();
+        let input = "$$\neCPM = 0.03 * 0.3 * 1000 = 9\n$$";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md037_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD037")
+            .collect();
+
+        // `*` here is multiplication inside a math block, not an emphasis marker
+        assert_eq!(md037_violations.len(), 0);
+    }
+
+    #[test]
+    fn test_currency_is_not_math() {
+        let config = test_config();
+        let input = "Cost is $5 and $10 with * real _ bad_ here";
+
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        let md037_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule().id == "MD037")
+            .collect();
+
+        assert_eq!(md037_violations.len(), 1);
     }
 }
