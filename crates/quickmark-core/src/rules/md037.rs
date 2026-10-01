@@ -24,7 +24,7 @@ static UNDERSCORE_EMPHASIS_REGEX: Lazy<Regex> = Lazy::new(|| {
 /// Whether the byte at `pos` is escaped, i.e. preceded by an odd number of backslashes. An escaped
 /// marker is literal text rather than a delimiter, so `\* a \*` is not emphasis with spaces inside
 /// it and markdownlint does not report it.
-fn is_escaped(text: &str, pos: usize) -> bool {
+pub(crate) fn is_escaped(text: &str, pos: usize) -> bool {
     let bytes = text.as_bytes();
     let mut backslashes = 0;
     while backslashes < pos && bytes[pos - backslashes - 1] == b'\\' {
@@ -77,12 +77,7 @@ impl MD037Linter {
         let literal_spans = literal_ranges(&text);
 
         // Check for asterisk emphasis violations
-        self.check_emphasis_pattern(
-            &text,
-            start_byte,
-            &ASTERISK_EMPHASIS_REGEX,
-            &literal_spans,
-        );
+        self.check_emphasis_pattern(&text, start_byte, &ASTERISK_EMPHASIS_REGEX, &literal_spans);
 
         // Check for underscore emphasis violations
         self.check_emphasis_pattern(
@@ -116,11 +111,12 @@ impl MD037Linter {
             ) {
                 // Only the markers have to sit outside literal content; what is between them may
                 // contain code spans, links or math.
-                if marker_in_literal(
-                    &literal_spans,
-                    opening_marker.start(),
-                    opening_marker.end(),
-                ) || marker_in_literal(&literal_spans, closing_marker.start(), closing_marker.end())
+                if marker_in_literal(literal_spans, opening_marker.start(), opening_marker.end())
+                    || marker_in_literal(
+                        literal_spans,
+                        closing_marker.start(),
+                        closing_marker.end(),
+                    )
                 {
                     continue;
                 }

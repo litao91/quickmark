@@ -1,3 +1,5 @@
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::Deserialize;
 use std::rc::Rc;
 
@@ -5,7 +7,158 @@ use tree_sitter::Node;
 
 use crate::linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation};
 
+use super::md037::is_escaped;
+use super::md049::{CODE_SPAN_REGEX, MATH_REGEX};
 use super::{Rule, RuleType};
+
+// Inline content that micromark tokenises as something other than `data`, which is the only child
+// markdownlint tolerates inside a reported emphasis. Each alternative is one token type: character
+// escape, inline HTML tag, angle-bracket autolink, GFM autolink literal, GFM email literal, and
+// character reference. A bare `<`, `&` or `]` stays literal text, so none of those characters
+// appears here on its own.
+static NON_DATA_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"\\[!-/:-@\[-_`{-~]",
+        r"|</?[A-Za-z][A-Za-z0-9-]*(?:[\s/][^>\n]*)?>",
+        r"|<(?:[A-Za-z][A-Za-z0-9+.-]*:[^<>\n]*|[^<>\s@]+@[^<>\s@]+\.[^<>\s]+)>",
+        r"|(?:www\.|[A-Za-z][A-Za-z0-9+.-]*://)[^<>\s]",
+        r"|[^<>\s@]+@[^<>\s@]+\.[A-Za-z]{2,}",
+        r"|&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]{1,31});",
+    ))
+    .expect("Invalid MD036 non-data regex")
+});
+
+/// A run of `*` or `_` that CommonMark may use to open or close emphasis.
+struct DelimiterRun {
+    marker: u8,
+    len: usize,
+    can_open: bool,
+    can_close: bool,
+}
+
+/// The delimiter runs in `text`, approximating CommonMark's flanking rules: a run opens when
+/// non-whitespace follows it and closes when non-whitespace precedes it. A `_` between two
+/// alphanumeric characters is not a delimiter at all, which is why `snake_case_name` is plain text
+/// while `_name_` is not.
+fn delimiter_runs(text: &str) -> Vec<DelimiterRun> {
+    let bytes = text.as_bytes();
+    let mut runs = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let marker = bytes[index];
+        if (marker != b'*' && marker != b'_') || is_escaped(text, index) {
+            index += 1;
+            continue;
+        }
+        let end = index + bytes[index..].iter().take_while(|&&b| b == marker).count();
+        let before = index.checked_sub(1).map(|previous| bytes[previous]);
+        let after = bytes.get(end).copied();
+        let intraword = marker == b'_'
+            && before.is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && after.is_some_and(|byte| byte.is_ascii_alphanumeric());
+        if !intraword {
+            runs.push(DelimiterRun {
+                marker,
+                len: end - index,
+                can_open: after.is_some_and(|byte| !byte.is_ascii_whitespace()),
+                can_close: before.is_some_and(|byte| !byte.is_ascii_whitespace()),
+            });
+        }
+        index = end;
+    }
+    runs
+}
+
+/// Whether CommonMark's "rule of 3" keeps two runs apart: when either run can both open and close,
+/// their lengths must not sum to a multiple of three unless both are themselves multiples of three.
+/// This is what makes `**a*b**` one strong emphasis rather than a nested pair.
+fn rule_of_three_blocks(opener_can_close: bool, opener_len: usize, closer: &DelimiterRun) -> bool {
+    (opener_can_close || closer.can_open)
+        && (opener_len + closer.len).is_multiple_of(3)
+        && !(opener_len.is_multiple_of(3) && closer.len.is_multiple_of(3))
+}
+
+/// Whether `text` holds a matched emphasis pair. A marker that never finds a partner stays literal
+/// data, so counting markers is not enough — `**a*b**` is plain text but `**a*b*c**` is not.
+fn has_emphasis_pair(text: &str) -> bool {
+    let runs = delimiter_runs(text);
+    runs.iter().enumerate().any(|(opener_index, opener)| {
+        opener.can_open
+            && runs[opener_index + 1..].iter().any(|closer| {
+                closer.marker == opener.marker
+                    && closer.can_close
+                    && !rule_of_three_blocks(opener.can_close, opener.len, closer)
+            })
+    })
+}
+
+/// Whether the leading delimiter run of an emphasis is claimed by a run inside its own content,
+/// which leaves trailing text in the paragraph. In `**a**b**` the inner `**` closes the emphasis
+/// after `a`, so the paragraph is a strong plus the literal `b**` — two children, not one.
+fn opener_claimed_by_inner(inner: &str, outer_len: usize, marker: u8) -> bool {
+    delimiter_runs(inner)
+        .iter()
+        // The leading run sits at the start of the paragraph, so it can never close.
+        .any(|run| {
+            run.marker == marker && run.can_close && !rule_of_three_blocks(false, outer_len, run)
+        })
+}
+
+/// The content of `text` when the whole inline is a single emphasis span, otherwise `None`.
+///
+/// `***x***` nests an emphasis inside a strong, so neither token holds plain data on its own and
+/// the paragraph is left alone. Leading indentation is consumed at block level and does not matter,
+/// but whitespace *after* the closing delimiter does — the caller checks for it in the document.
+fn sole_emphasis_content(text: &str) -> Option<&str> {
+    let text = text.trim_start();
+    let bytes = text.as_bytes();
+    let marker = *bytes.first()?;
+    if marker != b'*' && marker != b'_' {
+        return None;
+    }
+    let run_len = bytes.iter().take_while(|&&byte| byte == marker).count();
+    if !matches!(run_len, 1 | 2) || bytes.len() <= 2 * run_len {
+        return None;
+    }
+    let closing = &bytes[bytes.len() - run_len..];
+    if closing.iter().any(|&byte| byte != marker) {
+        return None;
+    }
+    // Markers adjacent to the content belong to the delimiters, so the run lengths would be wrong.
+    if bytes[run_len] == marker || bytes[bytes.len() - run_len - 1] == marker {
+        return None;
+    }
+    let inner = &text[run_len..bytes.len() - run_len];
+    (!opener_claimed_by_inner(inner, run_len, marker)).then_some(inner)
+}
+
+/// Whether the emphasized content carries inline markup of its own. markdownlint reports an
+/// emphasis only when its text child is a single `data` token, so `**\`code\`**`, `**$x$**`,
+/// `**a [b] c**` and `**a _b_ c**` are all left alone. An unmatched marker is literal and does not
+/// count, which is why the emphasis scan is paired rather than a search for `*`.
+fn contains_inline_markup(text: &str) -> bool {
+    text.contains('\n')
+        || text.contains('[')
+        || NON_DATA_REGEX.is_match(text)
+        || CODE_SPAN_REGEX.is_match(text)
+        || MATH_REGEX.is_match(text)
+        || has_emphasis_pair(text)
+}
+
+/// markdownlint only considers a paragraph whose micromark parent is the document's `content`
+/// chunk, which excludes anything nested in a list item, block quote, table cell or HTML block.
+/// tree-sitter wraps document-level blocks in `section` nodes, so those are the only other
+/// ancestors a candidate paragraph may have.
+fn is_document_level(node: &Node) -> bool {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if !matches!(ancestor.kind(), "section" | "document") {
+            return false;
+        }
+        current = ancestor.parent();
+    }
+    true
+}
 
 // MD036-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
@@ -35,70 +188,35 @@ impl MD036Linter {
         }
     }
 
-    fn is_meaningful_node(node: &Node) -> bool {
-        matches!(
-            node.kind(),
-            "text" | "emphasis" | "strong_emphasis" | "inline"
-        )
-    }
+    fn check_paragraph_for_emphasis_heading(&mut self, paragraph_node: &Node) {
+        if !is_document_level(paragraph_node) {
+            return;
+        }
 
-    fn extract_text_content(&self, node: &Node) -> String {
+        // A paragraph holds a single inline node covering all of its content.
+        let Some(inline_node) = paragraph_node.named_child(0) else {
+            return;
+        };
+        if inline_node.kind() != "inline" {
+            return;
+        }
+
         let source = self.context.get_document_content();
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        source[start_byte..end_byte].to_string()
-    }
-
-    fn check_inline_for_emphasis_heading(&mut self, inline_node: &Node) {
-        // Get the text content of the inline node
-        let inline_text = self.extract_text_content(inline_node);
-        let trimmed_text = inline_text.trim();
-
-        // Check if the entire inline text is emphasis (starts and ends with * or ** or _ or __)
-        if (trimmed_text.starts_with("**")
-            && trimmed_text.ends_with("**")
-            && trimmed_text.len() > 4)
-            || (trimmed_text.starts_with("__")
-                && trimmed_text.ends_with("__")
-                && trimmed_text.len() > 4)
-            || (trimmed_text.starts_with("*")
-                && trimmed_text.ends_with("*")
-                && trimmed_text.len() > 2
-                && !trimmed_text.starts_with("**"))
-            || (trimmed_text.starts_with("_")
-                && trimmed_text.ends_with("_")
-                && trimmed_text.len() > 2
-                && !trimmed_text.starts_with("__"))
-        {
-            // Extract the text inside the emphasis markers
-            let inner_text = if trimmed_text.starts_with("**") || trimmed_text.starts_with("__") {
-                &trimmed_text[2..trimmed_text.len() - 2]
-            } else {
-                &trimmed_text[1..trimmed_text.len() - 1]
-            };
-
-            // Process this as emphasis
-            self.process_emphasis_text(inner_text, inline_node);
+        let inline_text = &source[inline_node.start_byte()..inline_node.end_byte()];
+        let Some(inner_text) = sole_emphasis_content(inline_text) else {
+            return;
+        };
+        // Whitespace trailing the closing delimiter is a token of its own and counts as a second
+        // meaningful child, so `**x** ` reads as prose. Leading indentation does not: it is
+        // consumed at block level. The inline node ends before the trailing whitespace, so it has
+        // to be looked for in the document rather than in `inline_text`.
+        if source[inline_node.end_byte()..].starts_with([' ', '\t']) {
+            return;
         }
-    }
-
-    fn process_emphasis_text(&mut self, inner_text: &str, source_node: &Node) {
-        // Skip if text is empty
-        if inner_text.trim().is_empty() {
+        if inner_text.trim().is_empty() || contains_inline_markup(inner_text) {
             return;
         }
 
-        // Check if text is single line (no newlines)
-        if inner_text.contains('\n') {
-            return;
-        }
-
-        // Check if text contains links - if so, allow it
-        if inner_text.contains("[") && inner_text.contains("](") {
-            return;
-        }
-
-        // Get punctuation configuration
         let punctuation_chars = &self
             .context
             .config
@@ -106,25 +224,26 @@ impl MD036Linter {
             .settings
             .emphasis_as_heading
             .punctuation;
-
-        // Check if text ends with punctuation
-        if let Some(last_char) = inner_text.trim().chars().last() {
-            if punctuation_chars.contains(last_char) {
-                return; // Allow if ends with punctuation
-            }
+        if inner_text
+            .chars()
+            .next_back()
+            .is_some_and(|last_char| punctuation_chars.contains(last_char))
+        {
+            return; // A sentence ending in punctuation reads as prose, not as a heading
         }
 
-        // Create violation
+        let start = inline_node.start_position();
+        let end = inline_node.end_position();
         let range = tree_sitter::Range {
             start_byte: 0, // Not used by range_from_tree_sitter
             end_byte: 0,   // Not used by range_from_tree_sitter
             start_point: tree_sitter::Point {
-                row: source_node.start_position().row,
-                column: source_node.start_position().column,
+                row: start.row,
+                column: start.column,
             },
             end_point: tree_sitter::Point {
-                row: source_node.end_position().row,
-                column: source_node.end_position().column,
+                row: end.row,
+                column: end.column,
             },
         };
 
@@ -134,132 +253,6 @@ impl MD036Linter {
             self.context.file_path.clone(),
             range_from_tree_sitter(&range),
         ));
-    }
-
-    fn process_emphasis_node(&mut self, emphasis_node: &Node) {
-        let text_content = self.extract_text_content(emphasis_node);
-        let trimmed_text = text_content.trim();
-
-        // Skip if text is empty
-        if trimmed_text.is_empty() {
-            return;
-        }
-
-        // Check if text is single line (no newlines)
-        if trimmed_text.contains('\n') {
-            return;
-        }
-
-        // Check if the emphasis contains only text (no links, etc.)
-        let mut has_only_text = true;
-        let mut inner_cursor = emphasis_node.walk();
-        if inner_cursor.goto_first_child() {
-            loop {
-                let inner_child = inner_cursor.node();
-                if inner_child.kind() != "text" && !inner_child.kind().is_empty() {
-                    has_only_text = false;
-                    break;
-                }
-                if !inner_cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
-
-        if !has_only_text {
-            return;
-        }
-
-        // Get punctuation configuration
-        let punctuation_chars = &self
-            .context
-            .config
-            .linters
-            .settings
-            .emphasis_as_heading
-            .punctuation;
-
-        // Check if text ends with punctuation
-        if let Some(last_char) = trimmed_text.chars().last() {
-            if punctuation_chars.contains(last_char) {
-                return; // Allow if ends with punctuation
-            }
-        }
-
-        // Create violation
-        let range = tree_sitter::Range {
-            start_byte: 0, // Not used by range_from_tree_sitter
-            end_byte: 0,   // Not used by range_from_tree_sitter
-            start_point: tree_sitter::Point {
-                row: emphasis_node.start_position().row,
-                column: emphasis_node.start_position().column,
-            },
-            end_point: tree_sitter::Point {
-                row: emphasis_node.end_position().row,
-                column: emphasis_node.end_position().column,
-            },
-        };
-
-        self.violations.push(RuleViolation::new(
-            &MD036,
-            format!("Emphasis used instead of heading: '{trimmed_text}'"),
-            self.context.file_path.clone(),
-            range_from_tree_sitter(&range),
-        ));
-    }
-
-    fn is_inside_list_item(&self, node: &Node) -> bool {
-        let mut current = node.parent();
-        while let Some(parent) = current {
-            match parent.kind() {
-                "list_item" => return true,
-                "document" => return false, // Reached document root
-                _ => current = parent.parent(),
-            }
-        }
-        false
-    }
-
-    fn check_paragraph_for_emphasis_heading(&mut self, paragraph_node: &Node) {
-        // Check if this paragraph is inside a list item - if so, skip it
-        if self.is_inside_list_item(paragraph_node) {
-            return;
-        }
-
-        // Check if paragraph contains only emphasis or strong emphasis
-        let mut meaningful_children = Vec::new();
-        let mut cursor = paragraph_node.walk();
-
-        // Get all children of the paragraph
-        if cursor.goto_first_child() {
-            loop {
-                let child = cursor.node();
-                if Self::is_meaningful_node(&child) {
-                    meaningful_children.push(child);
-                }
-                if !cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
-
-        // Check if paragraph has exactly one meaningful child that is an inline node
-        if meaningful_children.len() == 1 {
-            let child = meaningful_children[0];
-            match child.kind() {
-                "inline" => {
-                    // Look inside the inline node for emphasis or strong emphasis
-                    self.check_inline_for_emphasis_heading(&child);
-                }
-                "emphasis" | "strong_emphasis" => {
-                    // Direct emphasis node (shouldn't happen with markdown structure, but handle it)
-                    self.process_emphasis_node(&child);
-                }
-                _ => {
-                    // Not an emphasis node, skip
-                }
-            }
-        }
     }
 }
 
@@ -412,5 +405,81 @@ mod test {
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(violations.len(), 0);
+    }
+
+    /// Every expectation below was measured against markdownlint-cli2 v0.23.3, whose MD036 reports
+    /// only a paragraph whose single meaningful child is an emphasis token holding one `data` token.
+    fn count(input: &str) -> usize {
+        let config = test_default_config();
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        linter.analyze().len()
+    }
+
+    #[test]
+    fn test_emphasis_wrapping_code_span_allowed() {
+        assert_eq!(count("**`Lifecycle#start`**\n\nContent."), 0);
+        assert_eq!(count("**a `b` c**\n\nContent."), 0);
+    }
+
+    #[test]
+    fn test_emphasis_wrapping_math_allowed() {
+        assert_eq!(count("**$x^2$**\n\nContent."), 0);
+        assert_eq!(count("**a $b$ c**\n\nContent."), 0);
+        // An unpaired `$$` is literal text, so the content really is plain.
+        assert_eq!(count("**a $$ b**\n\nContent."), 1);
+    }
+
+    #[test]
+    fn test_emphasis_in_block_quote_allowed() {
+        assert_eq!(count("> **Cut**\n\nContent."), 0);
+        assert_eq!(count("> _License: TBD_\n\nContent."), 0);
+    }
+
+    #[test]
+    fn test_two_emphasis_spans_in_one_paragraph_allowed() {
+        assert_eq!(count("**Lexical analysis** or **scanning**\n\nContent."), 0);
+        // The inner `**` closes the leading run, leaving `b**` as a second child.
+        assert_eq!(count("**a**b**\n\nContent."), 0);
+    }
+
+    #[test]
+    fn test_nested_emphasis_allowed() {
+        assert_eq!(count("**an _lvalue_ or an _rvalue_**\n\nContent."), 0);
+        assert_eq!(count("**a*b*c**\n\nContent."), 0);
+        assert_eq!(count("**_a_**\n\nContent."), 0);
+        assert_eq!(count("***bold italic***\n\nContent."), 0);
+    }
+
+    #[test]
+    fn test_unpaired_markers_are_plain_text() {
+        // A marker that never finds a partner stays `data`, so the emphasis still qualifies.
+        assert_eq!(count("**a*b**\n\nContent."), 1);
+        assert_eq!(count("**a_b**\n\nContent."), 1);
+        assert_eq!(count("**snake_case_name**\n\nContent."), 1);
+        assert_eq!(count("**a]b**\n\nContent."), 1);
+        assert_eq!(count("**a<b**\n\nContent."), 1);
+        assert_eq!(count("**AT&T**\n\nContent."), 1);
+        assert_eq!(count("**a ~~b~~ c**\n\nContent."), 1);
+    }
+
+    #[test]
+    fn test_markup_characters_that_are_not_plain_text() {
+        assert_eq!(count("**a\\_b**\n\nContent."), 0); // character escape
+        assert_eq!(count("**a&nbsp;b**\n\nContent."), 0); // character reference
+        assert_eq!(count("**<a>**\n\nContent."), 0); // inline HTML
+        assert_eq!(count("**see www.example.com now**\n\nContent."), 0); // GFM autolink literal
+        assert_eq!(count("**mail foo@bar.com ok**\n\nContent."), 0); // GFM email literal
+        assert_eq!(count("**a[b**\n\nContent."), 0); // label start
+                                                     // A reference without its semicolon is not recognised, so this one stays plain.
+        assert_eq!(count("**&amp**\n\nContent."), 1);
+    }
+
+    #[test]
+    fn test_trailing_whitespace_allowed() {
+        // Trailing whitespace is a token of its own and makes the paragraph two children.
+        assert_eq!(count("**x** \n\nContent."), 0);
+        assert_eq!(count("**x**\t\n\nContent."), 0);
+        // Leading indentation is consumed at block level and changes nothing.
+        assert_eq!(count("  **x**\n\nContent."), 1);
     }
 }
