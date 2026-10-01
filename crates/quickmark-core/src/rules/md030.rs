@@ -95,11 +95,19 @@ impl MD030Linter {
     }
 
     fn is_single_line_list(&self, list_items: &[Node]) -> bool {
-        // A list is single-line if all its items are single-line
-        // (i.e., each item starts and ends on the same line)
-        list_items
-            .iter()
-            .all(|item| item.start_position().row == item.end_position().row)
+        // A list is single-line if all its items are single-line. A block's end position swallows its
+        // trailing newline, so an item whose content fits on one line ends at column 0 of the next
+        // row — comparing the rows directly would make every item look multi-line and quietly pin
+        // this rule to `ul_multi`/`ol_multi`.
+        list_items.iter().all(|item| {
+            let end = item.end_position();
+            let last_row = if end.column == 0 {
+                end.row.saturating_sub(1)
+            } else {
+                end.row
+            };
+            item.start_position().row == last_row
+        })
     }
 
     fn get_expected_spaces(&self, is_ordered: bool, is_single_line: bool) -> usize {
@@ -183,9 +191,11 @@ pub const MD030: Rule = Rule {
 mod test {
     use std::path::PathBuf;
 
-    use crate::config::{QuickmarkConfig, RuleSeverity};
+    use crate::config::{LintersSettingsTable, QuickmarkConfig, RuleSeverity};
     use crate::linter::MultiRuleLinter;
-    use crate::test_utils::test_helpers::test_config_with_rules;
+    use crate::test_utils::test_helpers::{test_config_with_rules, test_config_with_settings};
+
+    use super::MD030ListMarkerSpaceTable;
 
     fn test_config() -> QuickmarkConfig {
         test_config_with_rules(vec![("list-marker-space", RuleSeverity::Error)])
@@ -396,5 +406,79 @@ mod test {
             let violations = linter.analyze();
             assert_eq!(1, violations.len(), "expected one violation for {input:?}");
         }
+    }
+
+    /// markdownlint reads "single" as tight and "multi" as loose: a list whose items are separated by
+    /// blank lines, or whose items span more than one line, is judged against `ul_multi`/`ol_multi`,
+    /// and everything else against `ul_single`/`ol_single`. The four defaults are all 1, so nothing
+    /// below is observable in a default configuration — these pin the distinction itself.
+    ///
+    /// Every count was measured against markdownlint-cli2 v0.23.3 with the single settings at 1 and
+    /// the multi settings at 3, which makes the two readings disagree on every input.
+    fn split_spacing_config() -> QuickmarkConfig {
+        test_config_with_settings(
+            vec![("list-marker-space", RuleSeverity::Error)],
+            LintersSettingsTable {
+                list_marker_space: MD030ListMarkerSpaceTable {
+                    ul_single: 1,
+                    ol_single: 1,
+                    ul_multi: 3,
+                    ol_multi: 3,
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    fn count_with_split_spacing(input: &str) -> usize {
+        let mut linter = MultiRuleLinter::new_for_document(
+            PathBuf::from("test.md"),
+            split_spacing_config(),
+            input,
+        );
+        linter.analyze().len()
+    }
+
+    #[test]
+    fn test_tight_list_is_judged_as_single() {
+        assert_eq!(0, count_with_split_spacing("- one space\n- one space\n"));
+        assert_eq!(
+            2,
+            count_with_split_spacing("-   three space\n-   three space\n")
+        );
+        // A single item, and one at end of file with no trailing newline, are still single.
+        assert_eq!(1, count_with_split_spacing("-   three space\n"));
+        assert_eq!(1, count_with_split_spacing("-   three space"));
+    }
+
+    #[test]
+    fn test_loose_list_is_judged_as_multi() {
+        // Each item's content is one line, but the blank line between them makes the list loose.
+        assert_eq!(
+            0,
+            count_with_split_spacing("-   three space\n\n-   three space\n")
+        );
+        assert_eq!(2, count_with_split_spacing("- one space\n\n- one space\n"));
+    }
+
+    #[test]
+    fn test_item_spanning_lines_is_judged_as_multi() {
+        assert_eq!(
+            0,
+            count_with_split_spacing("-   three space\n    continued\n-   three space\n")
+        );
+        assert_eq!(
+            2,
+            count_with_split_spacing("- one space\n  continued\n- one space\n")
+        );
+    }
+
+    #[test]
+    fn test_ordered_list_splits_the_same_way() {
+        assert_eq!(0, count_with_split_spacing("1. one space\n2. one space\n"));
+        assert_eq!(
+            2,
+            count_with_split_spacing("1.  two space\n\n2.  two space\n")
+        );
     }
 }
