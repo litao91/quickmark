@@ -27,6 +27,7 @@
 //! // linter is now invalid - create new one for next document
 //! ```
 
+pub mod ast;
 pub mod config;
 pub mod linter;
 pub mod rules;

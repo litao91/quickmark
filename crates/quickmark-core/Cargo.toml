@@ -12,6 +12,10 @@ categories = ["text-processing", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
+# default-features is load-bearing: comrak's defaults are ["cli", "syntect-onig", "bon"], and
+# syntect-onig pulls oniguruma — a C library — plus clap. Without this we would trade tree-sitter's
+# C grammar for a different C dependency and break the Windows release matrix.
+comrak = { version = "0.55", default-features = false }
 linkify = "0.11"
 once_cell = "1.21"
 regex = "1.13"
