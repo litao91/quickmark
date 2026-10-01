@@ -581,14 +581,14 @@ impl<'a> Builder<'a> {
                     self.block_end(node),
                 );
                 drop(data);
-                out.extend(self.emit_paragraph(start, end));
+                out.extend(self.emit_paragraph(start, end, Some(node)));
             }
             NodeValue::Heading(heading) => {
                 let heading = *heading;
                 let (start, end) = (self.start_col(node, nesting), self.block_end(node));
                 let underline_row = (node.data().sourcepos.end.line - 1) as u32;
                 drop(data);
-                let index = self.emit_heading(&heading, start, end, underline_row);
+                let index = self.emit_heading(&heading, start, end, underline_row, node);
                 out.push(index);
             }
             NodeValue::ThematicBreak => {
@@ -627,19 +627,6 @@ impl<'a> Builder<'a> {
                 let index = self.emit_list_item(node, &list, nesting);
                 out.push(index);
             }
-            // Inline content. `inline` is a leaf on purpose — see KIND_NAMES_FORBIDDEN.
-            NodeValue::Text(_)
-            | NodeValue::Code(_)
-            | NodeValue::Emph
-            | NodeValue::Strong
-            | NodeValue::Link(_)
-            | NodeValue::Image(_)
-            | NodeValue::HtmlInline(_)
-            | NodeValue::SoftBreak
-            | NodeValue::LineBreak
-            | NodeValue::Raw(_)
-            | NodeValue::EscapedTag(_)
-            | NodeValue::Math(_) => {}
             other => {
                 let description = format!("{other:?}");
                 drop(data);
@@ -755,7 +742,7 @@ impl<'a> Builder<'a> {
             // The paragraph is the marker's own line and nothing more: whatever follows belongs to
             // the item's next block, not to the text `[x]`.
             let end = self.lines.block_end_row(start.0);
-            let paragraph = self.emit_paragraph((start.0, item_content_col), end);
+            let paragraph = self.emit_paragraph((start.0, item_content_col), end, None);
             children.splice(0..0, paragraph);
         }
 
@@ -818,7 +805,16 @@ impl<'a> Builder<'a> {
     /// A paragraph, or the link reference definitions comrak left at its head plus whatever
     /// paragraph remains. tree-sitter-md emits both for `[a]: /u\nbar`; comrak keeps one paragraph
     /// spanning both lines.
-    fn emit_paragraph(&mut self, start: (u32, u32), end: (u32, u32)) -> Vec<u32> {
+    ///
+    /// `source` is comrak's paragraph, whose inline children are hung off the synthesized `inline`
+    /// node. It is `None` only for the paragraph this file invents for a bare task marker, which
+    /// comrak produced nothing for.
+    fn emit_paragraph(
+        &mut self,
+        start: (u32, u32),
+        end: (u32, u32),
+        source: Option<ComrakNode<'a>>,
+    ) -> Vec<u32> {
         let mut out = Vec::new();
         let last_row = if end.1 == 0 {
             end.0.saturating_sub(1)
@@ -843,9 +839,68 @@ impl<'a> Builder<'a> {
         self.cover(index);
         let inline_end = (last_row, self.lines.inline_end_col(last_row as usize));
         let inline = self.add(Kind::Inline, paragraph_start, inline_end);
+        if let Some(source) = source {
+            self.emit_inline(inline, source);
+        }
         self.push(index, inline);
         out.push(index);
         out
+    }
+
+    /// comrak's inline children of a paragraph or heading, hung off the synthesized `inline` node.
+    ///
+    /// Spans follow the inline convention rather than the block one: comrak's `LineColumn` is 1-based
+    /// and end-inclusive, so a start converts to `(line - 1, column - 1)` and an end to
+    /// `(line - 1, column)`. An inline end does not swallow a newline. Columns count UTF-8 bytes,
+    /// and are absolute — comrak has already skipped the `> ` of a block quote or the indent of a
+    /// list item.
+    ///
+    /// These are in the tree but are deliberately not handed to `RuleLinter::feed` and not put in
+    /// `node_cache`; see [`Kind::is_inline`]. Rules opt in by walking, one at a time, so that
+    /// switching a kind on cannot make a dead `match` arm fire alongside the regex path it is meant
+    /// to replace — md039, md042, md044, md049, md050, md051, md052, md059 and md037 all have both.
+    fn emit_inline(&mut self, parent: u32, node: ComrakNode<'a>) {
+        for child in node.children() {
+            self.emit_inline_node(parent, child);
+        }
+    }
+
+    fn emit_inline_node(&mut self, parent: u32, node: ComrakNode<'a>) {
+        let kind = match &node.data().value {
+            NodeValue::Text(_) => Kind::Text,
+            NodeValue::Code(_) => Kind::CodeSpan,
+            NodeValue::Emph => Kind::Emphasis,
+            NodeValue::Strong => Kind::StrongEmphasis,
+            NodeValue::Link(_) => Kind::Link,
+            NodeValue::Image(_) => Kind::Image,
+            NodeValue::HtmlInline(_) => Kind::HtmlInline,
+            // A line break carries no structure a rule can use, and the `text` nodes either side of
+            // it already cover the bytes. `Raw` and `EscapedTag` are comrak's text-like leftovers.
+            NodeValue::SoftBreak
+            | NodeValue::LineBreak
+            | NodeValue::Raw(_)
+            | NodeValue::EscapedTag(_) => return,
+            other => {
+                let description = format!("{other:?}");
+                debug_assert!(
+                    false,
+                    "unmapped comrak inline node {description} — map it or leave its extension flag off"
+                );
+                return;
+            }
+        };
+
+        let sourcepos = node.data().sourcepos;
+        let index = self.add(
+            kind,
+            (
+                (sourcepos.start.line - 1) as u32,
+                (sourcepos.start.column - 1) as u32,
+            ),
+            ((sourcepos.end.line - 1) as u32, sourcepos.end.column as u32),
+        );
+        self.emit_inline(index, node);
+        self.push(parent, index);
     }
 
     fn emit_heading(
@@ -854,19 +909,20 @@ impl<'a> Builder<'a> {
         start: (u32, u32),
         end: (u32, u32),
         underline_row: u32,
+        source: ComrakNode<'a>,
     ) -> u32 {
         if heading.setext {
-            self.emit_setext_heading(heading, start, end, underline_row)
+            self.emit_setext_heading(heading, start, end, underline_row, source)
         } else {
-            self.emit_atx_heading(heading, start, end)
+            self.emit_atx_heading(start, end, source)
         }
     }
 
     fn emit_atx_heading(
         &mut self,
-        heading: &NodeHeading,
         start: (u32, u32),
         end: (u32, u32),
+        source: ComrakNode<'a>,
     ) -> u32 {
         let index = self.add(Kind::AtxHeading, start, end);
         self.cover(index);
@@ -880,9 +936,9 @@ impl<'a> Builder<'a> {
         self.push(index, marker_node);
         if let Some(span) = parts.inline {
             let inline_node = self.add(Kind::Inline, span.start(), span.end());
+            self.emit_inline(inline_node, source);
             self.push(index, inline_node);
         }
-        let _ = heading;
         index
     }
 
@@ -894,6 +950,7 @@ impl<'a> Builder<'a> {
         start: (u32, u32),
         end: (u32, u32),
         underline_row: u32,
+        source: ComrakNode<'a>,
     ) -> u32 {
         let index = self.add(Kind::SetextHeading, start, end);
 
@@ -904,6 +961,7 @@ impl<'a> Builder<'a> {
             start,
             (text_row, self.lines.inline_end_col(text_row as usize)),
         );
+        self.emit_inline(inline, source);
         self.push(paragraph, inline);
         self.push(index, paragraph);
 
@@ -916,6 +974,10 @@ impl<'a> Builder<'a> {
     }
 
     fn emit_table(&mut self, start: (u32, u32), end: (u32, u32), rows: &[(u32, bool)]) -> u32 {
+        // Cells come from `synth::table_rows`, not from comrak's `TableCell` children, so they are
+        // leaves: comrak's cells are autocompleted to the header width and their spans include the
+        // surrounding padding, which is why they are not used. A rule that needs inline structure
+        // inside a cell therefore has to work from the cell's byte range, not from its children.
         let index = self.add(Kind::PipeTable, start, end);
         self.cover(index);
 

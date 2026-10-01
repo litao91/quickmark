@@ -11,10 +11,10 @@
 //!   Every rule that asks "is the line after this block blank?" depends on the difference, so
 //!   [`block_end`] normalizes it.
 //!
-//! Node kinds are the names tree-sitter-md's *block* grammar produces. Its inline half is a
-//! different grammar that quickmark has never parsed, so kinds like `link`, `code_span`, `emphasis`
-//! and `text` are intentionally absent — the rule branches matching them are dead today and turning
-//! them on is a separate, behaviour-changing project. [`KIND_NAMES_FORBIDDEN`] pins that.
+//! Block kinds are the names tree-sitter-md's block grammar produced, because that is what 53 rule
+//! files match on. Inline kinds come from comrak and are in the tree, but they are neither fed to
+//! rules nor cached — see [`Kind::is_inline`] for why, and [`KIND_NAMES_FORBIDDEN`] for the spellings
+//! that must never appear at all.
 
 pub mod build;
 pub mod walker;
@@ -44,6 +44,13 @@ pub enum Kind {
     SetextH2Underline,
     Paragraph,
     Inline,
+    Text,
+    CodeSpan,
+    Emphasis,
+    StrongEmphasis,
+    Link,
+    Image,
+    HtmlInline,
     FencedCodeBlock,
     IndentedCodeBlock,
     CodeFenceContent,
@@ -90,6 +97,13 @@ pub const KIND_NAMES: &[&str] = &[
     "setext_h2_underline",
     "paragraph",
     "inline",
+    "text",
+    "code_span",
+    "emphasis",
+    "strong_emphasis",
+    "link",
+    "image",
+    "html_inline",
     "fenced_code_block",
     "indented_code_block",
     "code_fence_content",
@@ -116,23 +130,16 @@ pub const KIND_NAMES: &[&str] = &[
 
 /// Kinds that must stay out of [`KIND_NAMES`].
 ///
-/// tree-sitter-md's block grammar never produces them, so the rule branches matching them have
-/// never executed. Emitting them would make those branches live alongside the `inline`-text paths
-/// the same rules already use — `md039`/`md042` match `"link"` *and* `"inline"` in one `feed`, so
-/// both would fire and every link violation would be reported twice.
+/// No parser produces these. They appear in rule `match` arms as spellings of a kind that does not
+/// exist — `md059` asks for `"html_tag"` and `"inline_html"` where the real kind is `html_inline`,
+/// `md041` asks for `"html_flow"` where the tree emits `html_block`, `md013` asks for `"table"` and
+/// `"table_row"` where the tree emits `pipe_table` and `pipe_table_row`. Those arms have never
+/// executed and must not be "fixed" into existence by a well-meaning facade; the rules need fixing
+/// instead.
 pub const KIND_NAMES_FORBIDDEN: &[&str] = &[
-    "link",
-    "image",
     "label",
-    "text",
-    "code_span",
-    "emphasis",
-    "strong_emphasis",
-    "html_inline",
     "html_tag",
     "html_flow",
-    // Spellings no parser produces; they appear in rule match arms as typos and must not be
-    // "fixed" into existence by a well-meaning facade.
     "blockquote",
     "code_block",
     "table",
@@ -148,6 +155,26 @@ impl Kind {
     /// False only for [`Kind::Pipe`], matching tree-sitter's named/anonymous split.
     pub fn is_named(self) -> bool {
         self != Kind::Pipe
+    }
+
+    /// Whether this kind lives under an `inline` node.
+    ///
+    /// Inline nodes are in the tree but are neither fed to rules nor cached — see
+    /// [`crate::linter::MultiRuleLinter`]. Nine rules have both a dead `match` arm on an inline kind
+    /// and a live regex path over the enclosing `inline` text, so feeding them would report every
+    /// violation twice. A rule opts in by walking into `inline` itself and deleting its regex path
+    /// in the same change.
+    pub fn is_inline(self) -> bool {
+        matches!(
+            self,
+            Kind::Text
+                | Kind::CodeSpan
+                | Kind::Emphasis
+                | Kind::StrongEmphasis
+                | Kind::Link
+                | Kind::Image
+                | Kind::HtmlInline
+        )
     }
 }
 
@@ -251,6 +278,12 @@ impl<'a> Node<'a> {
 
     pub fn is_named(self) -> bool {
         self.node().kind.is_named()
+    }
+
+    /// Whether this node lives under an `inline`. Such nodes are in the tree but are neither fed to
+    /// rules nor cached; see [`Kind::is_inline`].
+    pub fn is_inline(self) -> bool {
+        self.node().kind.is_inline()
     }
 
     pub fn start_position(self) -> Point {
@@ -445,17 +478,58 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
-    /// Guards the invariant in [`KIND_NAMES_FORBIDDEN`]'s doc comment: the facade must not start
-    /// emitting inline kinds, or the dead rule branches matching them come alive next to the
-    /// `inline`-text paths those same rules already run.
+    /// Guards the invariant in [`KIND_NAMES_FORBIDDEN`]'s doc comment: no kind a rule misspells may
+    /// be emitted, or the dead branch matching it comes alive and silently changes what the rule
+    /// reports.
     #[test]
-    fn facade_emits_no_inline_kinds() {
+    fn facade_emits_no_forbidden_kinds() {
         for forbidden in KIND_NAMES_FORBIDDEN {
             assert!(
                 !KIND_NAMES.contains(forbidden),
-                "{forbidden} must not be emitted while rules still match it alongside \"inline\""
+                "{forbidden} must not be emitted while a rule still matches that spelling"
             );
         }
+    }
+
+    /// `Kind::is_inline` is what keeps inline nodes out of `feed` and `node_cache`, so a kind the
+    /// builder emits under `inline` but forgets to list there would be handed to every rule on every
+    /// document — which is exactly the double report this design exists to avoid.
+    #[test]
+    fn inline_is_exactly_the_subtree_under_an_inline_node() {
+        let source = "text *em* **strong** `code` [link](/u) ![img](/i) <b>html</b>\n";
+        let tree = build::parse(source);
+
+        let mut seen: Vec<&'static str> = Vec::new();
+        for index in 0..tree.node_count() {
+            let node = tree.node(index as u32);
+            let under_inline = node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "inline" || parent.is_inline());
+            assert_eq!(
+                node.is_inline(),
+                under_inline,
+                "{}: is_inline disagrees with its position in the tree",
+                node.kind()
+            );
+            if node.is_inline() {
+                seen.push(node.kind());
+            }
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            [
+                "code_span",
+                "emphasis",
+                "html_inline",
+                "image",
+                "link",
+                "strong_emphasis",
+                "text"
+            ],
+            "the builder emitted a different set of inline kinds than this test pins"
+        );
     }
 
     #[test]

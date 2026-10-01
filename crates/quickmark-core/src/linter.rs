@@ -155,10 +155,17 @@ impl Context {
     /// The tree is stored in pre-order, so walking it by index visits every node in document order
     /// and each kind's bucket comes out line-sorted — the property `md046` and `md048` relied on
     /// when they re-sorted defensively.
+    ///
+    /// Inline nodes are left out. `get_node_type_for_line` picks the smallest node covering a line
+    /// and every inline node is smaller than the block around it, so caching them would change which
+    /// kind MD013 sees on every line.
     fn build_node_cache(tree: &FacadeTree) -> HashMap<&'static str, Vec<NodeInfo>> {
         let mut cache: HashMap<&'static str, Vec<NodeInfo>> = HashMap::new();
         for index in 0..tree.node_count() {
             let node = tree.node(index as u32);
+            if node.is_inline() {
+                continue;
+            }
             cache.entry(node.kind()).or_default().push(NodeInfo {
                 line_start: node.start_position().row,
                 line_end: node.end_position().row,
@@ -324,9 +331,15 @@ impl MultiRuleLinter {
         };
 
         // Feed all nodes to all linters. Nodes are stored in pre-order, so this visits them in
-        // document order with no cursor and no recursion.
+        // document order with no cursor and no recursion. Inline nodes are skipped: nine rules have
+        // both a `match` arm on an inline kind and a regex path over the enclosing `inline` text, so
+        // feeding them would report the same violation twice. A rule that wants inline structure
+        // walks for it — see `ast::Kind::is_inline`.
         for index in 0..doc.node_count() {
             let node = doc.node(index as u32);
+            if node.is_inline() {
+                continue;
+            }
             for linter in &mut self.linters {
                 linter.feed(&node);
             }
@@ -363,7 +376,7 @@ mod test {
         rules::{md001::MD001, md003::MD003, md013::MD013},
     };
 
-    use super::MultiRuleLinter;
+    use super::{Context, MultiRuleLinter};
 
     #[test]
     fn test_multiple_violations() {
@@ -408,5 +421,53 @@ Second heading
         assert_eq!(4, violations[0].location().range.start.line);
         assert_eq!(MD003.id, violations[1].rule().id);
         assert_eq!(2, violations[1].location().range.start.line);
+    }
+
+    /// The node cache must hold block kinds only. `get_node_type_for_line` picks the smallest node
+    /// covering a line, and every inline node is smaller than the block around it, so caching them
+    /// would change which kind MD013 sees on every line of every document.
+    ///
+    /// The matching invariant for `feed` — that no rule is handed an inline node — is asserted by the
+    /// exact violation counts in md037, md039, md042, md044, md049, md050, md051, md052 and md059,
+    /// each of which has a dead `match` arm that would double-report if it were fed.
+    #[test]
+    fn node_cache_holds_no_inline_kinds() {
+        const INLINE: &[&str] = &[
+            "text",
+            "code_span",
+            "emphasis",
+            "strong_emphasis",
+            "link",
+            "image",
+            "html_inline",
+        ];
+        let source = "text *em* **strong** `code` [link](/u) ![img](/i) <b>html</b>\n";
+        let tree = crate::ast::build::parse(source);
+        let emitted = (0..tree.node_count())
+            .map(|index| tree.node(index as u32))
+            .filter(|node| node.is_inline())
+            .count();
+        assert!(
+            emitted > 0,
+            "the document should have produced inline nodes"
+        );
+
+        let context = Context::new(
+            PathBuf::from("test.md"),
+            QuickmarkConfig::default(),
+            source,
+            &tree,
+        );
+        let cache = context.node_cache.borrow();
+        let cached: Vec<&str> = cache
+            .keys()
+            .copied()
+            .filter(|kind| INLINE.contains(kind))
+            .collect();
+        assert!(cached.is_empty(), "cached inline kinds: {cached:?}");
+        assert!(
+            cache.contains_key("inline"),
+            "the `inline` node itself is a block-level child of the paragraph and must stay cached"
+        );
     }
 }

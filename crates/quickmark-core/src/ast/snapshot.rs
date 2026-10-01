@@ -59,12 +59,16 @@ const CASES: &[(&str, &str, &str)] = &[
   (section 0:0-5:0 0-24
     (atx_heading 0:0-1:0 0-6
       (atx_h1_marker 0:0-0:1 0-1)
-      (inline 0:2-0:5 2-5)
+      (inline 0:2-0:5 2-5
+        (text 0:2-0:5 2-5)
+      )
     )
     (section 2:0-5:0 7-24
       (atx_heading 2:0-3:0 7-19
         (atx_h2_marker 2:0-2:2 7-9)
-        (inline 2:4-2:11 11-18)
+        (inline 2:4-2:11 11-18
+          (text 2:4-2:7 11-14)
+        )
       )
       (section 4:0-5:0 20-24
         (atx_heading 4:0-5:0 20-24
@@ -83,13 +87,17 @@ const CASES: &[(&str, &str, &str)] = &[
   (section 0:0-5:0 0-21
     (setext_heading 0:0-2:0 0-12
       (paragraph 0:0-1:0 0-6
-        (inline 0:0-0:5 0-5)
+        (inline 0:0-0:5 0-5
+          (text 0:0-0:5 0-5)
+        )
       )
       (setext_h1_underline 1:0-1:5 6-11)
     )
     (setext_heading 3:0-5:0 13-21
       (paragraph 3:0-4:0 13-17
-        (inline 3:0-3:3 13-16)
+        (inline 3:0-3:3 13-16
+          (text 3:0-3:3 13-16)
+        )
       )
       (setext_h2_underline 4:0-4:3 17-20)
     )
@@ -106,10 +114,16 @@ const CASES: &[(&str, &str, &str)] = &[
   (section 4:0-9:0 18-40
     (atx_heading 4:0-5:0 18-22
       (atx_h1_marker 4:0-4:1 18-19)
-      (inline 4:2-4:3 20-21)
+      (inline 4:2-4:3 20-21
+        (text 4:2-4:3 20-21)
+      )
     )
     (paragraph 6:0-9:0 23-40
-      (inline 6:0-8:3 23-39)
+      (inline 6:0-8:3 23-39
+        (text 6:0-6:3 23-26)
+        (text 7:0-7:8 27-35)
+        (text 8:0-8:3 36-39)
+      )
     )
   )
 )
@@ -124,7 +138,9 @@ const CASES: &[(&str, &str, &str)] = &[
   (section 4:0-5:0 18-22
     (atx_heading 4:0-5:0 18-22
       (atx_h1_marker 4:0-4:1 18-19)
-      (inline 4:2-4:3 20-21)
+      (inline 4:2-4:3 20-21
+        (text 4:2-4:3 20-21)
+      )
     )
   )
 )
@@ -139,13 +155,17 @@ const CASES: &[(&str, &str, &str)] = &[
       (list_item 0:0-1:0 0-8
         (list_marker_minus 0:0-0:2 0-2)
         (paragraph 0:2-1:0 2-8
-          (inline 0:2-0:7 2-7)
+          (inline 0:2-0:7 2-7
+            (text 0:2-0:7 2-7)
+          )
         )
       )
       (list_item 1:0-3:0 8-17
         (list_marker_minus 1:0-1:2 8-10)
         (paragraph 1:2-2:0 10-16
-          (inline 1:2-1:7 10-15)
+          (inline 1:2-1:7 10-15
+            (text 1:2-1:7 10-15)
+          )
         )
       )
     )
@@ -153,13 +173,17 @@ const CASES: &[(&str, &str, &str)] = &[
       (list_item 3:0-5:0 17-27
         (list_marker_dot 3:0-3:3 17-20)
         (paragraph 3:3-4:0 20-26
-          (inline 3:3-3:8 20-25)
+          (inline 3:3-3:8 20-25
+            (text 3:3-3:8 20-25)
+          )
         )
       )
       (list_item 5:0-7:0 27-37
         (list_marker_dot 5:0-5:3 27-30)
         (paragraph 5:3-6:0 30-36
-          (inline 5:3-5:8 30-35)
+          (inline 5:3-5:8 30-35
+            (text 5:3-5:8 30-35)
+          )
         )
       )
     )
@@ -167,7 +191,9 @@ const CASES: &[(&str, &str, &str)] = &[
       (list_item 7:0-8:0 37-48
         (list_marker_minus 7:0-7:2 37-39)
         (paragraph 7:6-8:0 43-48
-          (inline 7:6-7:10 43-47)
+          (inline 7:6-7:10 43-47
+            (text 7:6-7:10 43-47)
+          )
         )
       )
     )
@@ -184,19 +210,25 @@ const CASES: &[(&str, &str, &str)] = &[
       (list_item 0:0-3:0 0-29
         (list_marker_minus 0:0-0:2 0-2)
         (paragraph 0:2-1:2 2-10
-          (inline 0:2-0:7 2-7)
+          (inline 0:2-0:7 2-7
+            (text 0:2-0:7 2-7)
+          )
         )
         (list 1:2-3:0 10-29
           (list_item 1:2-3:0 10-29
             (list_marker_minus 1:2-1:4 10-12)
             (paragraph 1:4-2:4 12-22
-              (inline 1:4-1:9 12-17)
+              (inline 1:4-1:9 12-17
+                (text 1:4-1:9 12-17)
+              )
             )
             (list 2:4-3:0 22-29
               (list_item 2:4-3:0 22-29
                 (list_marker_minus 2:4-2:6 22-24)
                 (paragraph 2:6-3:0 24-29
-                  (inline 2:6-2:10 24-28)
+                  (inline 2:6-2:10 24-28
+                    (text 2:6-2:10 24-28)
+                  )
                 )
               )
             )
@@ -229,11 +261,15 @@ const CASES: &[(&str, &str, &str)] = &[
         r#"(document 0:0-6:0 0-30
   (section 0:0-6:0 0-30
     (paragraph 0:0-1:0 0-5
-      (inline 0:0-0:4 0-4)
+      (inline 0:0-0:4 0-4
+        (text 0:0-0:4 0-4)
+      )
     )
     (indented_code_block 2:0-5:0 6-25)
     (paragraph 5:0-6:0 25-30
-      (inline 5:0-5:4 25-29)
+      (inline 5:0-5:4 25-29
+        (text 5:0-5:4 25-29)
+      )
     )
   )
 )
@@ -246,13 +282,18 @@ const CASES: &[(&str, &str, &str)] = &[
   (section 0:0-4:0 0-29
     (block_quote 0:0-4:0 0-29
       (paragraph 0:2-2:1 2-17
-        (inline 0:2-1:6 2-15)
+        (inline 0:2-1:6 2-15
+          (text 0:2-0:8 2-8)
+          (text 1:2-1:6 11-15)
+        )
       )
       (list 3:2-4:0 20-29
         (list_item 3:2-4:0 20-29
           (list_marker_minus 3:2-3:4 20-22)
           (paragraph 3:4-4:0 22-29
-            (inline 3:4-3:10 22-28)
+            (inline 3:4-3:10 22-28
+              (text 3:4-3:10 22-28)
+            )
           )
         )
       )
@@ -299,7 +340,13 @@ const CASES: &[(&str, &str, &str)] = &[
     (link_reference_definition 0:0-1:0 0-10)
     (link_reference_definition 1:0-2:0 10-24)
     (paragraph 3:0-4:0 25-34
-      (inline 3:0-3:8 25-33)
+      (inline 3:0-3:8 25-33
+        (text 3:0-3:4 25-29)
+        (link 3:4-3:7 29-32
+          (text 3:5-3:6 30-31)
+        )
+        (text 3:7-3:8 32-33)
+      )
     )
   )
 )
@@ -316,6 +363,76 @@ const CASES: &[(&str, &str, &str)] = &[
 )
 "#,
     ),
+    // Every kind the builder can emit under `inline`, including nesting, an escaped character and a
+    // character reference. The `text` spans are raw source, so `a\*b` keeps its backslash and `&amp;`
+    // keeps its five bytes — comrak's decoded payload is not what a rule reads through `utf8_text`.
+    (
+        "inline kinds",
+        "p *em* **st** ***b*** `c` [l](/u \"t\") ![i](/v) <b>h</b> a\\*b &amp;\n",
+        r#"(document 0:0-1:0 0-67
+  (section 0:0-1:0 0-67
+    (paragraph 0:0-1:0 0-67
+      (inline 0:0-0:66 0-66
+        (text 0:0-0:2 0-2)
+        (emphasis 0:2-0:6 2-6
+          (text 0:3-0:5 3-5)
+        )
+        (text 0:6-0:7 6-7)
+        (strong_emphasis 0:7-0:13 7-13
+          (text 0:9-0:11 9-11)
+        )
+        (text 0:13-0:14 13-14)
+        (emphasis 0:14-0:21 14-21
+          (strong_emphasis 0:15-0:20 15-20
+            (text 0:17-0:18 17-18)
+          )
+        )
+        (text 0:21-0:22 21-22)
+        (code_span 0:22-0:25 22-25)
+        (text 0:25-0:26 25-26)
+        (link 0:26-0:37 26-37
+          (text 0:27-0:28 27-28)
+        )
+        (text 0:37-0:38 37-38)
+        (image 0:38-0:46 38-46
+          (text 0:40-0:41 40-41)
+        )
+        (text 0:46-0:47 46-47)
+        (html_inline 0:47-0:50 47-50)
+        (text 0:50-0:51 50-51)
+        (html_inline 0:51-0:55 51-55)
+        (text 0:55-0:66 55-66)
+      )
+    )
+  )
+)
+"#,
+    ),
+    // An emphasis spanning a line break, and a shortcut reference link that comrak resolved.
+    (
+        "inline across lines",
+        "one *em\nstill em* three [ref] tail\n\n[ref]: /u\n",
+        r#"(document 0:0-4:0 0-46
+  (section 0:0-4:0 0-46
+    (paragraph 0:0-2:0 0-35
+      (inline 0:0-1:26 0-34
+        (text 0:0-0:4 0-4)
+        (emphasis 0:4-1:9 4-17
+          (text 0:5-0:7 5-7)
+          (text 1:0-1:8 8-16)
+        )
+        (text 1:9-1:16 17-24)
+        (link 1:16-1:21 24-29
+          (text 1:17-1:20 25-28)
+        )
+        (text 1:21-1:26 29-34)
+      )
+    )
+    (link_reference_definition 3:0-4:0 36-46)
+  )
+)
+"#,
+    ),
     (
         "no trailing newline",
         "# H\n\ntext",
@@ -323,10 +440,14 @@ const CASES: &[(&str, &str, &str)] = &[
   (section 0:0-2:4 0-9
     (atx_heading 0:0-1:0 0-4
       (atx_h1_marker 0:0-0:1 0-1)
-      (inline 0:2-0:3 2-3)
+      (inline 0:2-0:3 2-3
+        (text 0:2-0:3 2-3)
+      )
     )
     (paragraph 2:0-2:4 5-9
-      (inline 2:0-2:4 5-9)
+      (inline 2:0-2:4 5-9
+        (text 2:0-2:4 5-9)
+      )
     )
   )
 )
