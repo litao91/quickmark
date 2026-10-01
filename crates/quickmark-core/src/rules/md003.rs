@@ -1,9 +1,9 @@
+use crate::ast::Node;
 use core::fmt;
 use serde::Deserialize;
 use std::rc::Rc;
-use tree_sitter::Node;
 
-use crate::linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation};
+use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
 use super::{Rule, RuleType};
 
@@ -132,7 +132,7 @@ impl MD003Linter {
                 MD003.description, expected, actual
             ),
             self.context.file_path.clone(),
-            range_from_tree_sitter(&node.range()),
+            range_from_node_range(&node.range()),
         ));
     }
 }

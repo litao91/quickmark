@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
+use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -94,7 +94,7 @@ impl MD042Linter {
             &MD042,
             MD042.description.to_string(),
             self.context.file_path.clone(),
-            range_from_tree_sitter(&node.range()),
+            range_from_node_range(&node.range()),
         ));
     }
 }

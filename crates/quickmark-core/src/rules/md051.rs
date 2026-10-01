@@ -4,10 +4,10 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -23,7 +23,7 @@ pub struct MD051LinkFragmentsTable {
 #[derive(Debug, Clone)]
 struct LinkFragment {
     fragment: String,
-    range: tree_sitter::Range,
+    range: crate::ast::NodeRange,
 }
 
 // GitHub line fragment regex matching:
@@ -161,11 +161,11 @@ impl MD051Linter {
                             let match_end = start_byte + cap.get(0).unwrap().end();
                             fragments.push(LinkFragment {
                                 fragment: fragment.to_string(),
-                                range: tree_sitter::Range {
+                                range: crate::ast::NodeRange {
                                     start_byte: match_start,
                                     end_byte: match_end,
-                                    start_point: tree_sitter::Point::new(0, match_start),
-                                    end_point: tree_sitter::Point::new(0, match_end),
+                                    start_point: crate::ast::Point::new(0, match_start),
+                                    end_point: crate::ast::Point::new(0, match_end),
                                 },
                             });
                         }
@@ -332,7 +332,7 @@ impl RuleLinter for MD051Linter {
                     &MD051,
                     format!("Link fragment '{fragment}' does not match any heading or anchor in the document"),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&link_fragment.range),
+                    range_from_node_range(&link_fragment.range),
                 ));
             }
         }

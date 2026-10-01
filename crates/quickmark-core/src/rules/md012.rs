@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -83,8 +83,9 @@ impl MD012Linter {
     /// memory block (`Vec<bool>`) for marking lines, leading to better cache
     /// performance than a `HashSet`. It uses 0-based indexing consistently.
     ///
-    /// Note: Works around a tree-sitter-md issue where fenced code blocks
-    /// incorrectly include a blank line immediately after the closing fence.
+    /// Note: a block's range includes its trailing newline, so `line_end` is the row *after* the
+    /// closing fence. That row is outside the block and must not be masked, or a blank line
+    /// following a fence would be exempt from this rule.
     fn populate_code_block_mask(&self, mask: &mut [bool]) {
         let node_cache = self.context.node_cache.borrow();
         let lines = self.context.lines.borrow();
@@ -100,20 +101,17 @@ impl MD012Linter {
             }
         }
 
-        // Handle fenced code blocks with workaround for tree-sitter issue
+        // Handle fenced code blocks, dropping the row after the closing fence
         if let Some(fenced_blocks) = node_cache.get("fenced_code_block") {
             for node_info in fenced_blocks {
                 let mut end_line = node_info.line_end;
 
-                // Workaround: If the last line in the range is blank and doesn't contain
-                // a closing fence, exclude it (it's likely incorrectly included by tree-sitter)
+                // `line_end` is the row after the closing fence. When that row is blank it is not
+                // part of the block, so it stays subject to this rule.
                 if let Some(last_line) = lines.get(end_line) {
                     if last_line.trim().is_empty() {
-                        // Check if the previous line contains a closing fence
                         if let Some(prev_line) = lines.get(end_line.saturating_sub(1)) {
                             if prev_line.trim().starts_with("```") {
-                                // The previous line is the closing fence, so this blank line
-                                // should not be part of the code block
                                 end_line = end_line.saturating_sub(1);
                             }
                         }
@@ -144,7 +142,7 @@ impl MD012Linter {
             &MD012,
             message,
             self.context.file_path.clone(),
-            range_from_tree_sitter(&tree_sitter::Range {
+            range_from_node_range(&crate::ast::NodeRange {
                 // FIXME: Byte offsets are not correctly calculated because line start offsets are
                 // unavailable here. To fix this, the `Context` should provide a way to resolve
                 // a line index to its starting byte offset in the source file.
@@ -152,11 +150,11 @@ impl MD012Linter {
                 // incorrect highlighting in some tools.
                 start_byte: 0,
                 end_byte: 0,
-                start_point: tree_sitter::Point {
+                start_point: crate::ast::Point {
                     row: line_index,
                     column: 0,
                 },
-                end_point: tree_sitter::Point {
+                end_point: crate::ast::Point {
                     row: line_index,
                     column: 0,
                 },

@@ -1,12 +1,12 @@
 use serde::Deserialize;
 use std::rc::Rc;
 
+use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, Context, RuleViolation},
+    linter::{range_from_node_range, Context, RuleViolation},
     rules::{Rule, RuleLinter, RuleType},
 };
 
@@ -223,7 +223,7 @@ impl MD049Linter {
                     let global_start = start_offset + marker_start;
                     let global_end = global_start + 1;
 
-                    let range = tree_sitter::Range {
+                    let range = crate::ast::NodeRange {
                         start_byte: global_start,
                         end_byte: global_end,
                         start_point: self.byte_to_point(global_start),
@@ -234,7 +234,7 @@ impl MD049Linter {
                         &MD049,
                         message.clone(),
                         self.context.file_path.clone(),
-                        range_from_tree_sitter(&range),
+                        range_from_node_range(&range),
                     ));
                 }
             }
@@ -273,7 +273,7 @@ impl MD049Linter {
         self.process_emphasis_matches(&text, start_byte, &matches);
     }
 
-    fn byte_to_point(&self, byte_pos: usize) -> tree_sitter::Point {
+    fn byte_to_point(&self, byte_pos: usize) -> crate::ast::Point {
         let source = self.context.get_document_content();
         let mut line = 0;
         let mut column = 0;
@@ -290,7 +290,7 @@ impl MD049Linter {
             }
         }
 
-        tree_sitter::Point { row: line, column }
+        crate::ast::Point { row: line, column }
     }
 }
 

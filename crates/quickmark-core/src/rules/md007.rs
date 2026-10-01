@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -115,7 +115,7 @@ impl MD007Linter {
                 &MD007,
                 message,
                 self.context.file_path.clone(),
-                range_from_tree_sitter(&list_item.range()),
+                range_from_node_range(&list_item.range()),
             ));
         }
     }

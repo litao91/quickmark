@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
+use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, Context, RuleViolation},
+    linter::{range_from_node_range, Context, RuleViolation},
     rules::{Rule, RuleLinter, RuleType},
 };
 
@@ -165,7 +165,7 @@ impl MD037Linter {
         let violation_start = text_start_byte + opening_marker.end();
         let violation_end = text_start_byte + opening_space.end();
 
-        let range = tree_sitter::Range {
+        let range = crate::ast::NodeRange {
             start_byte: violation_start,
             end_byte: violation_end,
             start_point: self.byte_to_point(violation_start),
@@ -176,7 +176,7 @@ impl MD037Linter {
             &MD037,
             format!("{} [Context: \"{}{}\"]", MD037.description, marker, space),
             self.context.file_path.clone(),
-            range_from_tree_sitter(&range),
+            range_from_node_range(&range),
         ));
     }
 
@@ -191,7 +191,7 @@ impl MD037Linter {
         let violation_start = text_start_byte + closing_space.start();
         let violation_end = text_start_byte + closing_marker.end();
 
-        let range = tree_sitter::Range {
+        let range = crate::ast::NodeRange {
             start_byte: violation_start,
             end_byte: violation_end,
             start_point: self.byte_to_point(violation_start),
@@ -202,11 +202,11 @@ impl MD037Linter {
             &MD037,
             format!("{} [Context: \"{}{}\"]", MD037.description, space, marker),
             self.context.file_path.clone(),
-            range_from_tree_sitter(&range),
+            range_from_node_range(&range),
         ));
     }
 
-    fn byte_to_point(&self, byte_pos: usize) -> tree_sitter::Point {
+    fn byte_to_point(&self, byte_pos: usize) -> crate::ast::Point {
         let source = self.context.get_document_content();
         let mut line = 0;
         let mut column = 0;
@@ -223,7 +223,7 @@ impl MD037Linter {
             }
         }
 
-        tree_sitter::Point { row: line, column }
+        crate::ast::Point { row: line, column }
     }
 }
 

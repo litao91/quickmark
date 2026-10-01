@@ -1,11 +1,9 @@
 use std::{cell::RefCell, collections::HashMap, fmt::Display, path::PathBuf, rc::Rc};
-use tree_sitter::{Node, Parser};
-use tree_sitter_md::LANGUAGE;
 
 use crate::{
+    ast::{self, FacadeTree, Node, NodeRange},
     config::{QuickmarkConfig, RuleSeverity},
     rules::{Rule, ALL_RULES},
-    tree_sitter_walker::TreeSitterWalker,
 };
 
 #[derive(Debug, Clone)]
@@ -60,16 +58,16 @@ impl RuleViolation {
     }
 }
 
-/// Convert from tree-sitter range to library range
-pub fn range_from_tree_sitter(ts_range: &tree_sitter::Range) -> Range {
+/// Convert from a node range to library range
+pub fn range_from_node_range(node_range: &NodeRange) -> Range {
     Range {
         start: CharPosition {
-            line: ts_range.start_point.row,
-            character: ts_range.start_point.column,
+            line: node_range.start_point.row,
+            character: node_range.start_point.column,
         },
         end: CharPosition {
-            line: ts_range.end_point.row,
-            character: ts_range.end_point.column,
+            line: node_range.end_point.row,
+            character: node_range.end_point.column,
         },
     }
 }
@@ -102,7 +100,7 @@ pub struct Context {
     /// Raw text lines for line-based rules (MD013, MD010, etc.) - initialized once per document
     pub lines: RefCell<Vec<String>>,
     /// Cached AST nodes filtered by type for efficient access - initialized once per document
-    pub node_cache: RefCell<HashMap<String, Vec<NodeInfo>>>,
+    pub node_cache: RefCell<HashMap<&'static str, Vec<NodeInfo>>>,
     /// Original document content for byte-based access - initialized once per document
     pub document_content: RefCell<String>,
 }
@@ -112,7 +110,7 @@ pub struct Context {
 pub struct NodeInfo {
     pub line_start: usize,
     pub line_end: usize,
-    pub kind: String,
+    pub kind: &'static str,
 }
 
 impl Context {
@@ -120,17 +118,22 @@ impl Context {
         file_path: PathBuf,
         config: QuickmarkConfig,
         source: &str,
-        root_node: &Node,
+        tree: &FacadeTree,
     ) -> Self {
-        // Parse lines in a way that's compatible with markdownlint's line counting
-        // markdownlint counts a trailing newline as creating an additional empty line
-        let mut lines: Vec<String> = source.lines().map(String::from).collect();
-
-        // If the source ends with a newline, add an empty line to match markdownlint's behavior
-        if source.ends_with('\n') {
-            lines.push(String::new());
-        }
-        let node_cache = Self::build_node_cache(root_node);
+        // Split lines the way the parser does. CommonMark counts a bare `\r` as a line ending, and
+        // so do comrak and markdownlint's micromark — but `str::lines` does not, so using it here
+        // would number `Context.lines` differently from the tree's rows and make every line-based
+        // rule read the wrong line on such a document. A trailing line ending yields a final empty
+        // line, which is the extra line markdownlint counts.
+        let index = ast::synth::LineIndex::new(source);
+        let lines: Vec<String> = if source.is_empty() {
+            Vec::new()
+        } else {
+            (0..index.line_count())
+                .map(|row| index.content(row).to_string())
+                .collect()
+        };
+        let node_cache = Self::build_node_cache(tree);
 
         Self {
             file_path,
@@ -147,42 +150,22 @@ impl Context {
         self.document_content.borrow()
     }
 
-    /// Build cache of nodes filtered by type for efficient rule access
-    fn build_node_cache(root_node: &Node) -> HashMap<String, Vec<NodeInfo>> {
-        let mut cache = HashMap::new();
-        Self::collect_nodes_recursive(root_node, &mut cache);
-        cache
-    }
-
-    fn collect_nodes_recursive(node: &Node, cache: &mut HashMap<String, Vec<NodeInfo>>) {
-        let kind = node.kind();
-        let kind_string = kind.to_string();
-        let node_info = NodeInfo {
-            line_start: node.start_position().row,
-            line_end: node.end_position().row,
-            kind: kind_string.clone(),
-        };
-
-        // Add to cache for this node type
-        cache
-            .entry(kind_string)
-            .or_default()
-            .push(node_info.clone());
-
-        // Add to cache for pattern-based lookups (e.g., all heading types)
-        if kind.contains("heading") {
-            cache
-                .entry("*heading*".to_string())
-                .or_default()
-                .push(node_info);
+    /// Build cache of nodes filtered by type for efficient rule access.
+    ///
+    /// The tree is stored in pre-order, so walking it by index visits every node in document order
+    /// and each kind's bucket comes out line-sorted — the property `md046` and `md048` relied on
+    /// when they re-sorted defensively.
+    fn build_node_cache(tree: &FacadeTree) -> HashMap<&'static str, Vec<NodeInfo>> {
+        let mut cache: HashMap<&'static str, Vec<NodeInfo>> = HashMap::new();
+        for index in 0..tree.node_count() {
+            let node = tree.node(index as u32);
+            cache.entry(node.kind()).or_default().push(NodeInfo {
+                line_start: node.start_position().row,
+                line_end: node.end_position().row,
+                kind: node.kind(),
+            });
         }
-
-        // Recursively process children
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                Self::collect_nodes_recursive(&child, cache);
-            }
-        }
+        cache
     }
 
     /// Get cached nodes of specific types - optimized equivalent of filterByTypesCached
@@ -198,7 +181,7 @@ impl Context {
     }
 
     /// Get the most specific node type that contains a given line number
-    pub fn get_node_type_for_line(&self, line_number: usize) -> String {
+    pub fn get_node_type_for_line(&self, line_number: usize) -> &'static str {
         let cache = self.node_cache.borrow();
         // Find the most specific (smallest range) node that contains this line
         let mut best_match: Option<&NodeInfo> = None;
@@ -216,9 +199,7 @@ impl Context {
             }
         }
 
-        best_match
-            .map(|n| n.kind.clone())
-            .unwrap_or_else(|| "text".to_string())
+        best_match.map(|n| n.kind).unwrap_or("text")
     }
 }
 
@@ -271,7 +252,7 @@ pub trait RuleLinter {
 /// After calling `analyze()`, the linter and all its rule instances should be discarded.
 pub struct MultiRuleLinter {
     linters: Vec<Box<dyn RuleLinter>>,
-    tree: Option<tree_sitter::Tree>,
+    doc: Option<FacadeTree>,
     config: QuickmarkConfig,
 }
 
@@ -303,25 +284,16 @@ impl MultiRuleLinter {
         if active_rules.is_empty() {
             return Self {
                 linters: Vec::new(),
-                tree: None,
+                doc: None,
                 config,
             };
         }
 
         // Parse the document only when we have active rules
-        let mut parser = Parser::new();
-        parser
-            .set_language(&LANGUAGE.into())
-            .expect("Error loading Markdown grammar");
-        let tree = parser.parse(document, None).expect("Parse failed");
+        let doc = ast::build::parse(document);
 
         // Create context with pre-initialized cache only for active rules
-        let context = Rc::new(Context::new(
-            file_path,
-            config.clone(),
-            document,
-            &tree.root_node(),
-        ));
+        let context = Rc::new(Context::new(file_path, config.clone(), document, &doc));
 
         // Create rule linters for active rules only
         let linters = active_rules
@@ -331,7 +303,7 @@ impl MultiRuleLinter {
 
         Self {
             linters,
-            tree: Some(tree),
+            doc: Some(doc),
             config,
         }
     }
@@ -346,20 +318,19 @@ impl MultiRuleLinter {
             return Vec::new();
         }
 
-        // If we have linters but no tree (shouldn't happen), return empty
-        let tree = match &self.tree {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        // If we have linters but no document (shouldn't happen), return empty
+        let Some(doc) = &self.doc else {
+            return Vec::new();
         };
 
-        let walker = TreeSitterWalker::new(tree);
-
-        // Feed all nodes to all linters
-        walker.walk(|node| {
+        // Feed all nodes to all linters. Nodes are stored in pre-order, so this visits them in
+        // document order with no cursor and no recursion.
+        for index in 0..doc.node_count() {
+            let node = doc.node(index as u32);
             for linter in &mut self.linters {
                 linter.feed(&node);
             }
-        });
+        }
 
         // Collect all violations from finalize and inject severity from config
         let mut violations = Vec::new();

@@ -1,9 +1,9 @@
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -62,7 +62,7 @@ impl MD056Linter {
                 )
             };
 
-            let mut range = range_from_tree_sitter(&row.range());
+            let mut range = range_from_node_range(&row.range());
             range.start.character += column_offset;
             range.end.character = range.start.character + 1;
 

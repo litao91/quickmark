@@ -1,6 +1,6 @@
+use crate::ast::Node;
 use serde::Deserialize;
 use std::rc::Rc;
-use tree_sitter::Node;
 
 use crate::linter::{CharPosition, Context, Range, RuleLinter, RuleViolation};
 
@@ -67,7 +67,7 @@ impl MD048Linter {
         self.context
             .node_cache
             .borrow_mut()
-            .entry("fenced_code_block".to_string())
+            .entry("fenced_code_block")
             .or_default()
             .sort_by_key(|node_info| node_info.line_start);
 

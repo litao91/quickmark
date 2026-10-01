@@ -1,7 +1,7 @@
+use crate::ast::Node;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::rc::Rc;
-use tree_sitter::Node;
 
 use crate::{
     linter::{CharPosition, Context, Range, RuleLinter, RuleViolation},

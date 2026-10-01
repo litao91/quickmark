@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -69,15 +69,15 @@ impl MD013Linter {
 
         for (line_index, line) in lines.iter().enumerate() {
             let node_kind = self.context.get_node_type_for_line(line_index);
-            let should_check = self.should_check_node_type(&node_kind);
+            let should_check = self.should_check_node_type(node_kind);
             let should_violate = if should_check {
-                self.should_violate_line(line, line_index, &node_kind)
+                self.should_violate_line(line, line_index, node_kind)
             } else {
                 false
             };
 
             if should_violate {
-                let violation = self.create_violation_for_line(line, line_index, &node_kind);
+                let violation = self.create_violation_for_line(line, line_index, node_kind);
                 self.violations.push(violation);
             }
         }
@@ -230,14 +230,14 @@ impl MD013Linter {
                 line.len()
             ),
             self.context.file_path.clone(),
-            range_from_tree_sitter(&tree_sitter::Range {
+            range_from_node_range(&crate::ast::NodeRange {
                 start_byte: 0,
                 end_byte: line.len(),
-                start_point: tree_sitter::Point {
+                start_point: crate::ast::Point {
                     row: line_number,
                     column: 0,
                 },
-                end_point: tree_sitter::Point {
+                end_point: crate::ast::Point {
                     row: line_number,
                     column: line.len(),
                 },
@@ -605,21 +605,11 @@ Another short line.";
     #[test]
     fn test_demonstrates_potential_bug_scenario() {
         // This test demonstrates that our concern was valid in theory, but doesn't occur in practice
-        // because tree-sitter creates enough AST nodes for even simple documents
+        // because the parser creates enough AST nodes for even simple documents
 
         let input = "A\nB\nC\n"; // Minimal document - just 3 short lines
 
-        // Count AST nodes for this minimal document
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_md::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(input, None).unwrap();
-        let mut node_count = 0;
-        let walker = crate::tree_sitter_walker::TreeSitterWalker::new(&tree);
-        walker.walk(|_node| {
-            node_count += 1;
-        });
+        let node_count = crate::ast::build::parse(input).node_count();
 
         println!("Even a 3-line minimal document creates {node_count} AST nodes");
         println!("This explains why our MD013 implementation works correctly");
@@ -653,16 +643,7 @@ Another short line.";
         println!("Number of lines: {}", input.lines().count());
 
         // Count how many AST nodes are created by parsing this document
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_md::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(&input, None).unwrap();
-        let mut node_count = 0;
-        let walker = crate::tree_sitter_walker::TreeSitterWalker::new(&tree);
-        walker.walk(|_node| {
-            node_count += 1;
-        });
+        let node_count = crate::ast::build::parse(&input).node_count();
         println!("Total AST nodes: {node_count}");
 
         let config = test_config();
@@ -699,16 +680,7 @@ Another short line.";
             input.push_str(&format!("Line {} with text that is definitely over eighty characters and should trigger MD013 violation\n", i + 1));
         }
 
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_md::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(&input, None).unwrap();
-        let mut node_count = 0;
-        let walker = crate::tree_sitter_walker::TreeSitterWalker::new(&tree);
-        walker.walk(|_node| {
-            node_count += 1;
-        });
+        let node_count = crate::ast::build::parse(&input).node_count();
 
         let config = test_config();
         let mut linter =

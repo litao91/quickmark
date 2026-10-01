@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation},
+    linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
     rules::{Rule, RuleType},
 };
 
@@ -27,7 +27,7 @@ pub(crate) struct MD024Linter {
 struct HeadingInfo {
     content: String,
     level: u8,
-    node_range: tree_sitter::Range,
+    node_range: crate::ast::NodeRange,
     parent_path: Vec<String>, // Path from root to parent heading
 }
 
@@ -140,7 +140,7 @@ impl MD024Linter {
                             MD024.description, current_heading.content
                         ),
                         self.context.file_path.clone(),
-                        range_from_tree_sitter(&current_heading.node_range),
+                        range_from_node_range(&current_heading.node_range),
                     ));
                     break; // Only report once per duplicate
                 }
@@ -386,7 +386,9 @@ Section 1
 
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
-        assert_eq!(violations.len(), 1); // Empty headings should be treated as duplicates
+        // Three empty headings, so two duplicates. tree-sitter-md parsed the final `##` — which has
+        // no trailing newline — as a paragraph and only saw two headings; markdownlint sees three.
+        assert_eq!(violations.len(), 2);
     }
 
     #[test]

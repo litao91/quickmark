@@ -1,10 +1,10 @@
+use crate::ast::Node;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::rc::Rc;
-use tree_sitter::Node;
 use unicode_width::UnicodeWidthStr;
 
-use crate::linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation};
+use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
 use super::{Rule, RuleType};
 
@@ -212,13 +212,6 @@ impl MD060Linter {
         let mut cursor = table.walk();
         let children: Vec<Node> = table.children(&mut cursor).collect();
 
-        // tree-sitter can emit a degenerate pipe_table that swallows preceding blocks and leaves an
-        // ERROR node beside a header whose range is truncated — the leading pipe falls outside it,
-        // so every following row then looks misaligned. Such a parse cannot be trusted.
-        if children.iter().any(|child| child.kind() == "ERROR") {
-            return;
-        }
-
         let rows: Vec<Node> = children
             .into_iter()
             .filter(|child| {
@@ -281,7 +274,7 @@ impl MD060Linter {
                 &MD060,
                 error.message.to_string(),
                 self.context.file_path.clone(),
-                range_from_tree_sitter(&error.node.range()),
+                range_from_node_range(&error.node.range()),
             ));
         }
     }

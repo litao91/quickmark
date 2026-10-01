@@ -1,12 +1,12 @@
+use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::rc::Rc;
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -43,7 +43,7 @@ static REFERENCE_DEFINITION_PATTERN: Lazy<Regex> =
 #[derive(Debug, Clone)]
 struct ReferenceLink {
     label: String,
-    range: tree_sitter::Range,
+    range: crate::ast::NodeRange,
     is_shortcut: bool,
 }
 
@@ -216,7 +216,7 @@ impl RuleLinter for MD052Linter {
                         reference.label
                     ),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&reference.range),
+                    range_from_node_range(&reference.range),
                 ));
             }
         }

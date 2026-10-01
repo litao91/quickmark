@@ -1,5 +1,5 @@
+use crate::ast::Node;
 use std::rc::Rc;
-use tree_sitter::Node;
 
 use crate::linter::{Context, RuleLinter, RuleViolation};
 

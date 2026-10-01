@@ -1,10 +1,10 @@
+use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashSet;
 use std::rc::Rc;
-use tree_sitter::Node;
 
-use crate::linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation};
+use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
 use super::{Rule, RuleType};
 
@@ -82,14 +82,14 @@ impl MD020Linter {
             &MD020,
             MD020.description.to_string(),
             self.context.file_path.clone(),
-            range_from_tree_sitter(&tree_sitter::Range {
+            range_from_node_range(&crate::ast::NodeRange {
                 start_byte: 0,
                 end_byte: line.len(),
-                start_point: tree_sitter::Point {
+                start_point: crate::ast::Point {
                     row: line_index,
                     column: 0,
                 },
-                end_point: tree_sitter::Point {
+                end_point: crate::ast::Point {
                     row: line_index,
                     column: line.len(),
                 },

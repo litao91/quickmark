@@ -1,6 +1,6 @@
+use crate::ast::Node;
 use regex::Regex;
 use std::rc::Rc;
-use tree_sitter::Node;
 
 use crate::linter::{CharPosition, Context, Range, RuleLinter, RuleViolation};
 

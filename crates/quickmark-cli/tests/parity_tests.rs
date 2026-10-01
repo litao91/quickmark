@@ -26,7 +26,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("MD032", 3),
     ("MD038", 92),
     ("MD041", 4),
-    ("MD047", 2),
 ];
 
 fn parity_root() -> PathBuf {

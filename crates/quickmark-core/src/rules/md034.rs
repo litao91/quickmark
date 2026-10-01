@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
+use crate::ast::Node;
 use linkify::{LinkFinder, LinkKind};
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -41,7 +41,7 @@ impl RuleLinter for MD034Linter {
 }
 
 impl MD034Linter {
-    fn check_for_bare_urls_in_text(&mut self, text: &str, paragraph_range: &tree_sitter::Range) {
+    fn check_for_bare_urls_in_text(&mut self, text: &str, paragraph_range: &crate::ast::NodeRange) {
         let finder = LinkFinder::new();
 
         for link in finder.links(text) {
@@ -51,14 +51,14 @@ impl MD034Linter {
 
             // Skip if this link is already properly formatted
             if !self.is_link_properly_formatted(text, link_start, link_text, link.kind()) {
-                let violation_range = tree_sitter::Range {
+                let violation_range = crate::ast::NodeRange {
                     start_byte: paragraph_range.start_byte + link_start,
                     end_byte: paragraph_range.start_byte + link_end,
-                    start_point: tree_sitter::Point {
+                    start_point: crate::ast::Point {
                         row: paragraph_range.start_point.row,
                         column: paragraph_range.start_point.column + link_start,
                     },
-                    end_point: tree_sitter::Point {
+                    end_point: crate::ast::Point {
                         row: paragraph_range.start_point.row,
                         column: paragraph_range.start_point.column + link_end,
                     },
@@ -68,7 +68,7 @@ impl MD034Linter {
                     &MD034,
                     format!("{} [Context: \"{}\"]", MD034.description, link_text),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&violation_range),
+                    range_from_node_range(&violation_range),
                 ));
             }
         }

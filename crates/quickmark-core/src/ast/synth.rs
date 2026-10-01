@@ -7,8 +7,6 @@
 //! row — so neither can be read off its tree.
 
 use comrak::nodes::{ListDelimType, ListType, NodeList};
-use once_cell::sync::Lazy;
-use regex::Regex;
 
 use super::Kind;
 
@@ -73,6 +71,12 @@ impl<'a> LineIndex<'a> {
 
     pub fn line_count(&self) -> usize {
         self.starts.len()
+    }
+
+    /// Whether the source ends in a line terminator, which is what makes [`Self::line_count`] count
+    /// one more row than the source has content in.
+    pub fn ends_with_line_terminator(&self) -> bool {
+        self.source.ends_with(['\n', '\r'])
     }
 
     pub fn has_line(&self, row: usize) -> bool {
@@ -388,7 +392,16 @@ pub struct RowChild {
 /// adding it to the tree, pads every body row up to the header width with empty cells (which would
 /// stop MD056 ever firing), and reports cell spans that include the surrounding padding where
 /// tree-sitter-md's exclude it.
-pub fn table_rows(lines: &LineIndex<'_>, header_row: u32, body_rows: &[u32]) -> Vec<RowSpan> {
+///
+/// `prefix` is the column the table's container's content starts at — 0 at document level, past the
+/// `> ` of a block quote, past a list item's marker. Rows are measured from it, not from the line
+/// start, so a table inside a container does not report its indentation as leading padding.
+pub fn table_rows(
+    lines: &LineIndex<'_>,
+    prefix: u32,
+    header_row: u32,
+    body_rows: &[u32],
+) -> Vec<RowSpan> {
     let mut rows = Vec::with_capacity(body_rows.len() + 2);
     rows.push((header_row, Kind::PipeTableHeader, Kind::PipeTableCell, true));
     rows.push((
@@ -405,15 +418,15 @@ pub fn table_rows(lines: &LineIndex<'_>, header_row: u32, body_rows: &[u32]) -> 
         .filter(|&(row, _, _, _)| lines.has_line(row as usize))
         .map(|(row, kind, cell_kind, is_header)| {
             // Only the header row starts at its first non-space; the delimiter and body rows start
-            // at column 0. Both end at the line's last non-blank byte, so trailing whitespace is
-            // outside the row.
+            // at the container's content column. Both end at the line's last non-blank byte, so
+            // trailing whitespace is outside the row.
             let start_col = if is_header {
-                lines.first_non_space_col(row as usize)
+                lines.first_non_space_col(row as usize).max(prefix)
             } else {
-                0
+                prefix
             };
             let end_col = lines.trim_end_col(row as usize);
-            let mut children = split_row(lines, row, cell_kind);
+            let mut children = split_row(lines, row, prefix, cell_kind);
             children.sort_by_key(|child| child.column);
             RowSpan {
                 kind,
@@ -424,13 +437,14 @@ pub fn table_rows(lines: &LineIndex<'_>, header_row: u32, body_rows: &[u32]) -> 
         .collect()
 }
 
-/// Splits one table line into cells and `|` separators.
+/// Splits one table line into cells and `|` separators, ignoring the first `prefix` columns, which
+/// belong to the enclosing container.
 ///
 /// A cell is left-trimmed but not right-trimmed — `| a | b |` yields cells `a ` and `b ` — except
 /// when it holds nothing but whitespace, in which case it keeps the whole inter-pipe region. A
 /// zero-width cell (`||`) produces nothing. A `|` preceded by an odd run of backslashes is escaped
 /// and separates nothing.
-fn split_row(lines: &LineIndex<'_>, row: u32, cell_kind: Kind) -> Vec<RowChild> {
+fn split_row(lines: &LineIndex<'_>, row: u32, prefix: u32, cell_kind: Kind) -> Vec<RowChild> {
     let text = lines.content(row as usize);
     let bytes = text.as_bytes();
     let width = lines.content_len(row as usize);
@@ -446,13 +460,14 @@ fn split_row(lines: &LineIndex<'_>, row: u32, cell_kind: Kind) -> Vec<RowChild> 
     // `(start, end, is_edge)`. The regions outside the outermost pipes are edges: they hold a cell
     // only when a table omits its leading or trailing pipe. The whitespace either side of `| a |` is
     // an edge region and produces nothing, where the whitespace inside `| a |  |` is interior and
-    // produces an empty cell.
+    // produces an empty cell. The leading edge starts at `prefix` so a block quote's `> ` is not
+    // mistaken for a cell.
     let mut regions: Vec<(u32, u32, bool)> = Vec::new();
     match pipes.first() {
-        None => regions.push((0, width, true)),
+        None => regions.push((prefix, width, true)),
         Some(&first) => {
-            if first > 0 {
-                regions.push((0, first, true));
+            if first > prefix {
+                regions.push((prefix, first, true));
             }
             for pair in pipes.windows(2) {
                 regions.push((pair[0] + 1, pair[1], false));
@@ -516,18 +531,123 @@ fn is_escaped(bytes: &[u8], offset: usize) -> bool {
     backslashes % 2 == 1
 }
 
-static LINK_REFERENCE_DEFINITION: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^ {0,3}\[[^\]\n]+\]:[ \t]*(\S|$)")
-        .expect("invalid link reference definition regex")
-});
-
 /// Whether a line opens a link reference definition. Used both to find the definitions comrak
 /// detached and to split the leading ones off a paragraph comrak kept, which it does when prose
 /// follows on the next line. Block quote markers are skipped first, so `> [a]: /u` counts.
 pub fn is_link_reference_definition(lines: &LineIndex<'_>, row: usize) -> bool {
-    let prefix = container_prefix_width(lines, row as u32) as usize;
-    let rest = &lines.content(row)[prefix.min(lines.content(row).len())..];
-    LINK_REFERENCE_DEFINITION.is_match(rest)
+    let content = lines.content(row);
+    let prefix = (container_prefix_width(lines, row as u32) as usize).min(content.len());
+    is_definition_line(&content[prefix..])
+}
+
+/// One line of a link reference definition: up to three spaces of indent, a label, a colon, a
+/// destination, and then either the end of the line or a title and the end of the line.
+///
+/// That last rule is why this is a parser and not a `[label]:` pattern. Prose where only a title may
+/// go makes the whole thing an ordinary paragraph, so `[^version]: It's generally good practice ...`
+/// is not a definition — and inventing one adds a spurious unused-definition report for every
+/// footnote in the document.
+fn is_definition_line(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let indent = bytes.iter().take_while(|&&byte| byte == b' ').count();
+    if indent > 3 || bytes.get(indent) != Some(&b'[') {
+        return false;
+    }
+
+    let mut at = indent + 1;
+    let label_start = at;
+    loop {
+        match bytes.get(at) {
+            None => return false,
+            Some(b'\\') => at += 2,
+            Some(b']') => break,
+            Some(_) => at += 1,
+        }
+    }
+    if at == label_start || bytes.get(at + 1) != Some(&b':') {
+        return false;
+    }
+
+    at = skip_space_tab(bytes, at + 2);
+    let (after_destination, balanced) = destination(bytes, at);
+    if !balanced {
+        return false;
+    }
+    at = skip_space_tab(bytes, after_destination);
+    if at >= bytes.len() {
+        return true;
+    }
+
+    let (after_title, closed) = match title(bytes, at) {
+        Some(found) => found,
+        // Not a title, so there is trailing content after the destination.
+        None => return false,
+    };
+    // An unterminated title continues on the following lines, which `reference_definitions` absorbs.
+    !closed || skip_space_tab(bytes, after_title) >= bytes.len()
+}
+
+fn skip_space_tab(bytes: &[u8], mut at: usize) -> usize {
+    while matches!(bytes.get(at), Some(b' ') | Some(b'\t')) {
+        at += 1;
+    }
+    at
+}
+
+/// The end of a link destination, and whether it was well formed. Returns the offset just past it.
+fn destination(bytes: &[u8], mut at: usize) -> (usize, bool) {
+    if bytes.get(at) == Some(&b'<') {
+        at += 1;
+        loop {
+            match bytes.get(at) {
+                None | Some(b'<') => return (at, false),
+                Some(b'\\') => at += 2,
+                Some(b'>') => return (at + 1, true),
+                Some(_) => at += 1,
+            }
+        }
+    }
+
+    let start = at;
+    let mut depth = 0usize;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'\\' => at += 2,
+            b' ' | b'\t' => break,
+            b'(' => {
+                depth += 1;
+                at += 1;
+            }
+            b')' => {
+                let Some(open) = depth.checked_sub(1) else {
+                    return (at, false);
+                };
+                depth = open;
+                at += 1;
+            }
+            b'<' | b'>' => return (at, false),
+            _ => at += 1,
+        }
+    }
+    (at, at > start && depth == 0)
+}
+
+/// A link title's end and whether its closing delimiter appeared on this line.
+fn title(bytes: &[u8], at: usize) -> Option<(usize, bool)> {
+    let close = match bytes.get(at) {
+        Some(b'"') | Some(b'\'') => bytes[at],
+        Some(b'(') => b')',
+        _ => return None,
+    };
+    let mut index = at + 1;
+    loop {
+        match bytes.get(index) {
+            None => return Some((index, false)),
+            Some(b'\\') => index += 2,
+            Some(&byte) if byte == close => return Some((index + 1, true)),
+            Some(_) => index += 1,
+        }
+    }
 }
 
 /// The link reference definitions comrak detached, one span each.
@@ -594,4 +714,58 @@ fn container_prefix_width(lines: &LineIndex<'_>, row: u32) -> u32 {
         }
     }
     col as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_definition_line;
+
+    #[test]
+    fn definition_shapes() {
+        for line in [
+            "[a]: /u",
+            "   [a]: /u",
+            "[a]: /u \"title\"",
+            "[a]: /u 'title'",
+            "[a]: /u (title)",
+            "[a]:\t/u\t\"title\"",
+            "[a]: <http://x.y/z> \"t\"",
+            "[a]: /u(b)",
+            // An angle-bracketed destination may be empty.
+            "[a]: <>",
+            "[a b]: /u",
+            "[a\\]]: /u",
+            // An unterminated title continues on the following lines, which `reference_definitions`
+            // absorbs into the same node.
+            "[a]: /u \"title",
+        ] {
+            assert!(is_definition_line(line), "should be a definition: {line:?}");
+        }
+    }
+
+    /// Prose where only a title may go makes the line an ordinary paragraph. Getting this wrong
+    /// invents a definition, which costs a spurious MD052/MD053 report for every footnote in a
+    /// document — the `[^version]: It's generally good practice ...` shape is common in posts
+    /// migrated from Jekyll.
+    #[test]
+    fn trailing_content_is_not_a_definition() {
+        for line in [
+            "[^version]: It's generally good practice for Rust posts",
+            "[a]: /url \"title\" ok",
+            "[a]: /url ok",
+            "[a]:",
+            "[a]: ",
+            "[]: /u",
+            "[a] /u",
+            "a: /u",
+            "[a]: /u(",
+            // Four spaces of indentation is an indented code block, not a definition.
+            "    [a]: /u",
+        ] {
+            assert!(
+                !is_definition_line(line),
+                "should not be a definition: {line:?}"
+            );
+        }
+    }
 }

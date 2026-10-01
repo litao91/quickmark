@@ -1,11 +1,11 @@
 use serde::Deserialize;
 use std::rc::Rc;
 
+use crate::ast::Node;
 use regex::Regex;
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation},
+    linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
     rules::{Rule, RuleType},
 };
 
@@ -32,8 +32,8 @@ impl Default for MD041FirstLineHeadingTable {
 
 #[derive(Debug)]
 enum FirstElement {
-    Heading(u8, tree_sitter::Range), // level, range
-    Content(tree_sitter::Range),
+    Heading(u8, crate::ast::NodeRange), // level, range
+    Content(crate::ast::NodeRange),
     None,
 }
 
@@ -241,7 +241,7 @@ impl RuleLinter for MD041Linter {
                             config.level, level
                         ),
                         self.context.file_path.clone(),
-                        range_from_tree_sitter(range),
+                        range_from_node_range(range),
                     ));
                 }
             }
@@ -252,7 +252,7 @@ impl RuleLinter for MD041Linter {
                         &MD041,
                         "First line in a file should be a top-level heading".to_string(),
                         self.context.file_path.clone(),
-                        range_from_tree_sitter(range),
+                        range_from_node_range(range),
                     ));
                 }
             }

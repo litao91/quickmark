@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -46,14 +46,14 @@ impl MD028Linter {
                         &MD028,
                         "Blank line inside blockquote".to_string(),
                         self.context.file_path.clone(),
-                        range_from_tree_sitter(&tree_sitter::Range {
+                        range_from_node_range(&crate::ast::NodeRange {
                             start_byte: 0,
                             end_byte: 0,
-                            start_point: tree_sitter::Point {
+                            start_point: crate::ast::Point {
                                 row: blank_idx,
                                 column: 0,
                             },
-                            end_point: tree_sitter::Point {
+                            end_point: crate::ast::Point {
                                 row: blank_idx,
                                 column: lines[blank_idx].len(),
                             },

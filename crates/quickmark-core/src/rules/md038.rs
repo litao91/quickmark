@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
-use crate::linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation};
+use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
 use super::{Rule, RuleType};
 
@@ -120,7 +120,7 @@ impl MD038Linter {
 
         if leading_is_violation {
             let leading_byte_len = leading_whitespace.len();
-            let violation_range = tree_sitter::Range {
+            let violation_range = crate::ast::NodeRange {
                 start_byte: content_start_byte,
                 end_byte: content_start_byte + leading_byte_len,
                 start_point: self.byte_to_point(content_start_byte),
@@ -131,7 +131,7 @@ impl MD038Linter {
                 &MD038,
                 format!("{VIOLATION_MESSAGE} [Context: leading whitespace]"),
                 self.context.file_path.clone(),
-                range_from_tree_sitter(&violation_range),
+                range_from_node_range(&violation_range),
             ));
         }
 
@@ -155,7 +155,7 @@ impl MD038Linter {
             let violation_end_byte = content_start_byte + content_len;
             let violation_start_byte = violation_end_byte - trailing_byte_len;
 
-            let violation_range = tree_sitter::Range {
+            let violation_range = crate::ast::NodeRange {
                 start_byte: violation_start_byte,
                 end_byte: violation_end_byte,
                 start_point: self.byte_to_point(violation_start_byte),
@@ -166,12 +166,12 @@ impl MD038Linter {
                 &MD038,
                 format!("{VIOLATION_MESSAGE} [Context: trailing whitespace]"),
                 self.context.file_path.clone(),
-                range_from_tree_sitter(&violation_range),
+                range_from_node_range(&violation_range),
             ));
         }
     }
 
-    fn byte_to_point(&self, byte_pos: usize) -> tree_sitter::Point {
+    fn byte_to_point(&self, byte_pos: usize) -> crate::ast::Point {
         let source = self.context.get_document_content();
         let mut line = 0;
         let mut column = 0;
@@ -188,7 +188,7 @@ impl MD038Linter {
             }
         }
 
-        tree_sitter::Point { row: line, column }
+        crate::ast::Point { row: line, column }
     }
 }
 

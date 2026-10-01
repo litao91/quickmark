@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation},
+    linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
     rules::{Rule, RuleType},
 };
 
@@ -29,7 +29,7 @@ impl Default for MD025SingleH1Table {
 #[derive(Debug)]
 struct HeadingInfo {
     content: String,
-    range: tree_sitter::Range,
+    range: crate::ast::NodeRange,
     is_first_content_heading: bool,
 }
 
@@ -269,7 +269,7 @@ impl RuleLinter for MD025Linter {
                     &MD025,
                     format!("{} [{}]", MD025.description, heading.content),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&heading.range),
+                    range_from_node_range(&heading.range),
                 ));
             }
         }

@@ -2,12 +2,12 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -298,10 +298,10 @@ impl MD054Linter {
         let violation_row = node_start_row + lines_before_offset;
 
         // Create a custom range for this specific violation
-        let violation_range = tree_sitter::Range {
+        let violation_range = crate::ast::NodeRange {
             start_byte: node.start_byte() + offset,
             end_byte: node.start_byte() + offset + 1, // Just mark the start of the violation
-            start_point: tree_sitter::Point {
+            start_point: crate::ast::Point {
                 row: violation_row,
                 column: if lines_before_offset == 0 {
                     node.start_position().column + offset
@@ -311,7 +311,7 @@ impl MD054Linter {
                     offset - line_start
                 },
             },
-            end_point: tree_sitter::Point {
+            end_point: crate::ast::Point {
                 row: violation_row,
                 column: if lines_before_offset == 0 {
                     node.start_position().column + offset + 1
@@ -326,7 +326,7 @@ impl MD054Linter {
             &MD054,
             message,
             self.context.file_path.clone(),
-            range_from_tree_sitter(&violation_range),
+            range_from_node_range(&violation_range),
         ));
     }
 }

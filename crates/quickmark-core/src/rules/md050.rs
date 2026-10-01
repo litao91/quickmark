@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation},
+    linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
     rules::{Rule, RuleType},
 };
 
@@ -228,7 +228,7 @@ impl MD050Linter {
                             - 1;
                         let char_end_byte = char_start_byte + current_char.len_utf8();
 
-                        let range = tree_sitter::Range {
+                        let range = crate::ast::NodeRange {
                             start_byte: char_start_byte,
                             end_byte: char_end_byte,
                             start_point: self.byte_to_point(char_start_byte),
@@ -239,7 +239,7 @@ impl MD050Linter {
                             &MD050,
                             format!("Expected: {expected_style}; Actual: {actual_style}"),
                             self.context.file_path.clone(),
-                            range_from_tree_sitter(&range),
+                            range_from_node_range(&range),
                         ));
                     }
 
@@ -254,10 +254,10 @@ impl MD050Linter {
         }
     }
 
-    fn byte_to_point(&self, byte_pos: usize) -> tree_sitter::Point {
+    fn byte_to_point(&self, byte_pos: usize) -> crate::ast::Point {
         let line = self.line_start_bytes.partition_point(|&x| x <= byte_pos) - 1;
         let column = byte_pos - self.line_start_bytes[line];
-        tree_sitter::Point { row: line, column }
+        crate::ast::Point { row: line, column }
     }
 }
 

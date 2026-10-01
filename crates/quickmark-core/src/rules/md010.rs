@@ -1,10 +1,10 @@
+use crate::ast::Node;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::rc::Rc;
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -162,17 +162,17 @@ impl MD010Linter {
             &MD010,
             message,
             self.context.file_path.clone(),
-            range_from_tree_sitter(&tree_sitter::Range {
+            range_from_node_range(&crate::ast::NodeRange {
                 // FIXME: Byte offsets are not correctly calculated as line start offset is unavailable here.
                 // This may result in incorrect highlighting in some tools.
                 // The primary information is in the points (row/column).
                 start_byte: 0,
                 end_byte: 0,
-                start_point: tree_sitter::Point {
+                start_point: crate::ast::Point {
                     row: line_index,
                     column: tab_position,
                 },
-                end_point: tree_sitter::Point {
+                end_point: crate::ast::Point {
                     row: line_index,
                     column: tab_position + 1,
                 },

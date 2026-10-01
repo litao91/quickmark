@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::{
-    linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation},
+    linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
     rules::{Rule, RuleType},
 };
 
@@ -117,14 +117,14 @@ impl MD044Linter {
                 }
 
                 // Create violation range
-                let range = tree_sitter::Range {
+                let range = crate::ast::NodeRange {
                     start_byte: match_start,
                     end_byte: match_end,
-                    start_point: tree_sitter::Point {
+                    start_point: crate::ast::Point {
                         row: start_line,
                         column: start_column + match_start,
                     },
-                    end_point: tree_sitter::Point {
+                    end_point: crate::ast::Point {
                         row: start_line,
                         column: start_column + match_end,
                     },
@@ -134,7 +134,7 @@ impl MD044Linter {
                     &MD044,
                     format!("Expected: {expected_name}; Actual: {matched_text}"),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&range),
+                    range_from_node_range(&range),
                 ));
 
                 // Add violation range to exclusions to prevent multiple reports on the same text
@@ -146,7 +146,7 @@ impl MD044Linter {
 }
 
 impl RuleLinter for MD044Linter {
-    fn feed(&mut self, node: &tree_sitter::Node) {
+    fn feed(&mut self, node: &crate::ast::Node) {
         if !self.should_check_node(node.kind()) {
             return;
         }

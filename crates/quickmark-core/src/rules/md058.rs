@@ -1,9 +1,9 @@
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation},
+    linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
     rules::{Rule, RuleType},
 };
 
@@ -28,26 +28,13 @@ impl MD058Linter {
         let start_line = table_node.start_position().row;
         let lines = self.context.lines.borrow();
 
-        // Find the actual last row of the table.
-        // tree-sitter can sometimes identify nodes as table rows even if they are not
-        // part of the table's syntax (e.g., surrounding text).
-        // We filter for children that are actual table components and contain a pipe character.
+        // GFM absorbs a following pipe-less line into the table as a one-cell row, so the table's
+        // last row is the right thing to look past for the blank line below. Filtering for rows that
+        // contain a pipe — which is what this did under tree-sitter-md, whose table ended above the
+        // absorbed line — reports a violation markdownlint does not.
         let mut cursor = table_node.walk();
-        let Some(last_row) = table_node
-            .children(&mut cursor)
-            .filter(|child| {
-                matches!(
-                    child.kind(),
-                    "pipe_table_header" | "pipe_table_row" | "pipe_table_delimiter_row"
-                )
-            })
-            .filter(|row| {
-                let row_line = row.start_position().row;
-                lines.get(row_line).is_some_and(|l| l.contains('|'))
-            })
-            .last()
-        else {
-            return; // No valid rows in table, nothing to check.
+        let Some(last_row) = table_node.children(&mut cursor).last() else {
+            return; // No rows in table, nothing to check.
         };
 
         let actual_end_line = last_row.end_position().row;
@@ -62,7 +49,7 @@ impl MD058Linter {
                     &MD058,
                     format!("{} [Above]", MD058.description),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&table_node.range()),
+                    range_from_node_range(&table_node.range()),
                 ));
             }
         }
@@ -78,7 +65,7 @@ impl MD058Linter {
                     &MD058,
                     format!("{} [Below]", MD058.description),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&table_node.range()),
+                    range_from_node_range(&table_node.range()),
                 ));
             }
         }
@@ -157,12 +144,28 @@ More text"#;
 | Header 1 | Header 2 |
 | -------- | -------- |
 | Cell 1   | Cell 2   |
-More text"#;
+# Heading"#;
         let config = test_config();
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(1, violations.len());
         assert!(violations[0].message().contains("[Below]"));
+    }
+
+    /// GFM absorbs a pipe-less line following a table as a one-cell row, so plain text under a table
+    /// does not end it and there is no "below" to check. markdownlint agrees: 0 violations here.
+    #[test]
+    fn test_table_absorbs_following_text_line() {
+        let input = r#"Some text
+
+| Header 1 | Header 2 |
+| -------- | -------- |
+| Cell 1   | Cell 2   |
+More text"#;
+        let config = test_config();
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        assert_eq!(0, violations.len());
     }
 
     #[test]
@@ -171,7 +174,7 @@ More text"#;
 | Header 1 | Header 2 |
 | -------- | -------- |
 | Cell 1   | Cell 2   |
-More text"#;
+# Heading"#;
         let config = test_config();
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
@@ -241,8 +244,11 @@ Final text"#;
         assert_eq!(0, violations.len());
     }
 
+    /// No blank lines anywhere, so GFM keeps absorbing rows and this is a single table running to the
+    /// end of the document — one missing blank line above, nothing below it to check. markdownlint
+    /// reports 1 here too; tree-sitter-md ended the table at each pipe-less line and saw four.
     #[test]
-    fn test_multiple_tables_improper_spacing() {
+    fn test_tables_with_no_blank_lines_are_one_table() {
         let input = r#"Some text
 | Table 1 | Header |
 | ------- | ------ |
@@ -255,7 +261,31 @@ Final text"#;
         let config = test_config();
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
-        assert_eq!(4, violations.len()); // 2 tables × 2 violations each (above and below)
+        assert_eq!(1, violations.len());
+        assert!(violations[0].message().contains("[Above]"));
+    }
+
+    /// Headings do end a table, so these really are two tables and all four sides are checked.
+    #[test]
+    fn test_multiple_tables_improper_spacing() {
+        let input = r#"Some text
+| Table 1 | Header |
+| ------- | ------ |
+| Cell    | Value  |
+# Between
+| Table 2 | Header |
+| ------- | ------ |
+| Cell    | Value  |
+# End
+"#;
+        let config = test_config();
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        assert_eq!(4, violations.len());
+        assert!(violations[0].message().contains("[Above]"));
+        assert!(violations[1].message().contains("[Below]"));
+        assert!(violations[2].message().contains("[Above]"));
+        assert!(violations[3].message().contains("[Below]"));
     }
 
     #[test]

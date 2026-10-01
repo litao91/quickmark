@@ -1,10 +1,10 @@
+use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::rc::Rc;
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -157,14 +157,14 @@ impl MD045Linter {
         let (start_line, start_col) = self.byte_to_line_col(start_byte);
         let (end_line, end_col) = self.byte_to_line_col(end_byte);
 
-        let range = range_from_tree_sitter(&tree_sitter::Range {
+        let range = range_from_node_range(&crate::ast::NodeRange {
             start_byte,
             end_byte,
-            start_point: tree_sitter::Point {
+            start_point: crate::ast::Point {
                 row: start_line,
                 column: start_col,
             },
-            end_point: tree_sitter::Point {
+            end_point: crate::ast::Point {
                 row: end_line,
                 column: end_col,
             },

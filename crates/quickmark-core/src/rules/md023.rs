@@ -1,7 +1,7 @@
+use crate::ast::Node;
 use std::rc::Rc;
-use tree_sitter::Node;
 
-use crate::linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation};
+use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
 use super::{Rule, RuleType};
 
@@ -69,14 +69,14 @@ impl MD023Linter {
             let leading_spaces = line.len() - line.trim_start().len();
 
             if leading_spaces > 0 {
-                let range = tree_sitter::Range {
-                    start_byte: 0, // Not used by range_from_tree_sitter
-                    end_byte: 0,   // Not used by range_from_tree_sitter
-                    start_point: tree_sitter::Point {
+                let range = crate::ast::NodeRange {
+                    start_byte: 0, // Not used by range_from_node_range
+                    end_byte: 0,   // Not used by range_from_node_range
+                    start_point: crate::ast::Point {
                         row: line_num,
                         column: 0,
                     },
-                    end_point: tree_sitter::Point {
+                    end_point: crate::ast::Point {
                         row: line_num,
                         column: leading_spaces,
                     },
@@ -86,7 +86,7 @@ impl MD023Linter {
                     &MD023,
                     MD023.description.to_string(),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&range),
+                    range_from_node_range(&range),
                 ));
             }
         }

@@ -19,7 +19,7 @@
 pub mod build;
 pub mod walker;
 
-mod synth;
+pub(crate) mod synth;
 
 #[cfg(test)]
 mod oracle;
@@ -294,8 +294,9 @@ impl<'a> Node<'a> {
     }
 
     /// The node's source text. Takes the document bytes so call sites are unchanged from the
-    /// tree-sitter API.
-    pub fn utf8_text(self, source: &'a [u8]) -> Result<&'a str, std::str::Utf8Error> {
+    /// tree-sitter API, and ties the result's lifetime to those bytes rather than to the tree —
+    /// rules slice a `RefCell` borrow of the document that does not outlive it.
+    pub fn utf8_text(self, source: &[u8]) -> Result<&str, std::str::Utf8Error> {
         let n = self.node();
         std::str::from_utf8(&source[n.start_byte as usize..n.end_byte as usize])
     }

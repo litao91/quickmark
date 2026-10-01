@@ -2,10 +2,10 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -138,7 +138,7 @@ impl MD004Linter {
         let style = &self.context.config.linters.settings.ul_style.style;
 
         // Extract marker information immediately to avoid lifetime issues
-        let marker_info: Vec<(tree_sitter::Range, char)> = {
+        let marker_info: Vec<(crate::ast::NodeRange, char)> = {
             let markers = self.find_list_item_markers(node);
             markers
                 .into_iter()
@@ -215,7 +215,7 @@ impl MD004Linter {
                         &MD004,
                         message,
                         self.context.file_path.clone(),
-                        range_from_tree_sitter(&range),
+                        range_from_node_range(&range),
                     ));
                 }
             }

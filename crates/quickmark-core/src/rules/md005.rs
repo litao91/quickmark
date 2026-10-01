@@ -1,9 +1,9 @@
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -98,7 +98,7 @@ impl MD005Linter {
                     &MD005,
                     message,
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&item.range()),
+                    range_from_node_range(&item.range()),
                 ));
             }
         }
@@ -135,7 +135,7 @@ impl MD005Linter {
                         &MD005,
                         format!("{} [{}]", MD005.description, detail),
                         self.context.file_path.clone(),
-                        range_from_tree_sitter(&item.range()),
+                        range_from_node_range(&item.range()),
                     ));
                 }
             }

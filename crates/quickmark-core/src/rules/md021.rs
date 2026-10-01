@@ -1,10 +1,10 @@
+use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashSet;
 use std::rc::Rc;
-use tree_sitter::Node;
 
-use crate::linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation};
+use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
 use super::{Rule, RuleType};
 
@@ -81,11 +81,11 @@ impl MD021Linter {
                     ),
                     self.context.file_path.clone(),
                     // The location points to the second space, which is the beginning of the violation.
-                    range_from_tree_sitter(&tree_sitter::Range {
+                    range_from_node_range(&crate::ast::NodeRange {
                         start_byte: 0, // Not accurate, but line/col is used
                         end_byte: 0,
-                        start_point: tree_sitter::Point { row: line_index, column: start_col + 2 },
-                        end_point: tree_sitter::Point { row: line_index, column: start_col + 3 },
+                        start_point: crate::ast::Point { row: line_index, column: start_col + 2 },
+                        end_point: crate::ast::Point { row: line_index, column: start_col + 3 },
                     }),
                 ));
             }
@@ -101,11 +101,11 @@ impl MD021Linter {
                     ),
                     self.context.file_path.clone(),
                     // The location points to the second space, which is the beginning of the violation.
-                    range_from_tree_sitter(&tree_sitter::Range {
+                    range_from_node_range(&crate::ast::NodeRange {
                         start_byte: 0, // Not accurate, but line/col is used
                         end_byte: 0,
-                        start_point: tree_sitter::Point { row: line_index, column: start_col + 2 },
-                        end_point: tree_sitter::Point { row: line_index, column: start_col + 3 },
+                        start_point: crate::ast::Point { row: line_index, column: start_col + 2 },
+                        end_point: crate::ast::Point { row: line_index, column: start_col + 3 },
                     }),
                 ));
             }

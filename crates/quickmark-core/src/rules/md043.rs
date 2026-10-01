@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use std::rc::Rc;
 
-use tree_sitter::Node;
+use crate::ast::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation},
+    linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
     rules::{Rule, RuleType},
 };
 
@@ -21,7 +21,7 @@ pub struct MD043RequiredHeadingsTable {
 struct HeadingInfo {
     content: String,
     level: u8,
-    range: tree_sitter::Range,
+    range: crate::ast::NodeRange,
 }
 
 pub(crate) struct MD043Linter {
@@ -170,7 +170,7 @@ impl MD043Linter {
                             &MD043,
                             format!("Expected: {expected}; Actual: {actual}"),
                             self.context.file_path.clone(),
-                            range_from_tree_sitter(&heading.range),
+                            range_from_node_range(&heading.range),
                         ));
                         has_error = true;
                     }
@@ -190,14 +190,14 @@ impl MD043Linter {
             let missing_heading = &config.headings[required_index];
 
             // Create a range for the end of file
-            let end_range = tree_sitter::Range {
+            let end_range = crate::ast::NodeRange {
                 start_byte: self.context.get_document_content().len(),
                 end_byte: self.context.get_document_content().len(),
-                start_point: tree_sitter::Point {
+                start_point: crate::ast::Point {
                     row: last_line,
                     column: 0,
                 },
-                end_point: tree_sitter::Point {
+                end_point: crate::ast::Point {
                     row: last_line,
                     column: 0,
                 },
@@ -207,7 +207,7 @@ impl MD043Linter {
                 &MD043,
                 format!("Missing heading: {missing_heading}"),
                 self.context.file_path.clone(),
-                range_from_tree_sitter(&end_range),
+                range_from_node_range(&end_range),
             ));
         }
     }

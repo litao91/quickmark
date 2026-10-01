@@ -1,12 +1,12 @@
+use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use tree_sitter::Node;
 
 use crate::{
-    linter::{range_from_tree_sitter, RuleViolation},
+    linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
@@ -40,7 +40,7 @@ static REFERENCE_DEFINITION_PATTERN: Lazy<Regex> =
 #[derive(Debug, Clone)]
 struct ReferenceDefinition {
     label: String,
-    range: tree_sitter::Range,
+    range: crate::ast::NodeRange,
 }
 
 pub(crate) struct MD053Linter {
@@ -251,7 +251,7 @@ impl RuleLinter for MD053Linter {
                             first_def.label
                         ),
                         self.context.file_path.clone(),
-                        range_from_tree_sitter(&first_def.range),
+                        range_from_node_range(&first_def.range),
                     ));
                 }
                 // Report all subsequent definitions as duplicates (first definition wins per CommonMark)
@@ -263,7 +263,7 @@ impl RuleLinter for MD053Linter {
                             definition.label
                         ),
                         self.context.file_path.clone(),
-                        range_from_tree_sitter(&definition.range),
+                        range_from_node_range(&definition.range),
                     ));
                 }
             } else if is_unused {
@@ -276,7 +276,7 @@ impl RuleLinter for MD053Linter {
                         def.label
                     ),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&def.range),
+                    range_from_node_range(&def.range),
                 ));
             }
         }

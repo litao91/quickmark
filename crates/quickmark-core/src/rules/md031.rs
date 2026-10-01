@@ -1,8 +1,8 @@
+use crate::ast::Node;
 use serde::Deserialize;
 use std::rc::Rc;
-use tree_sitter::Node;
 
-use crate::linter::{range_from_tree_sitter, Context, RuleLinter, RuleViolation};
+use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
 use super::{Rule, RuleType};
 
@@ -96,7 +96,7 @@ impl MD031Linter {
                     &MD031,
                     MISSING_BLANK_BEFORE.to_string(),
                     self.context.file_path.clone(),
-                    range_from_tree_sitter(&node.range()),
+                    range_from_node_range(&node.range()),
                 ));
             }
         }
@@ -123,7 +123,7 @@ impl MD031Linter {
                 &MD031,
                 MISSING_BLANK_AFTER.to_string(),
                 self.context.file_path.clone(),
-                range_from_tree_sitter(&node.range()),
+                range_from_node_range(&node.range()),
             ));
         }
     }

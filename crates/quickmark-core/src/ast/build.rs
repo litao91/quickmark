@@ -27,6 +27,7 @@ pub fn parse(source: &str) -> FacadeTree {
         covered,
         enclosing_list: None,
         pending_item_start: None,
+        pending_paragraph_start: None,
     };
     builder.build(root, source)
 }
@@ -74,6 +75,10 @@ struct Node {
     start_col: u32,
     end_row: u32,
     end_col: u32,
+    /// A list item's content column: where its marker ends *before* that is clamped to the line
+    /// length. An empty item's marker node is shorter than the indent its continuation lines need,
+    /// and `continuation_prefix` has to use the unclamped column. Zero for every other kind.
+    content_col: u32,
     children: Vec<u32>,
 }
 
@@ -109,6 +114,9 @@ struct Builder<'a> {
     /// the list's own column, which for an indented top-level list is column 0 rather than the
     /// marker's; every later item starts at its marker.
     pending_item_start: Option<(u32, u32)>,
+    /// Start position forced onto the next paragraph. Set for a list item whose task marker is not
+    /// followed by whitespace — see [`Builder::bare_task_marker`].
+    pending_paragraph_start: Option<(u32, u32)>,
 }
 
 impl<'a> Builder<'a> {
@@ -124,6 +132,7 @@ impl<'a> Builder<'a> {
             start_col: start.1,
             end_row: end.0,
             end_col: end.1,
+            content_col: 0,
             children: Vec::new(),
         });
         (self.nodes.len() - 1) as u32
@@ -217,6 +226,7 @@ impl<'a> Builder<'a> {
         }
 
         self.clamp_list_ends(&top_level);
+        self.fix_indented_code_ends(&top_level);
         self.extend_block_ends();
         self.attach_link_reference_definitions(&mut top_level);
         for child in self.group_sections(&top_level, content_start, document_end) {
@@ -263,6 +273,86 @@ impl<'a> Builder<'a> {
                 (node.end_row, node.end_col) = end;
             }
         }
+    }
+
+    /// Recomputes where an indented code block ends.
+    ///
+    /// comrak reports a zero-width sourcepos for an indented code block inside a list item that is
+    /// followed by more content in the same item — `3:8-3:8` for a seven-line block — so the range
+    /// has to come from the source. That matters well beyond cosmetics: every rule that asks "is
+    /// this line inside a code block?" reads this range out of `node_cache`, so MD009 reports the
+    /// trailing spaces on each line of a block it was told is one line long.
+    ///
+    /// The block covers every following row that is blank or indented four past the container's
+    /// content column, and then runs on over the trailing blank rows to wherever the next block
+    /// starts — or to its parent's end when it is the last child. `extend_block_ends` supplies the
+    /// column afterwards.
+    fn fix_indented_code_ends(&mut self, top_level: &[u32]) {
+        let parents = self.parent_map();
+        let count = self.nodes.len();
+        let fixed: Vec<(usize, (u32, u32))> = (0..count)
+            .filter(|&index| self.nodes[index].kind == Kind::IndentedCodeBlock)
+            .map(|index| (index, self.indented_code_end(&parents, top_level, index)))
+            .collect();
+        for (index, end) in fixed {
+            let node = &mut self.nodes[index];
+            (node.end_row, node.end_col) = end;
+        }
+    }
+
+    fn indented_code_end(&self, parents: &[u32], top_level: &[u32], index: usize) -> (u32, u32) {
+        let start_row = self.nodes[index].start_row;
+        // Four past the container's content column, not the first row's own indentation: a later row
+        // only has to reach the minimum, so a block may open at five spaces and continue at four.
+        let prefix = continuation_prefix(&self.nodes, parents, &self.lines, index, start_row);
+        let indent = prefix + 4;
+
+        let mut last_code = start_row;
+        let mut row = start_row + 1;
+        while row < self.lines.line_count() as u32 {
+            match self.content_indent(parents, index, row) {
+                // Blank once container prefixes are stripped, so still inside the block.
+                None => row += 1,
+                Some(column) if column >= indent => {
+                    last_code = row;
+                    row += 1;
+                }
+                Some(_) => break,
+            }
+        }
+
+        let natural = if self.lines.ends_with_line_terminator() {
+            (last_code + 1, 0)
+        } else {
+            (last_code, self.lines.content_len(last_code as usize))
+        };
+
+        // Trailing blank rows belong to the block's range too, so it runs on to whatever follows.
+        let parent = parents[index];
+        let (siblings, parent_end) = if parent == u32::MAX {
+            (top_level, self.document_end())
+        } else {
+            (
+                self.nodes[parent as usize].children.as_slice(),
+                self.nodes[parent as usize].end(),
+            )
+        };
+        let followed = siblings
+            .iter()
+            .position(|&sibling| sibling as usize == index)
+            .and_then(|position| siblings.get(position + 1))
+            .map(|&next| self.nodes[next as usize].start())
+            .unwrap_or(parent_end);
+        natural.max(followed)
+    }
+
+    /// The column `row`'s first non-space byte sits at, counting only what follows the container
+    /// prefixes that still enclose `index`. `None` when nothing does, i.e. the row is blank.
+    fn content_indent(&self, parents: &[u32], index: usize, row: u32) -> Option<u32> {
+        let text = self.lines.content(row as usize);
+        let prefix = continuation_prefix(&self.nodes, parents, &self.lines, index, row) as usize;
+        let rest = text[prefix.min(text.len())..].trim_start_matches([' ', '\t']);
+        (!rest.is_empty()).then_some((text.len() - rest.len()) as u32)
     }
 
     /// tree-sitter-md folds a block's continuation prefixes into the block's own range, so inside a
@@ -485,7 +575,11 @@ impl<'a> Builder<'a> {
                 out.push(index);
             }
             NodeValue::Paragraph => {
-                let (start, end) = (self.start_col(node, nesting), self.block_end(node));
+                let forced = self.pending_paragraph_start.take();
+                let (start, end) = (
+                    forced.unwrap_or_else(|| self.start_col(node, nesting)),
+                    self.block_end(node),
+                );
                 drop(data);
                 out.extend(self.emit_paragraph(start, end));
             }
@@ -566,7 +660,14 @@ impl<'a> Builder<'a> {
     }
 
     fn emit_container(&mut self, kind: Kind, node: ComrakNode<'a>, nesting: Nesting) -> u32 {
-        let index = self.add(kind, self.start_col(node, nesting), self.block_end(node));
+        let mut start = self.start_col(node, nesting);
+        // tree-sitter-md starts a nested container at the enclosing item's content column even when
+        // the container's own marker is indented past it, so `1. a` followed by `    * x` puts the
+        // inner list — and its first item, and that item's marker — at column 3 rather than 4.
+        if let Nesting::Content(column) = nesting {
+            start.1 = start.1.min(column);
+        }
+        let index = self.add(kind, start, self.block_end(node));
         let mut children = Vec::new();
 
         // A task list's items are `TaskItem`, which carries no marker details, so the enclosing
@@ -624,14 +725,38 @@ impl<'a> Builder<'a> {
         };
         let marker_node = self.add(marker.kind, marker.span.start(), marker.span.end());
 
-        // The item's content column is where its marker ends. In a task list that is *not* where the
-        // paragraph starts — `[x] ` sits between them — but it is the column a nested indented code
-        // block is measured from, and the indent a continuation line has to reach.
-        let item_content_col = self.nodes[marker_node as usize].end_col;
+        // The item's content column is the marker's column plus the list's padding — *not* where the
+        // marker node ends, because an empty item's marker is clamped to the line and a continuation
+        // line still has to reach the full indent. It is also not where a task item's paragraph
+        // starts, since `[x] ` sits between them.
+        let item_content_col = content_col;
+        self.nodes[index as usize].content_col = content_col;
+
+        // GFM only makes `[x]` a task marker when whitespace follows it, so `- [x]` at end of line is
+        // an ordinary item whose paragraph starts at the `[` and holds it as literal text. comrak
+        // strips the marker either way: it reports the paragraph three columns to the right, and
+        // drops it entirely when no later line carries the item's content.
+        let bare = matches!(node.data().value, NodeValue::TaskItem(_))
+            && self.bare_task_marker(start.0, item_content_col);
 
         let mut children = Vec::new();
+        if bare {
+            self.pending_paragraph_start = Some((start.0, item_content_col));
+        }
         for child in node.children() {
             self.emit_block(child, Nesting::Content(item_content_col), &mut children);
+        }
+        self.pending_paragraph_start = None;
+        if bare
+            && !children
+                .iter()
+                .any(|&child| self.nodes[child as usize].kind == Kind::Paragraph)
+        {
+            // The paragraph is the marker's own line and nothing more: whatever follows belongs to
+            // the item's next block, not to the text `[x]`.
+            let end = self.lines.block_end_row(start.0);
+            let paragraph = self.emit_paragraph((start.0, item_content_col), end);
+            children.splice(0..0, paragraph);
         }
 
         self.push(index, marker_node);
@@ -639,6 +764,19 @@ impl<'a> Builder<'a> {
             self.push(index, child);
         }
         index
+    }
+
+    /// Whether the task marker at `column` on `row` is the whole line, which is what stops GFM from
+    /// treating it as a marker at all.
+    fn bare_task_marker(&self, row: u32, column: u32) -> bool {
+        let Some(rest) = self.lines.content(row as usize).get(column as usize..) else {
+            return false;
+        };
+        let marker = rest.trim_end_matches([' ', '\t']);
+        marker.len() == 3
+            && marker.starts_with('[')
+            && marker.ends_with(']')
+            && matches!(marker.as_bytes()[1], b' ' | b'x' | b'X')
     }
 
     fn emit_code_block(
@@ -794,7 +932,7 @@ impl<'a> Builder<'a> {
             .map(|&(row, _)| row)
             .collect();
 
-        let table_rows = synth::table_rows(&self.lines, header, &body_rows);
+        let table_rows = synth::table_rows(&self.lines, start.1, header, &body_rows);
         for row in table_rows {
             let row_node = self.add(row.kind, row.span.start(), row.span.end());
             for child in row.children {
@@ -907,12 +1045,7 @@ fn continuation_prefix(
                 col = cursor;
             }
             Kind::ListItem => {
-                // A list item's content column is where its marker ends.
-                let content_col = nodes[ancestor]
-                    .children
-                    .first()
-                    .map(|&marker| nodes[marker as usize].end_col as usize)
-                    .unwrap_or(col);
+                let content_col = nodes[ancestor].content_col as usize;
                 let mut cursor = col;
                 while matches!(text.get(cursor), Some(b' ') | Some(b'\t')) {
                     cursor += 1;
