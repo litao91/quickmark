@@ -32,8 +32,45 @@ pub fn parse(source: &str) -> FacadeTree {
         math_emitted: Vec::new(),
     };
     builder.math = synth::math_regions(&builder.lines);
+    clip_math_to_containers(&mut builder.math, &builder.lines, root);
     builder.math_emitted = vec![false; builder.math.len()];
     builder.build(root, source)
+}
+
+/// Ends each math region with the container it opened in.
+///
+/// micromark's mathFlow is a flow construct, so it lives inside whatever container was open where it
+/// started and dies with it — `tokenizeNonLazyContinuation` gives up on a line the container no
+/// longer covers. An unclosed `$$` inside a list item therefore stops at the item, while the same `$$`
+/// at document level runs to the end of the file. [`synth::math_regions`] only sees lines and cannot
+/// tell the two apart; comrak's containers can.
+fn clip_math_to_containers(math: &mut [synth::Span], lines: &LineIndex<'_>, root: ComrakNode<'_>) {
+    for span in math.iter_mut() {
+        let opener = span.start().0;
+        // Containers holding a row form a chain, so the one that ends soonest is the innermost.
+        let innermost = root
+            .descendants()
+            .filter(|node| {
+                matches!(
+                    node.data().value,
+                    NodeValue::BlockQuote
+                        | NodeValue::List(_)
+                        | NodeValue::Item(_)
+                        | NodeValue::TaskItem(_)
+                )
+            })
+            .map(|node| node.data().sourcepos)
+            .filter(|sourcepos| {
+                let first = (sourcepos.start.line - 1) as u32;
+                let last = (sourcepos.end.line - 1) as u32;
+                first <= opener && opener <= last
+            })
+            .map(|sourcepos| (sourcepos.end.line - 1) as u32)
+            .min();
+        if let Some(last) = innermost {
+            *span = synth::Span::new(span.start(), lines.block_end_row(span.last_row().min(last)));
+        }
+    }
 }
 
 /// The comrak configuration quickmark parses with. Everything not set here stays at its default,

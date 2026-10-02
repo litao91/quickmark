@@ -661,6 +661,34 @@ const CASES: &[(&str, &str, &str)] = &[
 )
 "#,
     ),
+    (
+        "math region clipped to its list item",
+        "1. a\n\n   $$\n   x\n\n# H\n",
+        r#"(document 0:0-6:0 0-22
+  (section 0:0-5:0 0-18
+    (list 0:0-5:0 0-18
+      (list_item 0:0-5:0 0-18
+        (list_marker_dot 0:0-0:3 0-3)
+        (paragraph 0:3-1:0 3-5
+          (inline 0:3-0:4 3-4
+            (text 0:3-0:4 3-4)
+          )
+        )
+        (math_block 2:3-4:0 9-17)
+      )
+    )
+  )
+  (section 5:0-6:0 18-22
+    (atx_heading 5:0-6:0 18-22
+      (atx_h1_marker 5:0-5:1 18-19)
+      (inline 5:2-5:3 20-21
+        (text 5:2-5:3 20-21)
+      )
+    )
+  )
+)
+"#,
+    ),
 ];
 
 #[test]

@@ -162,15 +162,18 @@ impl Span {
         self.end
     }
 
-    /// Whether `row` carries any of this span's content. A span ending at column 0 stops before its
+    /// The last row carrying any of this span's content. A span ending at column 0 stops before its
     /// end row begins.
-    pub fn contains_row(self, row: u32) -> bool {
-        let last = if self.end.1 == 0 {
+    pub fn last_row(self) -> u32 {
+        if self.end.1 == 0 {
             self.end.0.saturating_sub(1)
         } else {
             self.end.0
-        };
-        self.start.0 <= row && row <= last
+        }
+    }
+
+    pub fn contains_row(self, row: u32) -> bool {
+        self.start.0 <= row && row <= self.last_row()
     }
 }
 
@@ -243,11 +246,12 @@ pub fn plus_front_matter(source: &str, lines: &LineIndex<'_>) -> Option<Span> {
 /// - An opener does interrupt a paragraph that is already open, so `text` followed by `$$` on the
 ///   next line starts a region.
 ///
-/// Two shapes are known not to work. `text` immediately followed by `$$` with no blank line between
+/// One shape is known not to work: `text` immediately followed by `$$` with no blank line between
 /// keeps one comrak paragraph spanning both lines, so nothing *starts* inside the region and no
 /// `math_block` is emitted; splitting the paragraph would mean rewriting a comrak block's range
-/// mid-emission. And a region is not clipped to the container it opened in, so a `$$` inside a list
-/// item that is never closed swallows the rest of the document where micromark stops at the item.
+/// mid-emission. Regions are also found here, where only lines are visible, and then clipped to the
+/// container they opened in by [`super::build`], because micromark's mathFlow dies with its
+/// container and a line-only scan cannot see one.
 pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
     let mut regions = Vec::new();
     let mut row = 0usize;
