@@ -105,6 +105,16 @@ impl Node {
     }
 }
 
+/// A comrak `TableCell`'s inline subtree, waiting to be grafted onto a synthesized
+/// `pipe_table_cell`. `start_byte` is the graft key; `start`/`end` are the span the `inline` node
+/// gets, and `source` is the cell whose children fill it.
+struct CellInline<'a> {
+    start_byte: u32,
+    start: (u32, u32),
+    end: (u32, u32),
+    source: ComrakNode<'a>,
+}
+
 struct Builder<'a> {
     lines: LineIndex<'a>,
     nodes: Vec<Node>,
@@ -616,7 +626,7 @@ impl<'a> Builder<'a> {
                     }
                 }
                 drop(data);
-                let index = self.emit_table(start, end, &rows);
+                let index = self.emit_table(start, end, &rows, node);
                 out.push(index);
             }
             // comrak resolves reference definitions into its private refmap and emits nothing here.
@@ -1027,11 +1037,16 @@ impl<'a> Builder<'a> {
         index
     }
 
-    fn emit_table(&mut self, start: (u32, u32), end: (u32, u32), rows: &[(u32, bool)]) -> u32 {
-        // Cells come from `synth::table_rows`, not from comrak's `TableCell` children, so they are
-        // leaves: comrak's cells are autocompleted to the header width and their spans include the
-        // surrounding padding, which is why they are not used. A rule that needs inline structure
-        // inside a cell therefore has to work from the cell's byte range, not from its children.
+    fn emit_table(
+        &mut self,
+        start: (u32, u32),
+        end: (u32, u32),
+        rows: &[(u32, bool)],
+        table: ComrakNode<'a>,
+    ) -> u32 {
+        // Rows and cells come from `synth::table_rows`, not from comrak's `TableCell` children:
+        // comrak autocompletes cells to the header width and its cell spans include the surrounding
+        // padding, neither of which matches what md055, md056 and md060 measure.
         let index = self.add(Kind::PipeTable, start, end);
         self.cover(index);
 
@@ -1048,16 +1063,84 @@ impl<'a> Builder<'a> {
             .map(|&(row, _)| row)
             .collect();
 
+        // comrak's cell *geometry* is unusable but its cell *content* is exactly right, so the inline
+        // subtree is grafted onto the synthesized cells by byte containment. Without it a cell is a
+        // leaf and every rule that scans `inline` is blind inside tables.
+        let cell_inlines = self.collect_cell_inlines(table);
+
         let table_rows = synth::table_rows(&self.lines, start.1, header, &body_rows);
         for row in table_rows {
             let row_node = self.add(row.kind, row.span.start(), row.span.end());
             for child in row.children {
                 let child_node = self.add(child.kind, child.span.start(), child.span.end());
+                if child.kind == Kind::PipeTableCell {
+                    self.emit_cell_inline(child_node, &cell_inlines);
+                }
                 self.push(row_node, child_node);
             }
             self.push(index, row_node);
         }
         index
+    }
+
+    /// One entry per comrak `TableCell` that has content: the byte offset its inline subtree starts
+    /// at, the span that subtree covers, and the cell to take the children from. Cells comrak
+    /// autocompleted for a short row have no children and are left out.
+    fn collect_cell_inlines(&self, table: ComrakNode<'a>) -> Vec<CellInline<'a>> {
+        let mut out = Vec::new();
+        for row in table.children() {
+            if !matches!(row.data().value, NodeValue::TableRow(_)) {
+                continue;
+            }
+            for cell in row.children() {
+                if !matches!(cell.data().value, NodeValue::TableCell) {
+                    continue;
+                }
+                let mut span: Option<((u32, u32), (u32, u32))> = None;
+                for child in cell.children() {
+                    let sourcepos = child.data().sourcepos;
+                    let start = (
+                        (sourcepos.start.line - 1) as u32,
+                        (sourcepos.start.column - 1) as u32,
+                    );
+                    let end = ((sourcepos.end.line - 1) as u32, sourcepos.end.column as u32);
+                    // Children are in source order, so the first one's start and the last one's end
+                    // bracket the cell's content.
+                    span = Some((span.map_or(start, |(first, _)| first), end));
+                }
+                if let Some((start, end)) = span {
+                    out.push(CellInline {
+                        start_byte: self.lines.byte_at(start.0 as usize, start.1 as usize),
+                        start,
+                        end,
+                        source: cell,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Gives one synthesized `pipe_table_cell` the `inline` subtree comrak parsed for it.
+    fn emit_cell_inline(&mut self, cell: u32, inlines: &[CellInline<'a>]) {
+        let (cell_start, cell_end) = {
+            let node = &self.nodes[cell as usize];
+            (
+                self.lines
+                    .byte_at(node.start_row as usize, node.start_col as usize),
+                self.lines
+                    .byte_at(node.end_row as usize, node.end_col as usize),
+            )
+        };
+        let Some(found) = inlines.iter().find(|candidate| {
+            candidate.start_byte >= cell_start && candidate.start_byte < cell_end
+        }) else {
+            return;
+        };
+        let (start, end, source) = (found.start, found.end, found.source);
+        let inline = self.add(Kind::Inline, start, end);
+        self.emit_inline(inline, source);
+        self.push(cell, inline);
     }
 
     /// Flattens the build-time tree into pre-order storage.

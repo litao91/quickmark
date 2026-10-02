@@ -452,6 +452,22 @@ mod test {
     }
 
     #[test]
+    fn test_emphasis_inside_a_table_cell_counts() {
+        // comrak's table cells are autocompleted to the header width and their spans include the
+        // surrounding padding, so the facade synthesizes cells from the raw lines and grafts
+        // comrak's inline subtree onto them. Without the graft a cell is a leaf and every rule that
+        // scans `inline` is blind inside tables.
+        let messages = md049_messages("_a_\n\n| *b* | c |\n|---|---|\n");
+        assert_eq!(
+            vec![
+                "Expected: underscore; Actual: asterisk",
+                "Expected: underscore; Actual: asterisk"
+            ],
+            messages.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_consistent_style_follows_document_order() {
         // The first emphasis in the document sets the style, so `_first_` wins over the later
         // `*second*` even though the asterisk regex is the one that runs first.

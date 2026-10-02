@@ -310,9 +310,17 @@ const CASES: &[(&str, &str, &str)] = &[
     (pipe_table 0:0-3:0 0-26
       (pipe_table_header 0:0-0:9 0-9
         (| 0:0-0:1 0-1)
-        (pipe_table_cell 0:2-0:4 2-4)
+        (pipe_table_cell 0:2-0:4 2-4
+          (inline 0:2-0:3 2-3
+            (text 0:2-0:3 2-3)
+          )
+        )
         (| 0:4-0:5 4-5)
-        (pipe_table_cell 0:6-0:8 6-8)
+        (pipe_table_cell 0:6-0:8 6-8
+          (inline 0:6-0:7 6-7
+            (text 0:6-0:7 6-7)
+          )
+        )
         (| 0:8-0:9 8-9)
       )
       (pipe_table_delimiter_row 1:0-1:9 10-19
@@ -324,7 +332,11 @@ const CASES: &[(&str, &str, &str)] = &[
       )
       (pipe_table_row 2:0-2:5 20-25
         (| 2:0-2:1 20-21)
-        (pipe_table_cell 2:2-2:4 22-24)
+        (pipe_table_cell 2:2-2:4 22-24
+          (inline 2:2-2:3 22-23
+            (text 2:2-2:3 22-23)
+          )
+        )
         (| 2:4-2:5 24-25)
       )
     )
@@ -520,6 +532,104 @@ const CASES: &[(&str, &str, &str)] = &[
     (paragraph 2:0-2:4 5-9
       (inline 2:0-2:4 5-9
         (text 2:0-2:4 5-9)
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        "table cell inline",
+        "| *em* | `code` |\n|---|---|\n| [l](/u) | <b>h</b> |\n",
+        r#"(document 0:0-3:0 0-51
+  (section 0:0-3:0 0-51
+    (pipe_table 0:0-3:0 0-51
+      (pipe_table_header 0:0-0:17 0-17
+        (| 0:0-0:1 0-1)
+        (pipe_table_cell 0:2-0:7 2-7
+          (inline 0:2-0:6 2-6
+            (emphasis 0:2-0:6 2-6
+              (text 0:3-0:5 3-5)
+            )
+          )
+        )
+        (| 0:7-0:8 7-8)
+        (pipe_table_cell 0:9-0:16 9-16
+          (inline 0:9-0:15 9-15
+            (code_span 0:9-0:15 9-15)
+          )
+        )
+        (| 0:16-0:17 16-17)
+      )
+      (pipe_table_delimiter_row 1:0-1:9 18-27
+        (| 1:0-1:1 18-19)
+        (pipe_table_delimiter_cell 1:1-1:4 19-22)
+        (| 1:4-1:5 22-23)
+        (pipe_table_delimiter_cell 1:5-1:8 23-26)
+        (| 1:8-1:9 26-27)
+      )
+      (pipe_table_row 2:0-2:22 28-50
+        (| 2:0-2:1 28-29)
+        (pipe_table_cell 2:2-2:10 30-38
+          (inline 2:2-2:9 30-37
+            (link 2:2-2:9 30-37
+              (text 2:3-2:4 31-32)
+            )
+          )
+        )
+        (| 2:10-2:11 38-39)
+        (pipe_table_cell 2:12-2:21 40-49
+          (inline 2:12-2:20 40-48
+            (html_inline 2:12-2:15 40-43)
+            (text 2:15-2:16 43-44)
+            (html_inline 2:16-2:20 44-48)
+          )
+        )
+        (| 2:21-2:22 49-50)
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        "table short row",
+        "| a | b |\n|---|---|\n| *x* |\n",
+        r#"(document 0:0-3:0 0-28
+  (section 0:0-3:0 0-28
+    (pipe_table 0:0-3:0 0-28
+      (pipe_table_header 0:0-0:9 0-9
+        (| 0:0-0:1 0-1)
+        (pipe_table_cell 0:2-0:4 2-4
+          (inline 0:2-0:3 2-3
+            (text 0:2-0:3 2-3)
+          )
+        )
+        (| 0:4-0:5 4-5)
+        (pipe_table_cell 0:6-0:8 6-8
+          (inline 0:6-0:7 6-7
+            (text 0:6-0:7 6-7)
+          )
+        )
+        (| 0:8-0:9 8-9)
+      )
+      (pipe_table_delimiter_row 1:0-1:9 10-19
+        (| 1:0-1:1 10-11)
+        (pipe_table_delimiter_cell 1:1-1:4 11-14)
+        (| 1:4-1:5 14-15)
+        (pipe_table_delimiter_cell 1:5-1:8 15-18)
+        (| 1:8-1:9 18-19)
+      )
+      (pipe_table_row 2:0-2:7 20-27
+        (| 2:0-2:1 20-21)
+        (pipe_table_cell 2:2-2:6 22-26
+          (inline 2:2-2:5 22-25
+            (emphasis 2:2-2:5 22-25
+              (text 2:3-2:4 23-24)
+            )
+          )
+        )
+        (| 2:6-2:7 26-27)
       )
     )
   )
