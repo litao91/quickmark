@@ -6,7 +6,7 @@
 //! detached into a private map, and table cells are autocompleted to the header width. Those are
 //! re-derived from raw source in `synth`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use comrak::nodes::{NodeHeading, NodeList, NodeValue};
 // `comrak::Node<'a>` is `&'a AstNode<'a>` — the shared-reference form that `children()` yields.
@@ -33,6 +33,7 @@ pub fn parse(source: &str) -> FacadeTree {
         math: Vec::new(),
         math_emitted: Vec::new(),
         link_targets: HashMap::new(),
+        closed_headings: HashSet::new(),
     };
     builder.math = synth::math_regions(&builder.lines);
     clip_math_to_containers(&mut builder.math, &builder.lines, root);
@@ -182,6 +183,8 @@ struct Builder<'a> {
     /// Destinations of the `link` nodes emitted so far, keyed by build-time index. [`Builder::flatten`]
     /// rekeys them by position.
     link_targets: HashMap<u32, LinkTarget>,
+    /// Build-time indices of the closed `atx_heading` nodes, rekeyed by [`Builder::flatten`].
+    closed_headings: HashSet<u32>,
 }
 
 impl<'a> Builder<'a> {
@@ -1039,18 +1042,22 @@ impl<'a> Builder<'a> {
         if heading.setext {
             self.emit_setext_heading(heading, start, end, underline_row, source)
         } else {
-            self.emit_atx_heading(start, end, source)
+            self.emit_atx_heading(heading.closed, start, end, source)
         }
     }
 
     fn emit_atx_heading(
         &mut self,
+        closed: bool,
         start: (u32, u32),
         end: (u32, u32),
         source: ComrakNode<'a>,
     ) -> u32 {
         let index = self.add(Kind::AtxHeading, start, end);
         self.cover(index);
+        if closed {
+            self.closed_headings.insert(index);
+        }
 
         let parts = synth::atx_parts(&self.lines, start.0, start.1);
         let marker_node = self.add(
@@ -1264,11 +1271,16 @@ impl<'a> Builder<'a> {
             .into_iter()
             .map(|(index, target)| (position_of[index as usize], target))
             .collect();
+        let closed_headings = std::mem::take(&mut self.closed_headings)
+            .into_iter()
+            .map(|index| position_of[index as usize])
+            .collect();
 
         FacadeTree {
             nodes,
             child_index,
             link_targets,
+            closed_headings,
         }
     }
 }

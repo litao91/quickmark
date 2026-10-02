@@ -21,7 +21,7 @@ pub mod walker;
 
 pub(crate) mod synth;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 mod snapshot;
@@ -230,6 +230,8 @@ pub struct FacadeTree {
     pub(crate) child_index: Vec<u32>,
     /// Destinations of the `link` nodes, keyed by node index. Only links have entries.
     pub(crate) link_targets: HashMap<u32, LinkTarget>,
+    /// Indices of the `atx_heading` nodes the parser closed. Only closed headings have entries.
+    pub(crate) closed_headings: HashSet<u32>,
 }
 
 /// Where a `link` node points.
@@ -350,6 +352,16 @@ impl<'a> Node<'a> {
     /// Where a `link` node points, or `None` for every other kind.
     pub fn link_target(self) -> Option<&'a LinkTarget> {
         self.tree.link_targets.get(&self.index)
+    }
+
+    /// Whether an `atx_heading` ends in a closing `#` sequence — `# H #`, but not `# H#`, whose
+    /// trailing hash is not preceded by whitespace and so is content. False for every other kind.
+    ///
+    /// The tree keeps the closing sequence inside the heading's `inline` rather than giving it a
+    /// node of its own, so this is the only way to tell the two apart, and markdownlint's MD019 and
+    /// MD021 split on exactly it.
+    pub fn is_closed(self) -> bool {
+        self.tree.closed_headings.contains(&self.index)
     }
 
     pub fn parent(self) -> Option<Node<'a>> {

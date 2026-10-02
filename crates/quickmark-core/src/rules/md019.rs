@@ -18,47 +18,60 @@ impl MD019Linter {
         }
     }
 
+    /// Reports the run of whitespace after an ATX heading's hashes when it is longer than one.
+    ///
+    /// A closed heading belongs to MD021 and not here: markdownlint splits the two on how many
+    /// `atxHeadingSequence` tokens micromark emitted, so `#  H  #` gets MD021 twice and no MD019.
+    /// The run is measured against the line rather than the heading's text node, because a heading
+    /// with nothing after its hashes has no text node and `##  ` is still reported.
     fn check_heading_spaces(&mut self, node: &Node) {
-        let source = self.context.get_document_content();
-
-        // Different approach: analyze the raw text between marker and content
-        if let (Some(marker_child), Some(content_child)) = (node.child(0), node.child(1)) {
-            if marker_child.kind().starts_with("atx_h") && marker_child.kind().ends_with("_marker")
-            {
-                let marker_end = marker_child.end_byte();
-                let content_start = content_child.start_byte();
-
-                // Extract the whitespace between marker and content
-                if content_start > marker_end {
-                    let whitespace_text = &source[marker_end..content_start];
-
-                    // Check if more than one whitespace character
-                    if whitespace_text.len() > 1 {
-                        // Create a range for the excess whitespace (after the first character)
-                        let line_num = node.start_position().row;
-                        let start_col = node.start_position().column
-                            + marker_child
-                                .utf8_text(source.as_bytes())
-                                .unwrap_or("")
-                                .len()
-                            + 1;
-
-                        self.violations.push(RuleViolation::new(
-                            &MD019,
-                            format!(
-                                "Multiple spaces after hash on atx style heading [Expected: 1; Actual: {}]",
-                                whitespace_text.len()
-                            ),
-                            self.context.file_path.clone(),
-                            crate::linter::Range {
-                                start: crate::linter::CharPosition { line: line_num, character: start_col },
-                                end: crate::linter::CharPosition { line: line_num, character: content_child.start_position().column },
-                            },
-                        ));
-                    }
-                }
-            }
+        if node.is_closed() {
+            return;
         }
+        let Some(marker) = node.child(0) else {
+            return;
+        };
+        let kind = marker.kind();
+        if !kind.starts_with("atx_h") || !kind.ends_with("_marker") {
+            return;
+        }
+
+        let row = node.start_position().row;
+        let (line_start, line_end) = {
+            let lines = self.context.lines.borrow();
+            let start = self.context.line_start_byte(row);
+            (start, start + lines.get(row).map_or(0, |line| line.len()))
+        };
+        let source = self.context.get_document_content();
+        let from = marker.end_byte().max(line_start).min(line_end);
+        let to = (from..line_end)
+            .find(|&at| !matches!(source.as_bytes()[at], b' ' | b'\t'))
+            .unwrap_or(line_end);
+        if to - from <= 1 {
+            return;
+        }
+
+        // markdownlint reports from the second character of the run to its end, which is the part
+        // its fix deletes.
+        let start = from - line_start + 1;
+        self.violations.push(RuleViolation::new(
+            &MD019,
+            format!(
+                "Multiple spaces after hash on atx style heading [Expected: 1; Actual: {}]",
+                to - from
+            ),
+            self.context.file_path.clone(),
+            crate::linter::Range {
+                start: crate::linter::CharPosition {
+                    line: row,
+                    character: start,
+                },
+                end: crate::linter::CharPosition {
+                    line: row,
+                    character: to - line_start,
+                },
+            },
+        ));
     }
 }
 
@@ -92,139 +105,91 @@ mod test {
     use crate::linter::MultiRuleLinter;
     use crate::test_utils::test_helpers::test_config_with_rules;
 
-    fn test_config() -> crate::config::QuickmarkConfig {
-        test_config_with_rules(vec![
+    /// `(line, column)` of one report, both 1-based, which is markdownlint's `errorRange` start: the
+    /// second character of the run, since that is the part its fix deletes.
+    type Position = (usize, usize);
+
+    fn positions(source: &str) -> Vec<Position> {
+        let config = test_config_with_rules(vec![
             ("no-multiple-space-atx", RuleSeverity::Error),
             ("heading-style", RuleSeverity::Off),
             ("heading-increment", RuleSeverity::Off),
-        ])
+        ]);
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, source);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let range = &violation.location().range;
+                (range.start.line + 1, range.start.character + 1)
+            })
+            .collect()
     }
 
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output with
+    /// MD019's defaults.
+    ///
+    /// Columns count UTF-8 bytes here and UTF-16 units there, and every case below has its
+    /// multi-byte characters after the reported run, so the two agree throughout.
+    const CASES: &[(&str, &[Position])] = &[
+        // A closed heading is MD021's, so it is quiet here however wide the gap is.
+        ("#  About  #\n", &[]),
+        ("# About  #\n", &[]),
+        ("##  ##\n", &[]),
+        ("#  #\n", &[]),
+        ("##  Heading  ##  \n", &[]),
+        ("#\t\tTab  #\n", &[]),
+        ("#  About  ##\n", &[]),
+        ("#  a  #  b  #\n", &[]),
+        ("###   x   ###\n", &[]),
+        ("   #  About  #\n", &[]),
+        ("> #  About  #\n", &[]),
+        ("- #  About  #\n", &[]),
+        ("######  six  ######\n", &[]),
+        ("#  \u{e9}  #\n", &[]),
+        ("# H #\n", &[]),
+        ("#  a #  \n", &[]),
+        // What keeps a heading open: no trailing hashes at all, hashes that are content, and hashes
+        // the parser never made a heading out of.
+        ("#  About\n", &[(1, 3)]),
+        ("#  foo#\n", &[(1, 3)]),
+        ("#  About \\#\n", &[(1, 3)]),
+        ("#  x  \\#\n", &[(1, 3)]),
+        ("#  About  # trailing\n", &[(1, 3)]),
+        ("#  About #\u{fe0f}\u{20e3}\n", &[(1, 3)]),
+        ("#\u{fe0f}\u{20e3}  keycap\n", &[]),
+        ("#######  seven  #######\n", &[]),
+        ("#Heading with no space\n", &[]),
+        ("Setext Heading\n==============\n", &[]),
+        ("Setext Heading\n--------------\n", &[]),
+        // Tabs count, a run of one does not, and a heading with no text still has a run.
+        ("##\t\tHeading with tabs\n", &[(1, 4)]),
+        ("###  \tHeading with space and tab\n", &[(1, 5)]),
+        ("####   Heading with multiple spaces\n", &[(1, 6)]),
+        ("##  ATX heading with multiple spaces\n", &[(1, 4)]),
+        ("#  H  \t\n", &[(1, 3)]),
+        ("#\t H\n", &[(1, 3)]),
+        ("#  \u{e9}\n", &[(1, 3)]),
+        ("  ##  x\n", &[(1, 6)]),
+        ("> ##  y\n", &[(1, 6)]),
+        ("- ##  z\n", &[(1, 6)]),
+        ("##  \n", &[(1, 4)]),
+        ("# \n", &[]),
+        ("#\n", &[]),
+        ("# Heading 1\n", &[]),
+    ];
+
     #[test]
-    fn test_md019_multiple_spaces_violations() {
-        let config = test_config();
-
-        let input = "##  Heading 2
-###   Heading 3
-####    Heading 4
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect 3 violations for multiple spaces after hash
-        assert_eq!(violations.len(), 3);
-
-        for violation in &violations {
-            assert_eq!(violation.rule().id, "MD019");
+    fn matches_markdownlint() {
+        for &(source, expected) in CASES {
+            assert_eq!(expected, positions(source).as_slice(), "source {source:?}");
         }
     }
 
     #[test]
-    fn test_md019_single_space_no_violations() {
-        let config = test_config();
-
-        let input = "# Heading 1
-## Heading 2
-### Heading 3
-#### Heading 4
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - single space after hash is correct
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md019_tabs_and_spaces_violations() {
-        let config = test_config();
-
-        let input = "##\t\tHeading with tabs
-###  \tHeading with space and tab
-####   Heading with multiple spaces
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect 3 violations for multiple whitespace chars after hash
-        assert_eq!(violations.len(), 3);
-
-        for violation in &violations {
-            assert_eq!(violation.rule().id, "MD019");
-        }
-    }
-
-    #[test]
-    fn test_md019_mixed_valid_and_invalid() {
-        let config = test_config();
-
-        let input = "# Valid heading 1
-##  Invalid heading 2
-### Valid heading 3
-####   Invalid heading 4
-##### Valid heading 5
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect 2 violations (lines 2 and 4)
-        assert_eq!(violations.len(), 2);
-
-        for violation in &violations {
-            assert_eq!(violation.rule().id, "MD019");
-        }
-    }
-
-    #[test]
-    fn test_md019_no_space_violations() {
-        let config = test_config();
-
-        let input = "#Heading with no space
-##Heading with no space
-###Heading with no space
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - MD019 only cares about multiple spaces, not missing spaces
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md019_closed_atx_violations() {
-        let config = test_config();
-
-        let input = "##  Closed heading with multiple spaces ##
-###   Another closed heading ###
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect 2 violations for multiple spaces after opening hash
-        assert_eq!(violations.len(), 2);
-
-        for violation in &violations {
-            assert_eq!(violation.rule().id, "MD019");
-        }
-    }
-
-    #[test]
-    fn test_md019_only_atx_headings() {
-        let config = test_config();
-
-        let input = "Setext Heading 1
-================
-
-Setext Heading 2
-----------------
-
-##  ATX heading with multiple spaces
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should only detect 1 violation for the ATX heading, not setext headings
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].rule().id, "MD019");
+    fn one_report_per_heading() {
+        let source = "##  Heading 2\n###   Heading 3\n####    Heading 4\n";
+        assert_eq!(vec![(1, 4), (2, 5), (3, 6)], positions(source));
     }
 }
