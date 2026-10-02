@@ -41,34 +41,27 @@ impl Default for MD049EmphasisStyleTable {
     }
 }
 
-// Regex patterns to find emphasis
-// The content class allows newlines: emphasis routinely spans a wrapped line, and excluding `\n`
-// made every such emphasis invisible. Runaway matches across a paragraph are held off by
-// `is_plausible_emphasis`, which rejects markers that are not adjacent to content.
-static ASTERISK_EMPHASIS_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\*([^*]+?)\*").expect("Invalid asterisk emphasis regex"));
+// The four helpers below belong to md036, md037 and md050, which still decide what is emphasis by
+// scanning raw text. md049 and md045 read the inline tree instead, so a code span, a link
+// destination or a math region simply never reaches them as text.
 
-static UNDERSCORE_EMPHASIS_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"_([^_]+?)_").expect("Invalid underscore emphasis regex"));
-
-// Regex to find code spans (to exclude from emphasis checking). The inline tree is never parsed, so
-// there are no code_span nodes to consult. Runs of one, two or three backticks are matched longest
-// first, and a span may cross lines — CommonMark allows both, and a URL like `l_orderkey__0` inside
-// a span is literal text rather than strong emphasis.
+/// Code spans. The content class is dotall: a span may cross lines, and a URL like `l_orderkey__0`
+/// inside one is literal text rather than strong emphasis. Runs of one, two or three backticks are
+/// matched longest first.
 pub(crate) static CODE_SPAN_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)```.*?```|``.*?``|`[^`]*`").expect("Invalid code span regex"));
 
-// Link and image destinations, and autolinks. Emphasis markers inside a URL are literal text —
-// `http://example.com/s?__biz=1` is not strong emphasis. markdownlint never sees them because
-// micromark tokenises a destination separately from inline content.
+/// Link and image destinations, and autolinks. Emphasis markers inside a URL are literal text —
+/// `http://example.com/s?__biz=1` is not strong emphasis. markdownlint never sees them because
+/// micromark tokenises a destination separately from inline content.
 pub(crate) static LINK_DESTINATION_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\]\([^)\n]*\)|<[^<>\n]*>").expect("Invalid link destination regex"));
 
 /// Math regions. markdownlint's micromark tokenises `$...$` and `$$...$$` as math, so their content
-/// never becomes inline text and no emphasis rule sees it. quickmark has no math tokeniser, so the
-/// regions are masked instead. Display math may span lines; inline math follows micromark's
-/// constraint that the opening `$` is not followed by whitespace and the closing `$` is not preceded
-/// by whitespace, which is what keeps a price like `$5 and $10` from being read as math.
+/// never becomes inline text and no emphasis rule sees it. Display math may span lines; inline math
+/// follows micromark's constraint that the opening `$` is not followed by whitespace and the
+/// closing `$` is not preceded by whitespace, which is what keeps a price like `$5 and $10` from
+/// being read as math.
 pub(crate) static MATH_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\$\$[\s\S]*?\$\$|\$(?:[^$\s\n]\$|[^$\s\n][^$\n]*[^$\s\n]\$)")
         .expect("Invalid math regex")
@@ -92,15 +85,24 @@ pub(crate) fn literal_ranges(text: &str) -> Vec<(usize, usize)> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum DetectedEmphasisStyle {
+enum Marker {
     Asterisk,
     Underscore,
+}
+
+impl Marker {
+    fn name(self) -> &'static str {
+        match self {
+            Marker::Asterisk => "asterisk",
+            Marker::Underscore => "underscore",
+        }
+    }
 }
 
 pub(crate) struct MD049Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
-    document_style: Option<DetectedEmphasisStyle>,
+    document_style: Option<Marker>,
 }
 
 impl MD049Linter {
@@ -122,207 +124,111 @@ impl MD049Linter {
             .clone()
     }
 
-    fn is_in_code_context(&self, node: &Node) -> bool {
-        // Check if this node is inside a code span or code block
-        let mut current = Some(*node);
-        while let Some(node_to_check) = current {
-            match node_to_check.kind() {
-                "code_span" | "fenced_code_block" | "indented_code_block" => {
-                    return true;
-                }
-                _ => {
-                    current = node_to_check.parent();
-                }
+    /// Walks the inline subtree, which `feed` never descends into because inline kinds are filtered
+    /// out of dispatch. Pre-order matches markdownlint's token order, which is what makes
+    /// `style = "consistent"` mean "whatever came first in the document".
+    fn walk(&mut self, root: Node) {
+        let mut cursor = root.walk();
+        let mut depth = 0;
+        loop {
+            let node = cursor.node();
+            if node.kind() == "emphasis" {
+                self.check(node);
             }
-        }
-        false
-    }
-
-    fn is_intraword_emphasis(
-        &self,
-        text: &str,
-        emphasis_start: usize,
-        emphasis_end: usize,
-    ) -> bool {
-        // `emphasis_start` and `emphasis_end` are byte offsets into `text`. Indexing the document's
-        // characters with a byte offset lands on the wrong character as soon as anything upstream is
-        // multi-byte — an em dash alone was enough to make real emphasis look intraword.
-        let before_is_word_char = text[..emphasis_start]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
-
-        let after_is_word_char = text[emphasis_end..]
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
-
-        before_is_word_char || after_is_word_char
-    }
-
-    fn process_emphasis_matches(
-        &mut self,
-        text: &str,
-        start_offset: usize,
-        matches: &[(usize, usize, DetectedEmphasisStyle)],
-    ) {
-        // Find ranges of literal content to exclude
-        let literal_spans = literal_ranges(text);
-
-        for &(match_start, match_end, style) in matches {
-            // Check if this match overlaps with any code span
-            // Only the markers have to sit outside literal content; what is between them may
-            // contain code spans, links or math.
-            if marker_in_literal(&literal_spans, match_start, match_start + 1)
-                || marker_in_literal(&literal_spans, match_end - 1, match_end)
-            {
+            if cursor.goto_first_child() {
+                depth += 1;
                 continue;
             }
-
-            // Check if this is intraword emphasis
-            if self.is_intraword_emphasis(text, match_start, match_end) {
-                // Intraword emphasis is always allowed regardless of configured style
-                continue;
-            }
-
-            let configured_style = self.get_configured_style();
-            let should_report_violation = match configured_style {
-                EmphasisStyle::Asterisk => style != DetectedEmphasisStyle::Asterisk,
-                EmphasisStyle::Underscore => style != DetectedEmphasisStyle::Underscore,
-                EmphasisStyle::Consistent => {
-                    if let Some(doc_style) = self.document_style {
-                        style != doc_style
-                    } else {
-                        // First emphasis sets the document style
-                        self.document_style = Some(style);
-                        false // No violation for the first emphasis
-                    }
+            loop {
+                if depth == 0 {
+                    return;
                 }
-            };
-
-            if should_report_violation {
-                let expected_style = match configured_style {
-                    EmphasisStyle::Asterisk => "asterisk",
-                    EmphasisStyle::Underscore => "underscore",
-                    EmphasisStyle::Consistent => match self.document_style {
-                        Some(DetectedEmphasisStyle::Asterisk) => "asterisk",
-                        Some(DetectedEmphasisStyle::Underscore) => "underscore",
-                        None => "consistent", // This shouldn't happen, but fallback
-                    },
-                };
-
-                let actual_style = match style {
-                    DetectedEmphasisStyle::Asterisk => "asterisk",
-                    DetectedEmphasisStyle::Underscore => "underscore",
-                };
-
-                // markdownlint reports the opening and the closing marker separately, since each is
-                // its own edit; match that so the violation counts agree.
-                let message = format!("Expected: {expected_style}; Actual: {actual_style}");
-                for marker_start in [match_start, match_end - 1] {
-                    let global_start = start_offset + marker_start;
-                    let global_end = global_start + 1;
-
-                    let range = crate::ast::NodeRange {
-                        start_byte: global_start,
-                        end_byte: global_end,
-                        start_point: self.byte_to_point(global_start),
-                        end_point: self.byte_to_point(global_end),
-                    };
-
-                    self.violations.push(RuleViolation::new(
-                        &MD049,
-                        message.clone(),
-                        self.context.file_path.clone(),
-                        range_from_node_range(&range),
-                    ));
+                if cursor.goto_next_sibling() {
+                    break;
                 }
+                cursor.goto_parent();
+                depth -= 1;
             }
         }
     }
 
-    fn find_emphasis_violations_in_text(&mut self, node: &Node) {
-        if self.is_in_code_context(node) {
+    fn check(&mut self, node: Node) {
+        let (start, end) = (node.start_byte(), node.end_byte());
+        let Some(marker) = self.marker_at(start) else {
+            return;
+        };
+
+        let expected = match self.get_configured_style() {
+            EmphasisStyle::Asterisk => Marker::Asterisk,
+            EmphasisStyle::Underscore => Marker::Underscore,
+            // The first emphasis in the document sets the style and is never itself a violation.
+            EmphasisStyle::Consistent => *self.document_style.get_or_insert(marker),
+        };
+        if expected == marker {
             return;
         }
 
-        let start_byte = node.start_byte();
-        let text = {
-            let source = self.context.get_document_content();
-            source[start_byte..node.end_byte()].to_string()
-        };
-
-        // eprintln!("DEBUG MD049: Processing text: '{}'", text);
-
-        // Both marker kinds have to be considered in a single document-order pass: whichever
-        // emphasis comes first defines the "consistent" style. Running the asterisk regex to
-        // completion first would let a later `*x*` set the style over an earlier `_y_`.
-        let mut matches: Vec<(usize, usize, DetectedEmphasisStyle)> = ASTERISK_EMPHASIS_REGEX
-            .find_iter(&text)
-            .filter(|m| is_plausible_emphasis(&text, m.start(), m.end(), b'*'))
-            .map(|m| (m.start(), m.end(), DetectedEmphasisStyle::Asterisk))
-            .chain(
-                UNDERSCORE_EMPHASIS_REGEX
-                    .find_iter(&text)
-                    .filter(|m| is_plausible_emphasis(&text, m.start(), m.end(), b'_'))
-                    .map(|m| (m.start(), m.end(), DetectedEmphasisStyle::Underscore)),
-            )
-            .collect();
-        matches.sort_by_key(|(start, _, _)| *start);
-
-        self.process_emphasis_matches(&text, start_byte, &matches);
-    }
-
-    fn byte_to_point(&self, byte_pos: usize) -> crate::ast::Point {
-        let source = self.context.get_document_content();
-        let mut line = 0;
-        let mut column = 0;
-
-        for (i, ch) in source.char_indices() {
-            if i >= byte_pos {
-                break;
-            }
-            if ch == '\n' {
-                line += 1;
-                column = 0;
-            } else {
-                column += 1;
-            }
+        // markdownlint only exempts intraword emphasis when the expected style is underscore, and
+        // only on its own `/^\w$/` — ASCII, so a CJK character beside the marker does not count.
+        if expected == Marker::Underscore && self.is_intraword(start, end) {
+            return;
         }
 
-        crate::ast::Point { row: line, column }
+        // markdownlint reports the opening and the closing delimiter separately, since each is its
+        // own edit; match that so the violation counts agree.
+        let message = format!("Expected: {}; Actual: {}", expected.name(), marker.name());
+        let start_point = node.start_position();
+        let end_point = node.end_position();
+        for (marker_byte, from, to) in [
+            (
+                start,
+                start_point,
+                crate::ast::Point::new(start_point.row, start_point.column + 1),
+            ),
+            (
+                end - 1,
+                crate::ast::Point::new(end_point.row, end_point.column - 1),
+                end_point,
+            ),
+        ] {
+            let range = crate::ast::NodeRange {
+                start_byte: marker_byte,
+                end_byte: marker_byte + 1,
+                start_point: from,
+                end_point: to,
+            };
+            self.violations.push(RuleViolation::new(
+                &MD049,
+                message.clone(),
+                self.context.file_path.clone(),
+                range_from_node_range(&range),
+            ));
+        }
     }
-}
 
-/// Whether a regex hit is plausibly real emphasis rather than an artifact of scanning raw text.
-/// micromark settles this with the full flanking rules; quickmark never parses the inline tree, so
-/// these are the two cheap conditions that remove the common false positives — a `**strong**` run,
-/// which is MD050's business, and markers used as ordinary punctuation, as in `a * b * c`.
-fn is_plausible_emphasis(text: &str, start: usize, end: usize, marker: u8) -> bool {
-    let bytes = text.as_bytes();
-
-    // Not one emphasis inside a longer run of the same marker.
-    if start > 0 && bytes[start - 1] == marker {
-        return false;
-    }
-    if bytes.get(end) == Some(&marker) {
-        return false;
+    /// Which marker an `emphasis` node was written with. The node's own source starts at its opening
+    /// delimiter, so the first byte settles it.
+    fn marker_at(&self, byte: usize) -> Option<Marker> {
+        match self.context.get_document_content().as_bytes().get(byte) {
+            Some(b'*') => Some(Marker::Asterisk),
+            Some(b'_') => Some(Marker::Underscore),
+            _ => None,
+        }
     }
 
-    // An opener must be followed by content and a closer preceded by it, so whitespace either side
-    // of the enclosed text means these were never delimiter runs.
-    !matches!(bytes.get(start + 1), Some(b' ') | Some(b'\t'))
-        && !matches!(bytes.get(end - 2), Some(b' ') | Some(b'\t'))
+    /// Whether a word character sits immediately outside either delimiter, making the emphasis
+    /// intraword. Both offsets are character boundaries because they came from a node's own span.
+    fn is_intraword(&self, start: usize, end: usize) -> bool {
+        let source = self.context.get_document_content();
+        let word = |ch: Option<char>| ch.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        word(source[..start].chars().next_back()) || word(source[end..].chars().next())
+    }
 }
 
 impl RuleLinter for MD049Linter {
     fn feed(&mut self, node: &Node) {
-        match node.kind() {
-            // Look for text content that might contain emphasis
-            "text" | "inline" => {
-                self.find_emphasis_violations_in_text(node);
-            }
-            _ => {}
+        if node.kind() == "inline" {
+            self.walk(*node);
         }
     }
 
@@ -337,7 +243,7 @@ pub const MD049: Rule = Rule {
     tags: &["emphasis"],
     description: "Emphasis style",
     rule_type: RuleType::Token,
-    required_nodes: &["emphasis"],
+    required_nodes: &["inline"],
     new_linter: |context| Box::new(MD049Linter::new(context)),
 };
 
@@ -506,7 +412,9 @@ mod test {
 
     #[test]
     fn test_inline_math_is_not_emphasis() {
-        // `$a_b_c$` is math, so `*emph*` is the only emphasis and sets the style
+        // `_b_` sits between word characters, so comrak makes no emphasis out of it and `*emph*`
+        // sets the style. This passes on the intraword rule, not on math: `math_dollars` is off, so
+        // `$ _a_ $` would still count as emphasis here where markdownlint sees only math.
         assert!(md049_messages("text $a_b_c$ more *emph*").is_empty());
     }
 
@@ -551,10 +459,25 @@ mod test {
 
     #[test]
     fn test_emphasis_may_contain_a_code_span() {
-        // Only the markers have to sit outside literal content, not the whole span
+        // A code span between the markers does not break the emphasis
         let messages = md049_messages(
             "_170 case(s) slower than baseline `161570`, 20 deep-dived_\n\nlater *emph* here",
         );
         assert_eq!(2, messages.len(), "unexpected: {messages:?}");
+    }
+
+    #[test]
+    fn test_emphasis_may_span_a_code_span_holding_the_marker() {
+        // The `*` inside the code span is literal, so the emphasis runs from the first `*` to the
+        // last one and contains `text`, `code_span`, `text`. A pattern that matched `*…*` over raw
+        // text paired the wrong two markers here and saw no emphasis at all.
+        let messages = md049_messages("_x_\n\n*a `b_*` c*\n");
+        assert_eq!(2, messages.len(), "unexpected: {messages:?}");
+        assert!(
+            messages
+                .iter()
+                .all(|m| m == "Expected: underscore; Actual: asterisk"),
+            "unexpected: {messages:?}"
+        );
     }
 }
