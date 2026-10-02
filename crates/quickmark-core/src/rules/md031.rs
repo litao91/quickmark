@@ -39,13 +39,15 @@ impl MD031Linter {
     }
 
     /// Check if a line is blank, handling out-of-bounds safely.
-    /// Out-of-bounds lines are considered blank to avoid false violations at document boundaries.
+    /// Out-of-bounds lines are considered blank to avoid false violations at document boundaries,
+    /// which is also what markdownlint gets from indexing past the end of `lines`.
     #[inline]
     fn is_line_blank_cached(&self, line_number: usize, lines: &[String]) -> bool {
-        if line_number < lines.len() {
-            lines[line_number].trim().is_empty()
-        } else {
-            true // Consider out-of-bounds lines as blank
+        match lines.get(line_number) {
+            Some(line) => is_blank_line(line),
+            // markdownlint indexes past the end of `lines` and gets `undefined`, which its own
+            // `!line` test calls blank.
+            None => true,
         }
     }
 
@@ -119,14 +121,70 @@ impl MD031Linter {
         let prev_line_blank = self.is_line_blank_cached(end_line.saturating_sub(1), &lines);
 
         if !end_line_blank && !prev_line_blank {
+            // markdownlint reports a missing blank *before* at the opening fence and a missing one
+            // *after* at the closing fence, so the two need ranges of their own. Reporting both at
+            // the block's start put every "after" on the opening fence's line.
+            let close_row = end_line.saturating_sub(1);
+            let fence = lines[close_row].trim_start();
+            let column = lines[close_row].len() - fence.len();
+            let width = fence.trim_end().len();
+            let start_byte = self.context.line_start_byte(close_row) + column;
             self.violations.push(RuleViolation::new(
                 &MD031,
                 MISSING_BLANK_AFTER.to_string(),
                 self.context.file_path.clone(),
-                range_from_node_range(&node.range()),
+                range_from_node_range(&crate::ast::NodeRange {
+                    start_byte,
+                    end_byte: start_byte + width,
+                    start_point: crate::ast::Point {
+                        row: close_row,
+                        column,
+                    },
+                    end_point: crate::ast::Point {
+                        row: close_row,
+                        column: column + width,
+                    },
+                }),
             ));
         }
     }
+}
+
+/// markdownlint's `isBlankLine`: a line counts as blank when it holds nothing but whitespace, HTML
+/// comments and block quote markers. The `>` matters here because a fenced block inside a block quote
+/// is separated from the text above it by a line holding only the quote marker, and the comment
+/// stripping is markdownlint's own loop, unmatched `-->` and unclosed `<!--` included.
+fn is_blank_line(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return true;
+    }
+    let mut outside = String::new();
+    let mut rest = line;
+    loop {
+        match (rest.find("<!--"), rest.find("-->")) {
+            // An end comment with no start comment before it: everything up to it goes.
+            (None, Some(end)) => {
+                rest = &rest[end + "-->".len()..];
+            }
+            (Some(start), Some(end)) if end < start => {
+                rest = &rest[end + "-->".len()..];
+            }
+            (Some(start), Some(end)) => {
+                outside.push_str(&rest[..start]);
+                rest = &rest[end + "-->".len()..];
+            }
+            // An unclosed start comment swallows the rest of the line.
+            (Some(start), None) => {
+                outside.push_str(&rest[..start]);
+                break;
+            }
+            (None, None) => {
+                outside.push_str(rest);
+                break;
+            }
+        }
+    }
+    outside.replace('>', "").trim().is_empty()
 }
 
 impl RuleLinter for MD031Linter {
@@ -351,5 +409,72 @@ More text";
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(2, violations.len()); // Should detect violations in nested structures
+    }
+    /// markdownlint reports a missing blank *before* at the opening fence and a missing one *after*
+    /// at the closing one. Every expectation here is a markdownlint-cli2 0.23.3 measurement with only
+    /// `blanks-around-fences` enabled, converted to the 0-based rows `range.start.line` holds.
+    #[test]
+    fn test_reports_each_missing_blank_at_its_own_fence() {
+        fn reports(input: &str) -> Vec<(usize, bool)> {
+            let mut linter = MultiRuleLinter::new_for_document(
+                PathBuf::from("test.md"),
+                test_config_default(),
+                input,
+            );
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD031")
+                .map(|v| {
+                    (
+                        v.location().range.start.line,
+                        v.message().contains("blank line after"),
+                    )
+                })
+                .collect()
+        }
+
+        // (row, is_after)
+        assert_eq!(
+            vec![(1, false), (3, true)],
+            reports("text\n```\ncode\n```\ntext\n")
+        );
+        assert_eq!(vec![(4, true)], reports("text\n\n```\ncode\n```\ntext\n"));
+        assert_eq!(vec![(1, false)], reports("text\n```\ncode\n```\n\ntext\n"));
+        // Nothing above the opening fence at the start of the document, so only the "after" fires.
+        assert_eq!(vec![(2, true)], reports("```\ncode\n```\ntext\n"));
+        // An unclosed fence at the end of the document has no line below it.
+        assert!(reports("text\n\n```\ncode\n```").is_empty());
+        assert_eq!(
+            vec![(4, true)],
+            reports("- item\n\n  ```\n  code\n  ```\n- next\n")
+        );
+        assert_eq!(vec![(4, true)], reports("text\n\n~~~\ncode\n~~~\ntext\n"));
+    }
+
+    /// markdownlint's `isBlankLine` counts a line as blank when it holds nothing but whitespace, HTML
+    /// comments and `>` markers, so a fence inside a block quote or under a comment line is properly
+    /// surrounded.
+    #[test]
+    fn test_quote_markers_and_comments_count_as_blank_lines() {
+        fn rows(input: &str) -> Vec<usize> {
+            let mut linter = MultiRuleLinter::new_for_document(
+                PathBuf::from("test.md"),
+                test_config_default(),
+                input,
+            );
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD031")
+                .map(|v| v.location().range.start.line)
+                .collect()
+        }
+
+        // The line above the opening fence holds only `>`, which is blank; only the "after" fires.
+        assert_eq!(vec![4], rows("> text\n>\n> ```\n> code\n> ```\n> text\n"));
+        assert_eq!(vec![4], rows("text\n<!-- c -->\n```\ncode\n```\ntext\n"));
+        // And a comment below the closing fence is blank too, so nothing fires.
+        assert!(rows("text\n\n```\ncode\n```\n<!-- c -->\ntext\n").is_empty());
     }
 }

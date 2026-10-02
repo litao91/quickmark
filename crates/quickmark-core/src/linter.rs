@@ -168,6 +168,12 @@ impl Context {
         }
     }
 
+    /// Byte offset of `row`'s first byte — the inverse of [`Context::point_at`]'s row, for a rule
+    /// that knows a line number and needs a position to report at.
+    pub fn line_start_byte(&self, row: usize) -> usize {
+        self.line_starts[row.min(self.line_starts.len() - 1)]
+    }
+
     /// Get the full document content as a string reference
     /// Returns a reference to the original document content stored during initialization
     pub fn get_document_content(&self) -> std::cell::Ref<'_, String> {
