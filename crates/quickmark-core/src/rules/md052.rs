@@ -108,8 +108,21 @@ impl MD052Linter {
             return links; // This is an inline link, not a reference link
         }
 
+        // Brackets inside a code span, a link destination or a math region are literal text, so
+        // `\`dp[3][2][1]\`` is not a chain of references. micromark never makes an
+        // `undefinedReference*` token inside one.
+        let literal = crate::rules::md049::literal_ranges(content);
+        let is_literal = |whole: Option<regex::Match>| {
+            whole.is_some_and(|m| {
+                crate::rules::md049::marker_in_literal(&literal, m.start(), m.end())
+            })
+        };
+
         // Full reference: [text][label]
         for cap in FULL_REFERENCE_PATTERN.captures_iter(content) {
+            if is_literal(cap.get(0)) {
+                continue;
+            }
             if let Some(label) = cap.get(2) {
                 let label_str = label.as_str();
                 if !label_str.is_empty() {
@@ -120,6 +133,9 @@ impl MD052Linter {
 
         // Collapsed reference: [label][]
         for cap in COLLAPSED_REFERENCE_PATTERN.captures_iter(content) {
+            if is_literal(cap.get(0)) {
+                continue;
+            }
             if let Some(label) = cap.get(1) {
                 links.push((self.normalize_reference(label.as_str()), false));
             }
@@ -128,6 +144,9 @@ impl MD052Linter {
         // Shortcut reference: [label] (only if not caught by other patterns and not inline links)
         if links.is_empty() {
             for cap in SHORTCUT_REFERENCE_PATTERN.captures_iter(content) {
+                if is_literal(cap.get(0)) {
+                    continue;
+                }
                 if let Some(label) = cap.get(1) {
                     // Only consider it a shortcut if it doesn't look like a full/collapsed reference
                     // and there's no second bracket pair after this one
@@ -526,5 +545,33 @@ mod test {
 
         // Should have no violations - first definition wins per CommonMark spec
         assert_eq!(0, violations.len());
+    }
+    /// Brackets inside a code span, a link destination or a math region are literal text, so they
+    /// are not references. micromark never makes an `undefinedReference*` token inside one. Every
+    /// expectation is a markdownlint-cli2 0.23.3 measurement with MD052 enabled.
+    #[test]
+    fn test_brackets_in_literal_content_are_not_references() {
+        fn count(input: &str) -> usize {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD052")
+                .count()
+        }
+
+        assert_eq!(0, count("- `dp[3][2][1]` means something\n"));
+        assert_eq!(0, count("| `a[1][2]` | b |\n|---|---|\n"));
+        assert_eq!(0, count("math $a[1][2]$ only\n"));
+
+        // A real undefined reference beside a literal one is still reported, once.
+        assert_eq!(1, count("a `[x][y]` b and [undef][z] c\n"));
+        assert_eq!(1, count("math $a[1][2]$ and [undef][q]\n"));
+        assert_eq!(1, count("see [undef][nope] here\n"));
+
+        // A defined reference and a proper inline link are not violations.
+        assert_eq!(0, count("see [ok][def] here\n\n[def]: /u\n"));
+        assert_eq!(0, count("see [text](https://e.example/a) ok\n"));
     }
 }
