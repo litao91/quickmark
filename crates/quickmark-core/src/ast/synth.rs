@@ -225,25 +225,29 @@ pub fn plus_front_matter(source: &str, lines: &LineIndex<'_>) -> Option<Span> {
 /// blocks the LaTeX happens to look like — so the regions are found in the raw source and whatever
 /// comrak built inside them is dropped.
 ///
-/// Every rule here was measured against markdownlint-cli2 v0.23.3, because they are not the ones a
-/// reading of micromark's source would suggest:
+/// Every rule here was measured against markdownlint-cli2 v0.23.3, and then checked against
+/// micromark's `math-flow.js`, which agrees:
 ///
 /// - The opener is a run of two or more `$` at the start of a line, after up to three spaces of
-///   indentation and any block quote markers. Four spaces makes it an indented code block instead.
-/// - A `$` run at the end of the opener's own line closes it on the spot when it is at least as long
-///   as the opener — `$$ x $$` is a one-line block — and *stops the block from opening at all* when
-///   it is shorter, so `$$ x $` is an ordinary paragraph and its contents are linted normally.
+///   indentation and any block quote or list markers. Four spaces makes it an indented code block
+///   instead.
+/// - Whatever follows the run on that line is micromark's *meta*, and a `$` anywhere in the meta
+///   makes the whole construct fail (`function meta`: `if (code === 36) return nok(code)`). So
+///   `$$ x $$` is not a one-line block — it is a paragraph whose `$$x$$` the *inline* tokenizer
+///   folds into math, and anything after it on the line is ordinary content. `$$$$` is a maximal run
+///   with empty meta, so it does open.
 /// - A later line closes the block only when it is a run of at least the opener's length followed by
 ///   nothing but whitespace. `$$ z` therefore does not close, and `$$$` closes a `$$` block while
 ///   `$$` does not close a `$$$` one.
-/// - A block that is never closed runs to the end of the document.
+/// - A block that is never closed runs to the end of the document. Blank lines do not end it.
+/// - An opener does interrupt a paragraph that is already open, so `text` followed by `$$` on the
+///   next line starts a region.
 ///
-/// One shape is known not to work: `text` immediately followed by `$$` with no blank line between.
-/// micromark's math flow interrupts the paragraph there, but comrak keeps one paragraph spanning both
-/// lines, so nothing starts inside the region and no `math_block` is emitted. Splitting the paragraph
-/// would mean rewriting a comrak block's range mid-emission; the shape is rare enough not to be worth
-/// it yet. Inline `$…$` math is likewise still handled by `md049::MATH_REGEX` masking rather than by
-/// a node, so a `$` spanning several lines is not folded the way micromark folds it.
+/// Two shapes are known not to work. `text` immediately followed by `$$` with no blank line between
+/// keeps one comrak paragraph spanning both lines, so nothing *starts* inside the region and no
+/// `math_block` is emitted; splitting the paragraph would mean rewriting a comrak block's range
+/// mid-emission. And a region is not clipped to the container it opened in, so a `$$` inside a list
+/// item that is never closed swallows the rest of the document where micromark stops at the item.
 pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
     let mut regions = Vec::new();
     let mut row = 0usize;
@@ -252,20 +256,10 @@ pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
             row += 1;
             continue;
         };
-
-        let rest = lines.content(row)[column + dollars..].trim_end();
-        let trailing = rest.bytes().rev().take_while(|&byte| byte == b'$').count();
-        if trailing > 0 && trailing < dollars {
-            // `$$ x $`: the line ends in a `$` run too short to close, so this is not a math block.
-            row += 1;
-            continue;
-        }
-        if !rest.is_empty() && trailing >= dollars {
-            // Opened and closed on one line.
-            regions.push(Span::new(
-                (row as u32, column as u32),
-                lines.block_end_row(row as u32),
-            ));
+        if lines.content(row)[column + dollars..]
+            .trim_start()
+            .contains('$')
+        {
             row += 1;
             continue;
         }
@@ -858,13 +852,12 @@ mod tests {
             // Up to three spaces of indentation; four makes it an indented code block instead.
             ("   $$\nx\n   $$\n", &[((0, 3), (3, 0))]),
             ("    $$\nx\n    $$\n", &[]),
-            // A `$` run at the end of the opener's own line closes it on the spot when it is at least
-            // as long as the opener ...
-            ("$$ x $$\n", &[((0, 0), (1, 0))]),
-            ("$$x$$\n", &[((0, 0), (1, 0))]),
-            // ... and stops the block from opening at all when it is shorter.
+            // A `$` in the meta stops the block from opening at all, however many `$` follow it.
+            ("$$ x $$\n", &[]),
+            ("$$x$$\n", &[]),
             ("$$ x $\n", &[]),
-            // A maximal leading run leaves nothing to close on the same line, so `$$$$` runs on.
+            ("$$ a $$ b $$\n", &[]),
+            // A maximal leading run leaves an empty meta, so `$$$$` does open.
             ("$$$$\n", &[((0, 0), (1, 0))]),
             // A later line closes only when it is a long-enough `$` run followed by nothing but
             // whitespace, so `$$ z` does not close and the block runs to the end of the document.

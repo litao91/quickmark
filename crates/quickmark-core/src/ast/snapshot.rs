@@ -469,11 +469,15 @@ const CASES: &[(&str, &str, &str)] = &[
 "#,
     ),
     (
-        "math block one line and unclosed",
+        "inline $$ is not a block, an unclosed one runs on",
         "$$ x $$\n# B\n\n$$\nnever closed\n",
         r#"(document 0:0-5:0 0-29
   (section 0:0-1:0 0-8
-    (math_block 0:0-1:0 0-8)
+    (paragraph 0:0-1:0 0-8
+      (inline 0:0-0:7 0-7
+        (math 0:0-0:7 0-7)
+      )
+    )
   )
   (section 1:0-5:0 8-29
     (atx_heading 1:0-2:0 8-12
