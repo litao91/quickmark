@@ -27,6 +27,8 @@ impl Default for MD022HeadingsBlanksTable {
 pub(crate) struct MD022Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
+    /// Last row of the document's front matter, if it has any.
+    front_matter_end: Option<usize>,
 }
 
 impl MD022Linter {
@@ -34,6 +36,7 @@ impl MD022Linter {
         Self {
             context,
             violations: Vec::new(),
+            front_matter_end: None,
         }
     }
 
@@ -88,7 +91,16 @@ impl MD022Linter {
         }
     }
 
+    /// Whether a row is blank for this rule's purposes.
+    ///
+    /// Front matter counts as blank because markdownlint strips it from the content before parsing,
+    /// so a heading on the line after `---` has no line above it at all and reading one yields the
+    /// empty string. Its `include_front_matter` option, which would put the lines back, has no
+    /// counterpart here.
     fn is_line_blank(&self, line_number: usize) -> bool {
+        if self.front_matter_end.is_some_and(|end| line_number <= end) {
+            return true;
+        }
         let lines = self.context.lines.borrow();
         if line_number < lines.len() {
             lines[line_number].trim().is_empty()
@@ -228,8 +240,20 @@ impl MD022Linter {
 
 impl RuleLinter for MD022Linter {
     fn feed(&mut self, node: &Node) {
-        if node.kind() == "atx_heading" || node.kind() == "setext_heading" {
-            self.check_heading(node);
+        match node.kind() {
+            // Front matter is the document's first child, so this lands before any heading is
+            // checked. A block's end swallows its trailing newline, which puts `end_position` on
+            // the row after its last one.
+            "minus_metadata" | "plus_metadata" => {
+                let end = node.end_position();
+                self.front_matter_end = Some(if end.column == 0 {
+                    end.row.saturating_sub(1)
+                } else {
+                    end.row
+                });
+            }
+            "atx_heading" | "setext_heading" => self.check_heading(node),
+            _ => {}
         }
     }
 
@@ -244,7 +268,12 @@ pub const MD022: Rule = Rule {
     tags: &["headings", "blank_lines"],
     description: "Headings should be surrounded by blank lines",
     rule_type: RuleType::Hybrid,
-    required_nodes: &["atx_heading", "setext_heading"],
+    required_nodes: &[
+        "atx_heading",
+        "setext_heading",
+        "minus_metadata",
+        "plus_metadata",
+    ],
     new_linter: |context| Box::new(MD022Linter::new(context)),
 };
 
@@ -498,5 +527,51 @@ Text";
         assert!(violations[0]
             .message()
             .contains("Above: Expected: 2; Actual: 1"));
+    }
+
+    fn directions(source: &str) -> Vec<(usize, &'static str)> {
+        let config = test_config_with_blanks(MD022HeadingsBlanksTable::default());
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, source);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let above = violation.message().contains("[Above:");
+                (
+                    violation.location().range.start.line + 1,
+                    if above { "Above" } else { "Below" },
+                )
+            })
+            .collect()
+    }
+
+    /// markdownlint strips front matter from the content before parsing it, so a heading on the line
+    /// after the closing delimiter has nothing above it and reading a line there yields the empty
+    /// string — blank. Every expectation is a markdownlint-cli2 v0.23.3 measurement.
+    #[test]
+    fn front_matter_counts_as_blank_above() {
+        assert!(directions("---\nfront: matter\n---\n# Heading\n").is_empty());
+        assert!(directions("+++\nfront = \"matter\"\n+++\n# Heading\n").is_empty());
+        assert!(directions("---\nfm\n---\n\n# H\n").is_empty());
+        assert!(directions("---\nfm\n---\n# H\n\ntext\n").is_empty());
+        // Front matter does not excuse the rest of the document.
+        assert_eq!(vec![(5, "Above")], directions("---\nfm\n---\ntext\n# H\n"));
+        assert_eq!(vec![(4, "Below")], directions("---\nfm\n---\n# H\ntext\n"));
+        assert_eq!(
+            vec![(4, "Below"), (5, "Above")],
+            directions("---\nfm\n---\n## H1\n## H2\n")
+        );
+        // `...` closes front matter only when `+++` opened it, so this is two thematic breaks around
+        // a paragraph and the heading does have a line above it.
+        assert_eq!(vec![(4, "Above")], directions("---\nfm\n...\n# H\n"));
+    }
+
+    /// markdownlint's front matter pattern also takes `{` and `}` as delimiters; the parser here
+    /// does not, so it sees a paragraph and reports the heading below it.
+    #[test]
+    fn brace_front_matter_is_a_known_difference() {
+        // markdownlint: []
+        assert_eq!(vec![(4, "Above")], directions("{\nfront\n}\n# Heading\n"));
     }
 }
