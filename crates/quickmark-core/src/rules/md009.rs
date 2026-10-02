@@ -71,7 +71,17 @@ impl MD009Linter {
 
         for (line_index, line) in lines.iter().enumerate() {
             let line_number = line_index + 1;
-            let trailing_spaces = line.len() - line.trim_end().len();
+            // markdownlint measures `line.length - line.trimEnd().length`, which counts characters.
+            // Counting bytes made one trailing non-breaking space look like two, so a line ending in
+            // a lone `\u{a0}` was wrongly exempt and one ending in ` \u{a0}` wrongly reported. The
+            // byte comparison first keeps lines with no trailing whitespace — nearly all of them —
+            // off the character count.
+            let trimmed = line.trim_end();
+            let trailing_spaces = if trimmed.len() == line.len() {
+                0
+            } else {
+                line.chars().count() - trimmed.chars().count()
+            };
 
             if trailing_spaces > 0
                 && !code_block_lines.contains(&line_number)
@@ -514,5 +524,51 @@ Normal paragraph without any trailing spaces."#;
             "Line 4 should be reported (trailing spaces before paragraph continuation)"
         );
         assert!(!line_numbers.contains(&2), "Line 2 should NOT be reported (trailing spaces before empty line create actual line break)");
+    }
+    /// markdownlint measures trailing whitespace in characters, so a non-breaking space counts as
+    /// one and `br_spaces = 2` accepts ` \u{a0}` but not a lone `\u{a0}`. Counting bytes made the
+    /// two look the same. Every expectation is a markdownlint-cli2 0.23.3 measurement.
+    #[test]
+    fn test_counts_trailing_whitespace_in_characters_not_bytes() {
+        fn count(input: &str) -> usize {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD009")
+                .count()
+        }
+
+        assert_eq!(1, count("text \n"), "one space");
+        assert_eq!(0, count("text  \n"), "two spaces is the allowed hard break");
+        assert_eq!(1, count("text   \n"));
+        assert_eq!(
+            1,
+            count("text\u{a0}\n"),
+            "one non-breaking space is not two"
+        );
+        assert_eq!(
+            0,
+            count("text \u{a0}\n"),
+            "a space and a non-breaking space is two"
+        );
+        assert_eq!(0, count("text\u{a0}\u{a0}\n"));
+        assert_eq!(
+            0,
+            count("text \u{2028}\n"),
+            "a line separator trims like a space"
+        );
+        assert_eq!(1, count("text\t\n"));
+        assert_eq!(0, count("text\n"));
+
+        // Multibyte text before the trailing whitespace, which is where a byte count went wrong.
+        assert_eq!(1, count("#### 页表的复制\u{a0}\n"));
+        assert_eq!(0, count("#### 库快照 \u{a0}\n"));
+        assert_eq!(
+            1,
+            count("a\u{a0}b \n"),
+            "an interior non-breaking space is not trailing"
+        );
     }
 }
