@@ -16,13 +16,26 @@ pub struct MD033InlineHtmlTable {
     pub allowed_elements: Vec<String>,
 }
 
-// Memoized regex patterns for HTML tag detection.
-// What may follow the tag name is what keeps autolinks out: CommonMark allows only whitespace or
-// `/` there, so `<https://example.com>` and `<foo@example.com>` are links, not HTML, and
-// markdownlint never reports them here. (`regex` has no lookahead, hence the optional group.)
-// Tag names may contain hyphens, as in `<ne-text>`.
+/// CommonMark's open and close tag grammar, which is what micromark tokenizes and therefore what
+/// markdownlint can see. Being strict about it is the point: `(?:[\s/][^>]*)?>` also matched
+/// `<br \>`, and a backslash is not an attribute name, so micromark leaves that as literal text and
+/// markdownlint never reports it — 132 false positives on the vault corpus, all from HTML tables
+/// written with `<br \>` as a line break.
+///
+/// Requiring whitespace or `/` or `>` straight after the tag name is also what keeps autolinks out:
+/// `<https://example.com>` and `<foo@example.com>` are links, not HTML. Tag names may contain
+/// hyphens, as in `<ne-text>`.
 static HTML_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)(?:[\s/][^>]*)?>").expect("Invalid HTML tag regex")
+    Regex::new(concat!(
+        r#"<(/?)"#,
+        r#"([a-zA-Z][a-zA-Z0-9-]*)"#,
+        // attribute = whitespace+ name ( "=" whitespace* value )?
+        r#"(?:[ \t\f\n\r]+[a-zA-Z:_][a-zA-Z0-9_.:-]*"#,
+        r#"(?:[ \t\f\n\r]*=[ \t\f\n\r]*(?:[^ \t\f\n\r"'=<>`]+|'[^']*'|"[^"]*"))?"#,
+        r#")*"#,
+        r#"[ \t\f\n\r]*/?>"#,
+    ))
+    .expect("Invalid HTML tag regex")
 });
 
 static CODE_SPAN_REGEX: Lazy<Regex> =
@@ -496,5 +509,52 @@ Content
         assert!(md033_violations
             .iter()
             .any(|v| v.message().contains("my-widget")));
+    }
+    /// CommonMark's tag grammar is what micromark tokenizes, so it is what markdownlint can see.
+    /// `<br \>` is not a tag — a backslash cannot start an attribute name — and micromark leaves it
+    /// as literal text. Accepting any `[^>]*` after the name reported it anyway: 132 false positives
+    /// on the vault corpus, all from HTML tables using `<br \>` as a line break. Every expectation
+    /// here is a markdownlint-cli2 0.23.3 measurement.
+    #[test]
+    fn test_only_well_formed_tags_are_inline_html() {
+        fn count(input: &str) -> usize {
+            let mut linter = MultiRuleLinter::new_for_document(
+                PathBuf::from("test.md"),
+                test_config_default(),
+                input,
+            );
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD033")
+                .count()
+        }
+
+        // A backslash is not an attribute name, so none of these are tags.
+        assert_eq!(0, count("a <br \\> b\n"));
+        assert_eq!(0, count("中文 <br \\> 中文\n"));
+        assert_eq!(
+            3,
+            count("<table><tr><td>x<br \\>y</td></tr></table>\n"),
+            "the three real tags in the HTML block, not the <br \\>"
+        );
+
+        // Well-formed shapes, in an inline and a block context alike.
+        assert_eq!(1, count("a <br/> b\n"));
+        assert_eq!(1, count("a <br /> b\n"));
+        assert_eq!(1, count("a <img src=x> y\n"));
+        assert_eq!(1, count("a <input disabled> y\n"));
+        assert_eq!(1, count("a <a href=\"x\" title='y'> y\n"));
+        assert_eq!(1, count("a <ne-text>x</ne-text> y\n"), "hyphenated name");
+        assert_eq!(1, count("a <b\n  class=\"x\"> y\n"), "a tag spanning lines");
+        // A closing tag is not reported, so `<b>x</b>` is one violation, not two.
+        assert_eq!(1, count("a <b>x</b> y\n"));
+
+        // Not elements: an autolink, an email autolink, a comment, a declaration, a code span.
+        assert_eq!(0, count("a <https://example.com> y\n"));
+        assert_eq!(0, count("a <foo@example.com> y\n"));
+        assert_eq!(0, count("a <!-- c --> y\n"));
+        assert_eq!(0, count("a <!DOCTYPE html> y\n"));
+        assert_eq!(0, count("a `x <b> y` z\n"));
     }
 }
