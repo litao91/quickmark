@@ -433,6 +433,79 @@ const CASES: &[(&str, &str, &str)] = &[
 )
 "#,
     ),
+    // A `$$…$$` region swallows the blocks comrak built inside it, because markdownlint's micromark
+    // folds the whole thing into one `mathFlow` token and no Rust parser here does.
+    (
+        "math block",
+        "# H\n\n$$\n# not a heading\n$$\n\ntext\n",
+        r#"(document 0:0-7:0 0-33
+  (section 0:0-7:0 0-33
+    (atx_heading 0:0-1:0 0-4
+      (atx_h1_marker 0:0-0:1 0-1)
+      (inline 0:2-0:3 2-3
+        (text 0:2-0:3 2-3)
+      )
+    )
+    (math_block 2:0-5:0 5-27)
+    (paragraph 6:0-7:0 28-33
+      (inline 6:0-6:4 28-32
+        (text 6:0-6:4 28-32)
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        "math block one line and unclosed",
+        "$$ x $$\n# B\n\n$$\nnever closed\n",
+        r#"(document 0:0-5:0 0-29
+  (section 0:0-1:0 0-8
+    (math_block 0:0-1:0 0-8)
+  )
+  (section 1:0-5:0 8-29
+    (atx_heading 1:0-2:0 8-12
+      (atx_h1_marker 1:0-1:1 8-9)
+      (inline 1:2-1:3 10-11
+        (text 1:2-1:3 10-11)
+      )
+    )
+    (math_block 3:0-5:0 13-29)
+  )
+)
+"#,
+    ),
+    (
+        "math block in a list item",
+        "- a\n- $$\n  x\n  $$\n- b\n",
+        r#"(document 0:0-5:0 0-22
+  (section 0:0-5:0 0-22
+    (list 0:0-5:0 0-22
+      (list_item 0:0-1:0 0-4
+        (list_marker_minus 0:0-0:2 0-2)
+        (paragraph 0:2-1:0 2-4
+          (inline 0:2-0:3 2-3
+            (text 0:2-0:3 2-3)
+          )
+        )
+      )
+      (list_item 1:0-4:0 4-18
+        (list_marker_minus 1:0-1:2 4-6)
+        (math_block 1:2-4:0 6-18)
+      )
+      (list_item 4:0-5:0 18-22
+        (list_marker_minus 4:0-4:2 18-20)
+        (paragraph 4:2-5:0 20-22
+          (inline 4:2-4:3 20-21
+            (text 4:2-4:3 20-21)
+          )
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
     (
         "no trailing newline",
         "# H\n\ntext",

@@ -19,14 +19,7 @@ use std::path::{Path, PathBuf};
 
 /// Rules allowed to disagree, and on how many fixtures, before the suite fails. Every entry is a
 /// known quickmark bug — shrink it as the rule is fixed, and never grow it.
-const BASELINE: &[(&str, usize)] = &[
-    ("MD004", 3),
-    ("MD019", 47),
-    ("MD022", 2),
-    ("MD032", 3),
-    ("MD038", 92),
-    ("MD041", 4),
-];
+const BASELINE: &[(&str, usize)] = &[("MD019", 47), ("MD022", 2), ("MD038", 92), ("MD041", 4)];
 
 fn parity_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

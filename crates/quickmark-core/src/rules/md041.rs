@@ -193,6 +193,7 @@ impl MD041Linter {
                 | "blockquote"
                 | "table"
                 | "thematic_break"
+                | "math_block"
         )
     }
 }

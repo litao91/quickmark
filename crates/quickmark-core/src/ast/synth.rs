@@ -217,6 +217,143 @@ pub fn plus_front_matter(source: &str, lines: &LineIndex<'_>) -> Option<Span> {
     Some(Span::new((0, 0), lines.block_end_row(close as u32)))
 }
 
+/// The `$$…$$` regions of a document, one span each, in document order.
+///
+/// markdownlint's micromark folds these into a single `mathFlow` token that swallows everything
+/// between the fences, so a `# B` inside one is not a heading and a `<b>` inside one is not inline
+/// HTML. No Rust Markdown parser does — comrak, pulldown-cmark and tree-sitter-md all hand back the
+/// blocks the LaTeX happens to look like — so the regions are found in the raw source and whatever
+/// comrak built inside them is dropped.
+///
+/// Every rule here was measured against markdownlint-cli2 v0.23.3, because they are not the ones a
+/// reading of micromark's source would suggest:
+///
+/// - The opener is a run of two or more `$` at the start of a line, after up to three spaces of
+///   indentation and any block quote markers. Four spaces makes it an indented code block instead.
+/// - A `$` run at the end of the opener's own line closes it on the spot when it is at least as long
+///   as the opener — `$$ x $$` is a one-line block — and *stops the block from opening at all* when
+///   it is shorter, so `$$ x $` is an ordinary paragraph and its contents are linted normally.
+/// - A later line closes the block only when it is a run of at least the opener's length followed by
+///   nothing but whitespace. `$$ z` therefore does not close, and `$$$` closes a `$$` block while
+///   `$$` does not close a `$$$` one.
+/// - A block that is never closed runs to the end of the document.
+///
+/// One shape is known not to work: `text` immediately followed by `$$` with no blank line between.
+/// micromark's math flow interrupts the paragraph there, but comrak keeps one paragraph spanning both
+/// lines, so nothing starts inside the region and no `math_block` is emitted. Splitting the paragraph
+/// would mean rewriting a comrak block's range mid-emission; the shape is rare enough not to be worth
+/// it yet. Inline `$…$` math is likewise still handled by `md049::MATH_REGEX` masking rather than by
+/// a node, so a `$` spanning several lines is not folded the way micromark folds it.
+pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
+    let mut regions = Vec::new();
+    let mut row = 0usize;
+    while row < lines.line_count() {
+        let Some((column, dollars)) = dollar_run(lines, row, 3) else {
+            row += 1;
+            continue;
+        };
+
+        let rest = lines.content(row)[column + dollars..].trim_end();
+        let trailing = rest.bytes().rev().take_while(|&byte| byte == b'$').count();
+        if trailing > 0 && trailing < dollars {
+            // `$$ x $`: the line ends in a `$` run too short to close, so this is not a math block.
+            row += 1;
+            continue;
+        }
+        if !rest.is_empty() && trailing >= dollars {
+            // Opened and closed on one line.
+            regions.push(Span::new(
+                (row as u32, column as u32),
+                lines.block_end_row(row as u32),
+            ));
+            row += 1;
+            continue;
+        }
+
+        let close = (row + 1..lines.line_count()).find(|&candidate| {
+            dollar_run(lines, candidate, column + 3).is_some_and(|(at, run)| {
+                run >= dollars && lines.content(candidate)[at + run..].trim().is_empty()
+            })
+        });
+        let last = close.unwrap_or(lines.line_count() - 1);
+        regions.push(Span::new(
+            (row as u32, column as u32),
+            lines.block_end_row(last as u32),
+        ));
+        row = last + 1;
+    }
+    regions
+}
+
+/// The column a line's `$` run starts at and how long it is, once leading indentation, any block
+/// quote markers and a list marker are removed — or `None` when the line does not open with a run of
+/// at least two `$`.
+///
+/// `indent` is how many leading spaces may precede the run. Three at document level, where four would
+/// make the line an indented code block; for a region's *closer* it is the column the region opened
+/// at plus three, because inside a list item the whole block sits that much further right and a
+/// closer indented four from the margin is only two past the item's content column.
+///
+/// Only the opener's own line carries a list marker; the closer lines that follow are indented to the
+/// item's content column and start with their `$` run directly.
+fn dollar_run(lines: &LineIndex<'_>, row: usize, indent: usize) -> Option<(usize, usize)> {
+    let bytes = lines.content(row).as_bytes();
+    let mut column = 0usize;
+    let mut limit = indent;
+    loop {
+        let mut spaces = 0;
+        while spaces < limit && bytes.get(column) == Some(&b' ') {
+            column += 1;
+            spaces += 1;
+        }
+        limit = 3;
+        match bytes.get(column) {
+            Some(b'>') => {
+                column += 1;
+                if bytes.get(column) == Some(&b' ') {
+                    column += 1;
+                }
+            }
+            Some(b'-' | b'*' | b'+') => match skip_marker_spaces(bytes, column + 1) {
+                Some(after) => column = after,
+                None => break,
+            },
+            Some(b'0'..=b'9') => {
+                let mut at = column;
+                let mut digits = 0;
+                while digits < 9 && matches!(bytes.get(at), Some(b'0'..=b'9')) {
+                    at += 1;
+                    digits += 1;
+                }
+                if !matches!(bytes.get(at), Some(b'.') | Some(b')')) {
+                    break;
+                }
+                match skip_marker_spaces(bytes, at + 1) {
+                    Some(after) => column = after,
+                    None => break,
+                }
+            }
+            _ => break,
+        }
+    }
+    let start = column;
+    while bytes.get(column) == Some(&b'$') {
+        column += 1;
+    }
+    (column - start >= 2).then_some((start, column - start))
+}
+
+/// The column a list item's content starts at, given the column just after its marker. One to four
+/// spaces; none at all, or five and up — which makes the item's first block an indented code block —
+/// means this was not a list marker.
+fn skip_marker_spaces(bytes: &[u8], mut at: usize) -> Option<usize> {
+    let start = at;
+    while bytes.get(at) == Some(&b' ') {
+        at += 1;
+    }
+    (at > start && at - start <= 4).then_some(at)
+}
+
 /// The two children of an ATX heading: its `#` run and, when there is any, its text.
 pub struct AtxParts {
     pub marker: Marker,
@@ -706,8 +843,65 @@ fn container_prefix_width(lines: &LineIndex<'_>, row: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_definition_line;
+    use super::{is_definition_line, math_regions, LineIndex};
 
+    /// `$$…$$` region detection, one case per rule measured against markdownlint-cli2 v0.23.3 with a
+    /// heading payload: a swallowed heading means the region covers it, a reported one means it does
+    /// not. Spans are `(start row, start column)-(end row, end column)`, where the end follows the
+    /// block convention of swallowing the trailing newline.
+    #[test]
+    fn math_regions_follow_the_measured_delimiter_rules() {
+        type Regions = &'static [((u32, u32), (u32, u32))];
+        let cases: &[(&str, Regions)] = &[
+            // Opened and closed on their own lines.
+            ("$$\nx\n$$\n", &[((0, 0), (3, 0))]),
+            // Up to three spaces of indentation; four makes it an indented code block instead.
+            ("   $$\nx\n   $$\n", &[((0, 3), (3, 0))]),
+            ("    $$\nx\n    $$\n", &[]),
+            // A `$` run at the end of the opener's own line closes it on the spot when it is at least
+            // as long as the opener ...
+            ("$$ x $$\n", &[((0, 0), (1, 0))]),
+            ("$$x$$\n", &[((0, 0), (1, 0))]),
+            // ... and stops the block from opening at all when it is shorter.
+            ("$$ x $\n", &[]),
+            // A maximal leading run leaves nothing to close on the same line, so `$$$$` runs on.
+            ("$$$$\n", &[((0, 0), (1, 0))]),
+            // A later line closes only when it is a long-enough `$` run followed by nothing but
+            // whitespace, so `$$ z` does not close and the block runs to the end of the document.
+            ("$$\nx\n$$ z\n", &[((0, 0), (3, 0))]),
+            // A longer run closes a shorter opener, but not the other way round.
+            ("$$\nx\n$$$\n", &[((0, 0), (3, 0))]),
+            ("$$$\nx\n$$\n", &[((0, 0), (3, 0))]),
+            // One `$` is inline math, not a block.
+            ("$\nx\n$\n", &[]),
+            // The opener has to start the line; a `$` run further along one opens nothing, so the
+            // heading before it is still a heading and the trailing `$$` opens a block of its own.
+            ("# A\n\ntext $$\n# B\n$$\n", &[((4, 0), (5, 0))]),
+            // Whatever follows a closed block is linted normally again.
+            ("$$\n# B\n$$\n# C\n", &[((0, 0), (3, 0))]),
+            (
+                "$$\nx\n$$\n\n$$\ny\n$$\n",
+                &[((0, 0), (3, 0)), ((4, 0), (7, 0))],
+            ),
+            // Block quote markers and list markers are stripped, and the region keeps the container's
+            // content column so it lands inside the container rather than replacing it.
+            ("> $$\n> x\n> $$\n", &[((0, 2), (3, 0))]),
+            ("- $$\n  x\n  $$\n", &[((0, 2), (3, 0))]),
+            ("1. $$\n   x\n   $$\n", &[((0, 3), (3, 0))]),
+            // A closer is measured from where the region opened, not from the margin: inside a list
+            // item indented two, a closer indented four from the margin is only two past the content.
+            ("- a\n- $$\n  x\n  $$\n- b\n", &[((1, 2), (4, 0))]),
+        ];
+
+        for &(source, expected) in cases {
+            let lines = LineIndex::new(source);
+            let actual: Vec<((u32, u32), (u32, u32))> = math_regions(&lines)
+                .iter()
+                .map(|span| (span.start(), span.end()))
+                .collect();
+            assert_eq!(actual, expected, "wrong regions for {source:?}");
+        }
+    }
     #[test]
     fn definition_shapes() {
         for line in [

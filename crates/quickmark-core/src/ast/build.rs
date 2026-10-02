@@ -28,7 +28,11 @@ pub fn parse(source: &str) -> FacadeTree {
         enclosing_list: None,
         pending_item_start: None,
         pending_paragraph_start: None,
+        math: Vec::new(),
+        math_emitted: Vec::new(),
     };
+    builder.math = synth::math_regions(&builder.lines);
+    builder.math_emitted = vec![false; builder.math.len()];
     builder.build(root, source)
 }
 
@@ -117,6 +121,10 @@ struct Builder<'a> {
     /// Start position forced onto the next paragraph. Set for a list item whose task marker is not
     /// followed by whitespace — see [`Builder::bare_task_marker`].
     pending_paragraph_start: Option<(u32, u32)>,
+    /// The `$$…$$` regions of the document, and whether each one's node has been emitted yet — see
+    /// [`Builder::math_at`].
+    math: Vec<synth::Span>,
+    math_emitted: Vec<bool>,
 }
 
 impl<'a> Builder<'a> {
@@ -220,6 +228,9 @@ impl<'a> Builder<'a> {
                 let node = self.emit_leaf(Kind::MinusMetadata, child, Nesting::TopLevel);
                 content_start = self.nodes[node as usize].end();
                 self.push(document, node);
+                continue;
+            }
+            if self.math_at(child, &mut top_level) {
                 continue;
             }
             self.emit_block(child, Nesting::TopLevel, &mut top_level);
@@ -687,6 +698,9 @@ impl<'a> Builder<'a> {
                 awaiting_first_item = false;
                 self.pending_item_start = Some(list_start);
             }
+            if self.math_at(child, &mut children) {
+                continue;
+            }
             self.emit_block(child, child_nesting, &mut children);
         }
         self.enclosing_list = saved;
@@ -731,6 +745,9 @@ impl<'a> Builder<'a> {
             self.pending_paragraph_start = Some((start.0, item_content_col));
         }
         for child in node.children() {
+            if self.math_at(child, &mut children) {
+                continue;
+            }
             self.emit_block(child, Nesting::Content(item_content_col), &mut children);
         }
         self.pending_paragraph_start = None;
@@ -751,6 +768,43 @@ impl<'a> Builder<'a> {
             self.push(index, child);
         }
         index
+    }
+
+    /// Whether `child` falls inside a `$$…$$` region, in which case the caller must drop it. The
+    /// region's own node is pushed the first time one is reached, so it lands among the siblings the
+    /// swallowed blocks would have been; every later block inside the same region is dropped silently.
+    ///
+    /// A container that *opens* on the region's first line holds the region rather than being
+    /// swallowed by it, so the caller descends into it and its own child loop emits the node at the
+    /// right depth: `> $$` keeps its block quote and `- $$` keeps its list item. Everything else is
+    /// dropped, including a container that merely starts on a later line inside the region.
+    ///
+    /// Claiming the region's lines also keeps `attach_link_reference_definitions` from reading a
+    /// `[a]: /u` inside a math block as a reference definition.
+    fn math_at(&mut self, child: ComrakNode<'a>, out: &mut Vec<u32>) -> bool {
+        let row = self.start_of(child).0;
+        let Some(slot) = self.math.iter().position(|span| span.contains_row(row)) else {
+            return false;
+        };
+        let holds_region = row == self.math[slot].start().0
+            && matches!(
+                child.data().value,
+                NodeValue::BlockQuote
+                    | NodeValue::List(_)
+                    | NodeValue::Item(_)
+                    | NodeValue::TaskItem(_)
+            );
+        if holds_region {
+            return false;
+        }
+        if !self.math_emitted[slot] {
+            self.math_emitted[slot] = true;
+            let span = self.math[slot];
+            let node = self.add(Kind::MathBlock, span.start(), span.end());
+            self.cover(node);
+            out.push(node);
+        }
+        true
     }
 
     /// Whether the task marker at `column` on `row` is the whole line, which is what stops GFM from
