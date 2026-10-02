@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    rules::{md037::is_escaped, Context, Rule, RuleLinter, RuleType},
 };
 
 // MD052-specific configuration types
@@ -15,30 +15,33 @@ use crate::{
 pub struct MD052ReferenceLinksImagesTable {
     #[serde(default)]
     pub shortcut_syntax: bool,
-    #[serde(default)]
+    // Not `#[serde(default)]`: a settings table that sets only `shortcut_syntax` still gets the
+    // default ignored labels, which is what markdownlint's `config.ignored_labels || ["x"]` does.
+    #[serde(default = "default_ignored_labels")]
     pub ignored_labels: Vec<String>,
+}
+
+fn default_ignored_labels() -> Vec<String> {
+    vec!["x".to_string()]
 }
 
 impl Default for MD052ReferenceLinksImagesTable {
     fn default() -> Self {
         Self {
             shortcut_syntax: false,
-            ignored_labels: vec!["x".to_string()],
+            ignored_labels: default_ignored_labels(),
         }
     }
 }
 
-// Pre-compiled regex patterns for performance
-static FULL_REFERENCE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[([^\]]*)\]\[([^\]]*)\]").unwrap());
+/// A run of two or more adjacent bracket groups — `[text][label]`, `[label][]`, `[a][b][c]` — or a
+/// lone one. Leftmost-first alternation, so the chain always wins over the shortcut inside it.
+static REFERENCE_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:\[[^\[\]]*\]){2,}|\[[^\[\]]+\]").expect("Invalid reference pattern")
+});
 
-static COLLAPSED_REFERENCE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[([^\]]+)\]\[\]").unwrap());
-
-static SHORTCUT_REFERENCE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[([^\]]+)\]").unwrap());
-
-static REFERENCE_DEFINITION_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^\s*\[([^\]]+)\]:\s*").unwrap());
+/// Leaves whose contents are literal, so brackets in one open no label.
+const LITERAL: &[&str] = &["code_span", "math", "html_inline"];
 
 #[derive(Debug, Clone)]
 struct ReferenceLink {
@@ -49,7 +52,6 @@ struct ReferenceLink {
 
 pub(crate) struct MD052Linter {
     context: Rc<Context>,
-    definitions: HashSet<String>,
     references: Vec<ReferenceLink>,
 }
 
@@ -57,7 +59,6 @@ impl MD052Linter {
     pub fn new(context: Rc<Context>) -> Self {
         Self {
             context,
-            definitions: HashSet::new(),
             references: Vec::new(),
         }
     }
@@ -74,133 +75,147 @@ impl MD052Linter {
             .join(" ")
     }
 
-    fn extract_reference_definition(&self, node: &Node) -> Vec<String> {
-        // Extract the label from reference definition nodes
-        // [label]: url "title"
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let document_content = self.context.document_content.borrow();
-        let content = &document_content[start_byte..end_byte];
-
-        let mut definitions = Vec::new();
-        for cap in REFERENCE_DEFINITION_PATTERN.captures_iter(content) {
-            if let Some(label) = cap.get(1) {
-                definitions.push(self.normalize_reference(label.as_str()));
-            }
-        }
-        definitions
-    }
-
-    fn extract_reference_links(&self, node: &Node) -> Vec<(String, bool)> {
-        // Extract reference links in different formats:
-        // Full: [text][label]
-        // Collapsed: [label][]
-        // Shortcut: [label]
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let document_content = self.context.document_content.borrow();
-        let content = &document_content[start_byte..end_byte];
-
-        let mut links = Vec::new();
-
-        // Check for inline links first (contain parentheses - not reference links)
-        if content.contains('(') && content.contains(')') {
-            return links; // This is an inline link, not a reference link
-        }
-
-        // Brackets inside a code span, a link destination or a math region are literal text, so
-        // `\`dp[3][2][1]\`` is not a chain of references. micromark never makes an
-        // `undefinedReference*` token inside one.
-        let literal = crate::rules::md049::literal_ranges(content);
-        let is_literal = |whole: Option<regex::Match>| {
-            whole.is_some_and(|m| {
-                crate::rules::md049::marker_in_literal(&literal, m.start(), m.end())
-            })
-        };
-
-        // Full reference: [text][label]
-        for cap in FULL_REFERENCE_PATTERN.captures_iter(content) {
-            if is_literal(cap.get(0)) {
-                continue;
-            }
-            if let Some(label) = cap.get(2) {
-                let label_str = label.as_str();
-                if !label_str.is_empty() {
-                    links.push((self.normalize_reference(label_str), false));
-                }
-            }
-        }
-
-        // Collapsed reference: [label][]
-        for cap in COLLAPSED_REFERENCE_PATTERN.captures_iter(content) {
-            if is_literal(cap.get(0)) {
-                continue;
-            }
-            if let Some(label) = cap.get(1) {
-                links.push((self.normalize_reference(label.as_str()), false));
-            }
-        }
-
-        // Shortcut reference: [label] (only if not caught by other patterns and not inline links)
-        if links.is_empty() {
-            for cap in SHORTCUT_REFERENCE_PATTERN.captures_iter(content) {
-                if is_literal(cap.get(0)) {
+    /// Finds the reference syntax in one inline subtree.
+    ///
+    /// A reference the parser resolved is a `link` or `image` node and its brackets are gone from the
+    /// text, so what is left to find here is exactly the syntax that resolved to nothing — which is
+    /// what MD052 reports, and why the rule needs no set of definitions of its own. Two kinds of span
+    /// are still off limits: the literal leaves, and a resolved link's destination, which is not one
+    /// of its children.
+    fn collect_references(&mut self, root: Node) {
+        let mut found = Vec::new();
+        {
+            let source = self.context.document_content.borrow();
+            let (from, to) = (root.start_byte(), root.end_byte());
+            let excluded = literal_spans(root);
+            for capture in REFERENCE_PATTERN.find_iter(&source[from..to]) {
+                let start = from + capture.start();
+                let end = from + capture.end();
+                // Only the brackets have to sit outside a literal span: a code span *inside* a
+                // label leaves the reference real, and markdownlint reports
+                // ``[the `Sized` trait][sized]``, while `` `[x][y]` `` is code and is not reported.
+                if covers(&excluded, start) || covers(&excluded, end - 1) {
                     continue;
                 }
-                if let Some(label) = cap.get(1) {
-                    // Only consider it a shortcut if it doesn't look like a full/collapsed reference
-                    // and there's no second bracket pair after this one
-                    let match_end = cap.get(0).unwrap().end();
-                    let remaining = &content[match_end..];
-                    if !remaining.trim_start().starts_with('[') {
-                        links.push((self.normalize_reference(label.as_str()), true));
-                    }
+                // An escaped bracket opens no label, so `\[a][b]` leaves only a shortcut.
+                if is_escaped(&source, start) {
+                    continue;
                 }
+                // An image's `!` is part of what markdownlint reports.
+                let preceded_by_bang = start
+                    .checked_sub(1)
+                    .and_then(|before| source.as_bytes().get(before))
+                    == Some(&b'!');
+                let start = if preceded_by_bang { start - 1 } else { start };
+                let Some(reference) = self.classify(capture.as_str(), start, end) else {
+                    continue;
+                };
+                found.push(reference);
             }
         }
-
-        links
+        self.references.extend(found);
     }
+
+    /// Works out which label a bracket run refers to, or `None` when micromark would not have made a
+    /// reference out of it at all.
+    fn classify(&self, chain: &str, start: usize, end: usize) -> Option<ReferenceLink> {
+        let groups = bracket_groups(chain);
+        let (label, is_shortcut) = match groups.len() {
+            0 => return None,
+            1 => (groups[0], true),
+            // `[label][]` is collapsed and refers to its own label; anything longer refers to the
+            // last group, which is why `[a][b][c]` reports `c`.
+            _ if groups[groups.len() - 1].is_empty() => (groups[0], false),
+            // micromark only pairs two labels when the first one has content, so `[][b]` is a
+            // shortcut rather than a full reference.
+            _ if groups[0].trim().is_empty() => return None,
+            _ => (groups[groups.len() - 1], false),
+        };
+        if label.trim().is_empty() {
+            return None;
+        }
+        Some(ReferenceLink {
+            label: self.normalize_reference(label),
+            range: self.range_on_line(start, end),
+            is_shortcut,
+        })
+    }
+
+    /// A reference spanning lines is reported on the line it opens on, and only as far as that line
+    /// goes — markdownlint takes its context from a single line too.
+    fn range_on_line(&self, start: usize, end: usize) -> crate::ast::NodeRange {
+        let start_point = self.context.point_at(start);
+        let lines = self.context.lines.borrow();
+        let line_end = lines.get(start_point.row).map_or(end, |line| {
+            self.context.line_start_byte(start_point.row) + line.len()
+        });
+        let end = end.min(line_end);
+        crate::ast::NodeRange {
+            start_byte: start,
+            end_byte: end,
+            start_point,
+            end_point: self.context.point_at(end),
+        }
+    }
+}
+
+fn covers(spans: &[(usize, usize)], byte: usize) -> bool {
+    spans.iter().any(|&(from, to)| from <= byte && byte < to)
+}
+
+/// The spans inside `root` that hold no reference syntax: the literal leaves, and each resolved
+/// link's or image's destination, which is the part of the node its children do not cover.
+fn literal_spans(root: Node) -> Vec<(usize, usize)> {
+    let mut excluded = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        if LITERAL.contains(&kind) {
+            excluded.push((node.start_byte(), node.end_byte()));
+        } else if kind == "link" || kind == "image" {
+            let last = node
+                .child_count()
+                .checked_sub(1)
+                .and_then(|index| node.child(index));
+            match last {
+                Some(last) => excluded.push((last.end_byte(), node.end_byte())),
+                None => excluded.push((node.start_byte(), node.end_byte())),
+            }
+        }
+        for index in 0..node.child_count() {
+            if let Some(child) = node.child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    excluded
+}
+
+/// The contents of each `[...]` group in a chain, in order.
+fn bracket_groups(chain: &str) -> Vec<&str> {
+    let bytes = chain.as_bytes();
+    let mut groups = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'[' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != b']' {
+            end += 1;
+        }
+        groups.push(&chain[start..end.min(bytes.len())]);
+        index = end + 1;
+    }
+    groups
 }
 
 impl RuleLinter for MD052Linter {
     fn feed(&mut self, node: &Node) {
-        match node.kind() {
-            // Handle reference definitions like [label]: url
-            "paragraph" => {
-                let definitions = self.extract_reference_definition(node);
-                for definition in definitions {
-                    self.definitions.insert(definition);
-                }
-
-                // Also check for reference links in paragraphs
-                let links = self.extract_reference_links(node);
-                for (label, is_shortcut) in links {
-                    self.references.push(ReferenceLink {
-                        label,
-                        range: node.range(),
-                        is_shortcut,
-                    });
-                }
-            }
-            // Handle reference links [text][label], [label][], [label]
-            "link" | "image" => {
-                let links = self.extract_reference_links(node);
-                for (label, is_shortcut) in links {
-                    self.references.push(ReferenceLink {
-                        label,
-                        range: node.range(),
-                        is_shortcut,
-                    });
-                }
-            }
-            _ => {
-                // Check all other node types for reference definitions
-                let definitions = self.extract_reference_definition(node);
-                for definition in definitions {
-                    self.definitions.insert(definition);
-                }
-            }
+        if node.kind() == "inline" {
+            self.collect_references(*node);
         }
     }
 
@@ -213,31 +228,23 @@ impl RuleLinter for MD052Linter {
             .map(|label| self.normalize_reference(label))
             .collect();
 
-        for reference in &self.references {
+        for reference in std::mem::take(&mut self.references) {
             // Skip shortcut syntax unless explicitly enabled
             if reference.is_shortcut && !config.shortcut_syntax {
                 continue;
             }
-
-            let normalized_label = self.normalize_reference(&reference.label);
-
-            // Skip if label is in ignored list
-            if ignored_labels.contains(&normalized_label) {
+            if ignored_labels.contains(&reference.label) {
                 continue;
             }
-
-            // Check if definition exists
-            if !self.definitions.contains(&normalized_label) {
-                violations.push(RuleViolation::new(
-                    &MD052,
-                    format!(
-                        "Missing link or image reference definition: \"{}\"",
-                        reference.label
-                    ),
-                    self.context.file_path.clone(),
-                    range_from_node_range(&reference.range),
-                ));
-            }
+            violations.push(RuleViolation::new(
+                &MD052,
+                format!(
+                    "Missing link or image reference definition: \"{}\"",
+                    reference.label
+                ),
+                self.context.file_path.clone(),
+                range_from_node_range(&reference.range),
+            ));
         }
 
         violations
@@ -250,7 +257,7 @@ pub const MD052: Rule = Rule {
     tags: &["links", "images"],
     description: "Reference links and images should use a label that is defined",
     rule_type: RuleType::Document,
-    required_nodes: &["link", "image", "paragraph"],
+    required_nodes: &["inline"],
     new_linter: |context| Box::new(MD052Linter::new(context)),
 };
 
@@ -260,318 +267,195 @@ mod test {
 
     use crate::config::{LintersSettingsTable, MD052ReferenceLinksImagesTable, RuleSeverity};
     use crate::linter::MultiRuleLinter;
-    use crate::test_utils::test_helpers::test_config_with_rules;
+    use crate::test_utils::test_helpers::test_config_with_settings;
 
-    fn test_config() -> crate::config::QuickmarkConfig {
-        test_config_with_rules(vec![("reference-links-images", RuleSeverity::Error)])
-    }
+    /// `(line, column)` of one undefined reference, both 1-based, which is markdownlint's
+    /// `errorRange` start.
+    type Position = (usize, usize);
 
-    fn test_config_with_settings(
-        shortcut_syntax: bool,
-        ignored_labels: Vec<String>,
-    ) -> crate::config::QuickmarkConfig {
-        crate::test_utils::test_helpers::test_config_with_settings(
+    fn config_with(table: MD052ReferenceLinksImagesTable) -> crate::config::QuickmarkConfig {
+        test_config_with_settings(
             vec![("reference-links-images", RuleSeverity::Error)],
             LintersSettingsTable {
-                reference_links_images: MD052ReferenceLinksImagesTable {
-                    shortcut_syntax,
-                    ignored_labels,
-                },
+                reference_links_images: table,
                 ..Default::default()
             },
         )
     }
 
-    #[test]
-    fn test_valid_full_reference() {
-        let input = "[Good link][label]
-
-[label]: https://example.com
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - valid reference
-        assert_eq!(0, violations.len());
+    fn positions_with(config: crate::config::QuickmarkConfig, source: &str) -> Vec<Position> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, source);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let range = &violation.location().range;
+                (range.start.line + 1, range.start.character + 1)
+            })
+            .collect()
     }
 
-    #[test]
-    fn test_invalid_full_reference() {
-        let input = "[Bad link][missing]
-
-[label]: https://example.com
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 1 violation - missing reference definition
-        assert_eq!(1, violations.len());
-        assert!(violations[0]
-            .message()
-            .contains("Missing link or image reference definition: \"missing\""));
+    fn positions(source: &str) -> Vec<Position> {
+        positions_with(
+            config_with(MD052ReferenceLinksImagesTable::default()),
+            source,
+        )
     }
 
-    #[test]
-    fn test_valid_collapsed_reference() {
-        let input = "[label][]
-
-[label]: https://example.com
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - valid collapsed reference
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_invalid_collapsed_reference() {
-        let input = "[missing][]
-
-[label]: https://example.com
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 1 violation - missing reference definition
-        assert_eq!(1, violations.len());
-        assert!(violations[0]
-            .message()
-            .contains("Missing link or image reference definition: \"missing\""));
-    }
-
-    #[test]
-    fn test_shortcut_syntax_disabled_by_default() {
-        let input = "[undefined]
-
-[label]: https://example.com
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - shortcut syntax ignored by default
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_shortcut_syntax_enabled() {
-        let input = "[undefined]
-
-[label]: https://example.com
-";
-
-        let config = test_config_with_settings(true, vec!["x".to_string()]);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 1 violation - shortcut syntax enabled and undefined
-        assert_eq!(1, violations.len());
-        assert!(violations[0]
-            .message()
-            .contains("Missing link or image reference definition: \"undefined\""));
-    }
-
-    #[test]
-    fn test_valid_shortcut_syntax_enabled() {
-        let input = "[label]
-
-[label]: https://example.com
-";
-
-        let config = test_config_with_settings(true, vec!["x".to_string()]);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - shortcut syntax enabled and defined
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_ignored_labels_default_x() {
-        let input = "[x] Task item
-
-[label]: https://example.com
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - 'x' is ignored by default (GitHub task list)
-        assert_eq!(0, violations.len());
-    }
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output with
+    /// MD052's defaults: its line and its `errorRange` column.
+    ///
+    /// Columns count UTF-8 bytes here and UTF-16 units there, so the one case with a multi-byte
+    /// character before a reference is asserted separately in [`positions_count_bytes`].
+    const CASES: &[(&str, &[Position])] = &[
+        ("[text][label]\n", &[(1, 1)]),
+        ("[text][label]\n\n[label]: http://x\n", &[]),
+        ("[label][]\n", &[(1, 1)]),
+        ("[label][]\n\n[label]: http://x\n", &[]),
+        ("[label]\n", &[]),
+        ("[label]\n\n[label]: http://x\n", &[]),
+        ("see ([dp][dp]) here\n", &[(1, 6)]),
+        ("[[RFC][PATCH] title](http://x)\n", &[(1, 2)]),
+        ("text[1][2]\n", &[(1, 5)]),
+        ("a thing (see [the docs][docs]) here\n", &[(1, 14)]),
+        ("f(x) and [a][b]\n", &[(1, 10)]),
+        ("# [a][b] title\n", &[(1, 3)]),
+        ("| a |\n|---|\n| [x][y] |\n", &[(3, 3)]),
+        ("> [x][y]\n", &[(1, 3)]),
+        ("- [x][y]\n", &[(1, 3)]),
+        ("`[x][y]`\n", &[]),
+        ("```\n[x][y]\n```\n", &[]),
+        ("$[x][y]$\n", &[]),
+        ("![alt][label]\n", &[(1, 1)]),
+        ("![alt][label]\n\n[label]: http://x\n", &[]),
+        ("[a]b][c]\n", &[]),
+        ("[][]\n", &[]),
+        ("[ ][ ]\n", &[]),
+        ("[text][LABEL]\n\n[label]: http://x\n", &[]),
+        ("[text][a  b]\n\n[a b]: http://x\n", &[]),
+        ("[a][b] and [c][d]\n", &[(1, 1), (1, 12)]),
+        ("[a][b]\n\n[c][d]\n", &[(1, 1), (3, 1)]),
+        ("[text][x]\n", &[]),
+        ("[a][b]\n\n[b]: http://x\n", &[]),
+        ("[outer [inner][nope] text](http://x)\n", &[(1, 8)]),
+        ("[outer [inner] text](http://x)\n", &[]),
+        ("[label]: http://x\n", &[]),
+        ("\\[a][b]\n", &[]),
+        ("[a][b]", &[(1, 1)]),
+        ("[a][b]\r\n[c][d]\r\n", &[(1, 1), (2, 1)]),
+        ("[a\nb][c]\n", &[(1, 1)]),
+        ("[x](http://y/[a][b])\n", &[]),
+        ("<div>\n[a][b]\n</div>\n", &[]),
+        ("[][b]\n", &[]),
+        ("[ ][b]\n", &[]),
+        ("[a][]\n", &[(1, 1)]),
+        ("[a][ ]\n", &[]),
+        ("[a][b][c]\n", &[(1, 1)]),
+        ("[a[b][c]\n", &[(1, 3)]),
+        ("[a][b] [c]\n", &[(1, 1)]),
+        ("![][b]\n", &[]),
+        ("[a]\n[b]\n", &[]),
+        ("[a][b]\n[c][d]\n", &[(1, 1), (2, 1)]),
+        ("text [x] more [y][z] end\n", &[(1, 15)]),
+        (
+            "[the `Sized` trait][sized] and [a][b]\n",
+            &[(1, 1), (1, 32)],
+        ),
+        // Which lines define a label. Each is `[x][a]` after something that does or does not turn out
+        // to be a definition of `a`, so the expectation is the whole question.
+        ("[a]: /u\n\n[x][a]\n", &[]),
+        ("[a]: /u\nbar\n\n[x][a]\n", &[]),
+        ("[a]: /u\n  \"title\"\n\n[x][a]\n", &[]),
+        ("[a]:\n/u\n\n[x][a]\n", &[]),
+        ("   [a]: /u\n\n[x][a]\n", &[]),
+        ("> [a]: /u\n\n[x][a]\n", &[]),
+        ("- [a]: /u\n\n[x][a]\n", &[]),
+        ("[x][a]\n\n[a]: /u\n", &[]),
+        ("[x][a]\n\n[a]: /u \"t\" junk\n", &[(1, 1)]),
+        // A bare destination may not contain a space, so this is an ordinary paragraph and
+        // `previouspost` is undefined.
+        ("[p]: {% post_url x %} [n]: {% y\n%}\n\n[a][p]\n", &[(4, 1)]),
+        ("# [a]: /u\n\n[x][a]\n", &[(3, 1)]),
+        ("| [a]: /u |\n|---|\n\n[x][a]\n", &[(4, 1)]),
+        // Normalization: the label is reported lowercased, trimmed and whitespace-collapsed.
+        ("[x][ a ]\n", &[(1, 1)]),
+        ("[x][A  B]\n", &[(1, 1)]),
+        ("[x][a]\n\n[A]: /u\n", &[]),
+        ("[x][a b]\n\n[a  B]: /u\n", &[]),
+    ];
 
     #[test]
-    fn test_custom_ignored_labels() {
-        let input = "[custom] Some text
-[another] More text
-
-[label]: https://example.com
-";
-
-        let config =
-            test_config_with_settings(true, vec!["custom".to_string(), "another".to_string()]);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - custom labels are ignored
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_case_insensitive_matching() {
-        let input = "[Good Link][LABEL]
-
-[label]: https://example.com
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - case insensitive matching per CommonMark
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_whitespace_normalization() {
-        let input = "[Good Link][  label   with   spaces  ]
-
-[label with spaces]: https://example.com
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - whitespace is normalized per CommonMark
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_images_full_reference() {
-        let input = "![Alt text][image]
-
-[image]: https://example.com/image.png
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - valid image reference
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_images_invalid_reference() {
-        let input = "![Alt text][missing]
-
-[image]: https://example.com/image.png
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 1 violation - missing image reference definition
-        assert_eq!(1, violations.len());
-        assert!(violations[0]
-            .message()
-            .contains("Missing link or image reference definition: \"missing\""));
-    }
-
-    #[test]
-    fn test_multiple_violations() {
-        let input = "[Bad link][missing1]
-[Another bad][missing2]
-[Good link][valid]
-
-[valid]: https://example.com
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 2 violations - two missing reference definitions
-        assert_eq!(2, violations.len());
-    }
-
-    #[test]
-    fn test_mixed_link_types() {
-        let input = "[Full][label1]
-[Collapsed][]
-[Shortcut]
-![Image][image1]
-![Collapsed image][]
-
-[label1]: https://example.com/1
-[collapsed]: https://example.com/2
-[shortcut]: https://example.com/3
-[image1]: https://example.com/image1.png
-[collapsed image]: https://example.com/image2.png
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - all references defined (shortcut ignored by default)
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_duplicate_definitions() {
-        let input = "[Good link][label]
-
-[label]: https://example.com/1
-[label]: https://example.com/2
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - first definition wins per CommonMark spec
-        assert_eq!(0, violations.len());
-    }
-    /// Brackets inside a code span, a link destination or a math region are literal text, so they
-    /// are not references. micromark never makes an `undefinedReference*` token inside one. Every
-    /// expectation is a markdownlint-cli2 0.23.3 measurement with MD052 enabled.
-    #[test]
-    fn test_brackets_in_literal_content_are_not_references() {
-        fn count(input: &str) -> usize {
-            let mut linter =
-                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
-            linter
-                .analyze()
-                .iter()
-                .filter(|v| v.rule().id == "MD052")
-                .count()
+    fn matches_markdownlint() {
+        for &(source, expected) in CASES {
+            assert_eq!(expected, positions(source).as_slice(), "source {source:?}");
         }
+    }
 
-        assert_eq!(0, count("- `dp[3][2][1]` means something\n"));
-        assert_eq!(0, count("| `a[1][2]` | b |\n|---|---|\n"));
-        assert_eq!(0, count("math $a[1][2]$ only\n"));
+    /// A reference after a multi-byte character. markdownlint counts UTF-16 units, so its column is
+    /// smaller than the byte-based one quickmark reports. That is the byte-column convention every
+    /// rule shares, not an MD052 difference.
+    #[test]
+    fn positions_count_bytes() {
+        // markdownlint: [(1, 3)]
+        assert_eq!(vec![(1, 5)], positions("你 [a][b] 好\n"));
+    }
 
-        // A real undefined reference beside a literal one is still reported, once.
-        assert_eq!(1, count("a `[x][y]` b and [undef][z] c\n"));
-        assert_eq!(1, count("math $a[1][2]$ and [undef][q]\n"));
-        assert_eq!(1, count("see [undef][nope] here\n"));
+    /// The label in the message is the normalized one, not the written one: markdownlint says `"abc"`
+    /// for `[x][ABC]` and `"a b"` for `[y][A  B]`.
+    #[test]
+    fn labels_in_messages_are_normalized() {
+        let mut linter = MultiRuleLinter::new_for_document(
+            PathBuf::from("test.md"),
+            config_with(MD052ReferenceLinksImagesTable::default()),
+            "[x][ABC] and [y][A  B]\n",
+        );
+        let messages: Vec<String> = linter
+            .analyze()
+            .iter()
+            .map(|violation| violation.message().to_string())
+            .collect();
+        assert_eq!(
+            vec![
+                r#"Missing link or image reference definition: "abc""#,
+                r#"Missing link or image reference definition: "a b""#,
+            ],
+            messages
+        );
+    }
 
-        // A defined reference and a proper inline link are not violations.
-        assert_eq!(0, count("see [ok][def] here\n\n[def]: /u\n"));
-        assert_eq!(0, count("see [text](https://e.example/a) ok\n"));
+    #[test]
+    fn shortcut_syntax_reports_lone_labels() {
+        let source = "# H\n\n[a] and [b][c] and [d][] and [text][x]\n";
+        let config = config_with(MD052ReferenceLinksImagesTable {
+            shortcut_syntax: true,
+            ..Default::default()
+        });
+        // markdownlint reports `[a]`, `[b][c]` and `[d][]`, and not `[text][x]` — `x` is ignored.
+        assert_eq!(
+            vec![(3, 1), (3, 9), (3, 20)],
+            positions_with(config, source)
+        );
+        // The same document with the default leaves the lone label alone.
+        assert_eq!(vec![(3, 9), (3, 20)], positions(source));
+    }
+
+    #[test]
+    fn ignored_labels_replace_the_default() {
+        let source = "# H\n\n[a] and [b][c] and [d][] and [text][x]\n";
+        let config = config_with(MD052ReferenceLinksImagesTable {
+            ignored_labels: vec!["c".to_string(), "d".to_string()],
+            ..MD052ReferenceLinksImagesTable {
+                shortcut_syntax: false,
+                ignored_labels: vec![],
+            }
+        });
+        // markdownlint reports only `[text][x]`: setting `ignored_labels` drops the default `x`.
+        assert_eq!(vec![(3, 30)], positions_with(config, source));
+    }
+
+    #[test]
+    fn a_document_without_references_is_quiet() {
+        assert_eq!(0, positions("# H\n\n[a](http://x) and plain text\n").len());
     }
 }

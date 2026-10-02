@@ -67,14 +67,8 @@ pub(crate) static MATH_REGEX: Lazy<Regex> = Lazy::new(|| {
         .expect("Invalid math regex")
 });
 
-/// Whether a delimiter marker at `start..end` falls inside literal content. Only the markers
-/// matter: an emphasis that merely *contains* a code span, link or math region is still real
-/// emphasis, so `_170 cases, 20 deep-dived `161570`_` must not be discarded whole.
-pub(crate) fn marker_in_literal(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
-    spans.iter().any(|(s, e)| start < *e && end > *s)
-}
-
-/// Byte ranges within `text` that hold literal content, where emphasis markers do not count.
+/// Byte ranges within `text` that hold literal content — code spans, link destinations and math —
+/// where an emphasis marker does not count.
 pub(crate) fn literal_ranges(text: &str) -> Vec<(usize, usize)> {
     CODE_SPAN_REGEX
         .find_iter(text)
