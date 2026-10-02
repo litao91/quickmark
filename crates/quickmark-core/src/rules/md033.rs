@@ -38,9 +38,6 @@ static HTML_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
     .expect("Invalid HTML tag regex")
 });
 
-static CODE_SPAN_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"`[^`]*`").expect("Invalid code span regex"));
-
 pub(crate) struct MD033Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
@@ -67,103 +64,240 @@ impl MD033Linter {
         }
     }
 
-    fn is_allowed_element(&self, element_name: &str) -> bool {
-        // O(1) lookup in pre-computed HashSet
-        self.allowed_elements.contains(&element_name.to_lowercase())
-    }
-
-    fn process_html_in_node(&mut self, node: &Node) {
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let content = {
-            let document_content = self.context.document_content.borrow();
-            document_content[start_byte..end_byte].to_string()
-        };
-
-        if node.kind() == "inline" {
-            // Find all code span ranges using memoized regex pattern
-            let mut code_span_ranges = Vec::new();
-            for cap in CODE_SPAN_REGEX.captures_iter(&content) {
-                let span_start = cap.get(0).unwrap().start();
-                let span_end = cap.get(0).unwrap().end();
-                code_span_ranges.push((span_start, span_end));
+    /// Walks the inline subtree, which `feed` never descends into because inline kinds are filtered
+    /// out of dispatch, and reports the `html_inline` nodes in it.
+    ///
+    /// A code span, inline math and an autolink are all leaves, so nothing inside one can be
+    /// mistaken for a tag: `` `Foo<T>::f()` `` and `$A<B>C<D$` are quiet here exactly as they are
+    /// in micromark, and no masking regex is needed to make that so.
+    fn check_inline(&mut self, root: Node) {
+        let mut tags = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "html_inline" {
+                tags.push(node);
             }
-            self.process_html_with_regex(node, &content, start_byte, Some(&code_span_ranges));
-        } else {
-            // For html_block nodes, process directly
-            self.process_html_with_regex(node, &content, start_byte, None);
+            for index in 0..node.child_count() {
+                if let Some(child) = node.child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        // The walk pops siblings in reverse; violations come out in document order.
+        tags.sort_unstable_by_key(|tag| tag.start_byte());
+
+        let mut found = Vec::new();
+        {
+            let source = self.context.document_content.borrow();
+            for tag in tags {
+                let range = tag.range();
+                let text = source[range.start_byte..range.end_byte].to_string();
+                // `getHtmlTagInfo` is markdownlint's own test, `/^<([^!>][^/\s>]*)/`: a comment, a
+                // CDATA section or a declaration has no name and is not an element, and a closing
+                // tag is not reported.
+                let Some(name) = html_tag_info(&text).map(str::to_string) else {
+                    continue;
+                };
+                found.push((range.start_byte, name, text));
+            }
+        }
+
+        for (start, name, text) in found {
+            self.report(start, &name, &text);
         }
     }
 
-    fn process_html_with_regex(
-        &mut self,
-        _node: &Node,
-        content: &str,
-        start_byte: usize,
-        exclude_ranges: Option<&[(usize, usize)]>,
-    ) {
-        // Use memoized HTML tag regex pattern
-        for cap in HTML_TAG_REGEX.captures_iter(content) {
-            if let Some(element_name_match) = cap.get(2) {
-                let tag_start = cap.get(0).unwrap().start();
-                let tag_end = cap.get(0).unwrap().end();
-
-                // If exclude_ranges are provided, check if the tag is inside one
-                if let Some(ranges) = exclude_ranges {
-                    let mut in_excluded_range = false;
-                    for &(exclude_start, exclude_end) in ranges {
-                        if tag_start >= exclude_start && tag_end <= exclude_end {
-                            in_excluded_range = true;
-                            break;
-                        }
-                    }
-                    if in_excluded_range {
-                        continue;
-                    }
-                }
-
-                let is_closing = cap.get(1).is_some_and(|m| m.as_str() == "/");
-
-                // Skip closing tags - we only want to report opening/self-closing tags
-                if is_closing {
+    /// Finds the tags in an HTML block's raw text.
+    ///
+    /// micromark re-tokenizes the content of every HTML block type as inline markdown except a
+    /// comment's, which stays raw — so `<!-- <link> -->` holds no tags at all while
+    /// `<div>\n<p>x</p>\n</div>` holds four, of which the two closing ones are not reported. A
+    /// comment, a CDATA section, a declaration and a processing instruction are each a single
+    /// token here too, and only the last has a name markdownlint reports.
+    ///
+    /// That re-tokenization is the one part this has to redo by hand, because comrak's `html_block`
+    /// is a leaf: code spans are located and skipped, since a `` `<b>` `` inside an HTML block is
+    /// code to micromark and so is not an element. Inline math is not; `$A<B>C$` inside an HTML
+    /// block reports `B` here and nothing in markdownlint.
+    fn check_html_block(&mut self, node: Node) {
+        let base = node.start_byte();
+        let mut found = Vec::new();
+        {
+            let source = self.context.document_content.borrow();
+            let text = &source[base..node.end_byte()];
+            let code = code_spans(text);
+            let mut index = 0;
+            while let Some(offset) = text[index..].find('<') {
+                let start = index + offset;
+                let rest = &text[start..];
+                // A code span is code, so a `<` inside one opens nothing.
+                if code.iter().any(|&(from, to)| from <= start && start < to) {
+                    index = start + 1;
                     continue;
                 }
-
-                let element_name = element_name_match.as_str();
-
-                // Check if this element is allowed
-                if !self.is_allowed_element(element_name) {
-                    // Calculate precise position of the HTML tag
-                    let tag_start_byte = start_byte + tag_start;
-                    let tag_end_byte = start_byte + tag_end;
-
-                    // Create precise crate::ast::NodeRange for this violation
-                    let range = range_from_node_range(&crate::ast::NodeRange {
-                        start_byte: tag_start_byte,
-                        end_byte: tag_end_byte,
-                        start_point: self.context.point_at(tag_start_byte),
-                        end_point: self.context.point_at(tag_end_byte),
-                    });
-
-                    let violation = RuleViolation::new(
-                        &MD033,
-                        format!("Inline HTML [Element: {element_name}]"),
-                        self.context.file_path.clone(),
-                        range,
-                    );
-                    self.violations.push(violation);
+                if let Some((length, name)) = raw_construct(rest) {
+                    if let Some(name) = name {
+                        found.push((base + start, name.to_string(), rest[..length].to_string()));
+                    }
+                    index = start + length;
+                    continue;
+                }
+                match HTML_TAG_REGEX.find(rest) {
+                    Some(found_tag) if found_tag.start() == 0 => {
+                        let tag = &rest[..found_tag.end()];
+                        if !tag.starts_with("</") {
+                            let name = HTML_TAG_REGEX
+                                .captures(tag)
+                                .and_then(|caps| caps.get(2))
+                                .map_or("", |name| name.as_str());
+                            found.push((base + start, name.to_string(), tag.to_string()));
+                        }
+                        index = start + found_tag.end();
+                    }
+                    _ => index = start + 1,
                 }
             }
         }
+
+        for (start, name, text) in found {
+            self.report(start, &name, &text);
+        }
     }
+
+    fn report(&mut self, start: usize, name: &str, text: &str) {
+        if self.allowed_elements.contains(&name.to_lowercase()) {
+            return;
+        }
+        // markdownlint's range stops at the tag's first line ending, so a tag written across
+        // several lines is underlined only as far as its opening line goes.
+        let end = start + text.find(['\n', '\r']).unwrap_or(text.len());
+        let range = range_from_node_range(&crate::ast::NodeRange {
+            start_byte: start,
+            end_byte: end,
+            start_point: self.context.point_at(start),
+            end_point: self.context.point_at(end),
+        });
+        self.violations.push(RuleViolation::new(
+            &MD033,
+            format!("Inline HTML [Element: {name}]"),
+            self.context.file_path.clone(),
+            range,
+        ));
+    }
+}
+
+/// The byte spans of the code spans in `text`, by CommonMark's rule: a run of N backticks is closed
+/// by the next run of exactly N, and an opener with no such close is literal text.
+///
+/// Pairing stops at a blank line, because a code span may not cross one. micromark gets that for
+/// free — it re-tokenizes an HTML block's content as *flow*, so blank lines split it into separate
+/// paragraphs before inline parsing ever runs — and without the same limit a stray backtick early in
+/// a long `<pre>` block swallows everything after it.
+fn code_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut base = 0;
+    for chunk in text.split("\n\n") {
+        spans.extend(
+            code_spans_in(chunk)
+                .into_iter()
+                .map(|(from, to)| (from + base, to + base)),
+        );
+        base += chunk.len() + 2;
+    }
+    spans
+}
+
+fn code_spans_in(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let open = index;
+        while index < bytes.len() && bytes[index] == b'`' {
+            index += 1;
+        }
+        let width = index - open;
+        let mut probe = index;
+        while probe < bytes.len() {
+            if bytes[probe] != b'`' {
+                probe += 1;
+                continue;
+            }
+            let close = probe;
+            while probe < bytes.len() && bytes[probe] == b'`' {
+                probe += 1;
+            }
+            if probe - close == width {
+                spans.push((open, probe));
+                index = probe;
+                break;
+            }
+        }
+    }
+    spans
+}
+
+/// The element name of an inline HTML tag, or `None` for a closing tag, a comment, a CDATA section,
+/// a processing instruction or a declaration. markdownlint's own test is `/^<([^!>][^/\s>]*)/`,
+/// which takes a leading `/` as part of the name and reads it as the close — and a leading `?` as
+/// part of the name too, which is how `<?php … ?>` comes to be an element called `?php`.
+fn html_tag_info(tag: &str) -> Option<&str> {
+    let rest = tag.strip_prefix('<')?;
+    let first = rest.as_bytes().first()?;
+    if *first == b'!' || *first == b'>' {
+        return None;
+    }
+    let name_end = rest[1..]
+        .find(|c: char| c == '/' || c.is_whitespace() || c == '>')
+        .map_or(rest.len(), |offset| offset + 1);
+    let name = &rest[..name_end];
+    if name.starts_with('/') {
+        return None;
+    }
+    Some(name)
+}
+
+/// A construct micromark tokenizes whole, so nothing inside it is a tag: `(length, name to report)`.
+/// Only a processing instruction has one. An unterminated construct runs to the end of the text.
+fn raw_construct(text: &str) -> Option<(usize, Option<&str>)> {
+    let bytes = text.as_bytes();
+    let (marker, terminator) = if text.starts_with("<!--") {
+        ("<!--", "-->")
+    } else if text.starts_with("<![CDATA[") {
+        ("<![CDATA[", "]]>")
+    } else if text.starts_with("<?") {
+        ("<?", "?>")
+    } else if bytes.get(1) == Some(&b'!')
+        && bytes.get(2).is_some_and(|byte| byte.is_ascii_alphabetic())
+    {
+        ("<!", ">")
+    } else {
+        return None;
+    };
+    let length = text[marker.len()..]
+        .find(terminator)
+        .map_or(text.len(), |offset| {
+            marker.len() + offset + terminator.len()
+        });
+    let name = text.starts_with("<?").then(|| {
+        let rest = &text[1..];
+        let end = rest
+            .find(|c: char| c == '/' || c.is_whitespace() || c == '>')
+            .unwrap_or(rest.len());
+        &rest[..end]
+    });
+    Some((length, name))
 }
 
 impl RuleLinter for MD033Linter {
     fn feed(&mut self, node: &Node) {
         match node.kind() {
-            // A code span is a leaf, so nothing inside one is ever fed here; the spans are masked
-            // out of the raw text by `process_html_in_node` instead.
-            "inline" | "html_block" => self.process_html_in_node(node),
+            "inline" => self.check_inline(*node),
+            "html_block" => self.check_html_block(*node),
             _ => (),
         }
     }
@@ -189,372 +323,186 @@ mod test {
 
     use crate::config::{LintersSettingsTable, MD033InlineHtmlTable, RuleSeverity};
     use crate::linter::MultiRuleLinter;
-    use crate::test_utils::test_helpers::test_config_with_settings;
+    use crate::test_utils::test_helpers::{test_config_with_rules, test_config_with_settings};
 
-    fn test_config_default() -> crate::config::QuickmarkConfig {
-        test_config_with_settings(
-            vec![("no-inline-html", RuleSeverity::Error)],
-            LintersSettingsTable {
-                inline_html: MD033InlineHtmlTable {
-                    allowed_elements: vec![],
-                },
-                ..Default::default()
-            },
-        )
+    /// One reported tag: `(line, column, width, element)`, the first three 1-based. The width runs
+    /// to the tag's first line ending, which is what markdownlint's `errorRange` covers, and the
+    /// element keeps the case it was written in.
+    type Tag<'a> = (usize, usize, usize, &'a str);
+
+    fn test_config() -> crate::config::QuickmarkConfig {
+        test_config_with_rules(vec![("no-inline-html", RuleSeverity::Error)])
     }
 
-    fn test_config_with_allowed_elements(
-        allowed_elements: Vec<&str>,
-    ) -> crate::config::QuickmarkConfig {
-        test_config_with_settings(
-            vec![("no-inline-html", RuleSeverity::Error)],
-            LintersSettingsTable {
-                inline_html: MD033InlineHtmlTable {
-                    allowed_elements: allowed_elements.iter().map(|s| s.to_string()).collect(),
-                },
-                ..Default::default()
-            },
-        )
+    fn tags_with(
+        config: crate::config::QuickmarkConfig,
+        source: &str,
+    ) -> Vec<(usize, usize, usize, String)> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, source);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let range = &violation.location().range;
+                let element = violation
+                    .message()
+                    .split_once("[Element: ")
+                    .map_or("", |(_, rest)| rest.trim_end_matches(']'))
+                    .to_string();
+                (
+                    range.start.line + 1,
+                    range.start.character + 1,
+                    range.end.character - range.start.character,
+                    element,
+                )
+            })
+            .collect()
     }
+
+    fn tags(source: &str) -> Vec<(usize, usize, usize, String)> {
+        tags_with(test_config(), source)
+    }
+
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output, run with
+    /// only `no-inline-html` enabled: its line, its `errorRange` column and length, and the element
+    /// name from its `errorDetail`.
+    ///
+    /// Columns count UTF-8 bytes here and UTF-16 units there, so the one case with a multi-byte
+    /// character before a tag is asserted separately in [`positions_count_bytes`].
+    const CASES: &[(&str, &[Tag<'static>])] = &[
+        ("a <div> b\n", &[(1, 3, 5, "div")]),
+        ("a </div> b\n", &[]),
+        ("a <br/> b\n", &[(1, 3, 5, "br")]),
+        ("a <img src=\"x\" alt='y'> b\n", &[(1, 3, 21, "img")]),
+        ("a <!-- <link rel=x> --> b\n", &[]),
+        ("<!-- <link rel=x> -->\n", &[]),
+        (
+            "<div>\n<p>x</p>\n</div>\n",
+            &[(1, 1, 5, "div"), (2, 1, 3, "p")],
+        ),
+        ("<!--\n<link rel=x>\n-->\n", &[]),
+        ("a `<div>` b\n", &[]),
+        ("```\n<div>\n```\n", &[]),
+        ("text\n\n    <div>\n", &[]),
+        ("- assume $A<B>C<D$\n", &[]),
+        ("$$\nA<B>C\n$$\n", &[]),
+        ("see <https://example.com> and <a@b.com>\n", &[]),
+        ("# <div> heading\n", &[(1, 3, 5, "div")]),
+        ("| a |\n|---|\n| <b>x</b> |\n", &[(3, 3, 3, "b")]),
+        ("> <div> x\n", &[(1, 3, 5, "div")]),
+        ("- <div> x\n", &[(1, 3, 5, "div")]),
+        ("[<b>x</b>](http://y)\n", &[(1, 2, 3, "b")]),
+        ("a <br \\> b\n", &[]),
+        ("a<b>c\n", &[(1, 2, 3, "b")]),
+        ("a <DIV> b\n", &[(1, 3, 5, "DIV")]),
+        ("a <ne-text> b\n", &[(1, 3, 9, "ne-text")]),
+        (
+            "a <b>x</b> <i>y</i> c\n",
+            &[(1, 3, 3, "b"), (1, 12, 3, "i")],
+        ),
+        ("a <div\n  class='x'> b\n", &[(1, 3, 4, "div")]),
+        ("a < b > c and 1<2>3\n", &[]),
+        ("<!DOCTYPE html>\n<div>x</div>\n", &[(2, 1, 5, "div")]),
+        ("a <![CDATA[ x ]]> b\n", &[]),
+        ("a <?php echo 1; ?> b\n", &[(1, 3, 16, "?php")]),
+        (
+            "<script>\nvar x = '<div>';\n</script>\n",
+            &[(1, 1, 8, "script"), (2, 10, 5, "div")],
+        ),
+        ("<?php\n$x = '<div>';\n?>\n", &[(1, 1, 5, "?php")]),
+        ("<![CDATA[\n<div>\n]]>\n", &[]),
+        (
+            "<div>\ntext <b>y</b>\n\n",
+            &[(1, 1, 5, "div"), (2, 6, 3, "b")],
+        ),
+        ("a <!--\n<div>\n--> b\n", &[(2, 1, 5, "div")]),
+        (
+            "<span class='x'>\ntext <b>y</b>\n\n",
+            &[(1, 1, 16, "span"), (2, 6, 3, "b")],
+        ),
+        ("<div>\n<!-- <b>x</b> -->\n</div>\n", &[(1, 1, 5, "div")]),
+        ("<div>\n\n<p>x</p>\n", &[(1, 1, 5, "div"), (3, 1, 3, "p")]),
+        ("no html here at all\n", &[]),
+        ("a <div>\n", &[(1, 3, 5, "div")]),
+        (
+            "text <sub>x</sub> and <sup>y</sup>\n",
+            &[(1, 6, 5, "sub"), (1, 23, 5, "sup")],
+        ),
+        ("<div>\n`<b>`\n</div>\n", &[(1, 1, 5, "div")]),
+        (
+            "<div>\n`<b>` and <i>x</i>\n</div>\n",
+            &[(1, 1, 5, "div"), (2, 11, 3, "i")],
+        ),
+        ("<pre class=x>\ntext `<T>` more\n", &[(1, 1, 13, "pre")]),
+        ("<div>\n``a <b>`` c\n</div>\n", &[(1, 1, 5, "div")]),
+        (
+            "<div>\nx `y\n\nz <b> w\n</div>\n",
+            &[(1, 1, 5, "div"), (4, 3, 3, "b")],
+        ),
+        (
+            "<pre>\n`a` <b>\n\n`c` <i>\n</pre>\n",
+            &[(1, 1, 5, "pre"), (2, 5, 3, "b"), (4, 5, 3, "i")],
+        ),
+        (
+            "<div>\n`unclosed <b>\n</div>\n",
+            &[(1, 1, 5, "div"), (2, 11, 3, "b")],
+        ),
+    ];
 
     #[test]
-    fn test_no_inline_html_no_violations() {
-        let config = test_config_default();
-        let input = "# Regular heading
-
-This is regular markdown with no HTML.
-
-- List item 1
-- List item 2
-
-```text
-<p>This should not trigger as it's in a code block</p>
-```
-
-Text `<code>` text (this should not trigger as it's in a code span)";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-        assert_eq!(md033_violations.len(), 0);
-    }
-
-    #[test]
-    fn test_basic_inline_html_violations() {
-        let config = test_config_default();
-        let input = "# Regular heading
-
-<h1>Inline HTML Heading</h1>
-
-<p>More inline HTML
-but this time on multiple lines
-</p>
-
-Regular text";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // Should find 2 violations: <h1> and <p> opening tags
-        assert_eq!(md033_violations.len(), 2);
-
-        // Check that the violations contain the element names
-        assert!(md033_violations[0].message().contains("h1"));
-        assert!(md033_violations[1].message().contains("p"));
-    }
-
-    #[test]
-    fn test_self_closing_tags() {
-        let config = test_config_default();
-        let input = "# Heading
-
-<hr>
-
-<hr/>
-
-<br />
-
-<img src=\"test.jpg\" alt=\"test\"/>";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // Should find 4 violations: <hr>, <hr/>, <br />, <img/>
-        assert_eq!(md033_violations.len(), 4);
-
-        // Check element names
-        assert!(md033_violations.iter().any(|v| v.message().contains("hr")));
-        assert!(md033_violations.iter().any(|v| v.message().contains("br")));
-        assert!(md033_violations.iter().any(|v| v.message().contains("img")));
-    }
-
-    #[test]
-    fn test_allowed_elements() {
-        let config = test_config_with_allowed_elements(vec!["h1", "p", "hr"]);
-        let input = "# Regular heading
-
-<h1>This is allowed</h1>
-
-<h2>This is not allowed</h2>
-
-<p>This is allowed</p>
-
-<div>This is not allowed</div>
-
-<hr>
-
-<hr/>
-
-<br/>";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // Should find 3 violations: <h2>, <div>, <br/>
-        assert_eq!(md033_violations.len(), 3);
-
-        // Check that only non-allowed elements are reported
-        assert!(md033_violations.iter().any(|v| v.message().contains("h2")));
-        assert!(md033_violations.iter().any(|v| v.message().contains("div")));
-        assert!(md033_violations.iter().any(|v| v.message().contains("br")));
-
-        // Check that allowed elements are not reported
-        assert!(!md033_violations.iter().any(|v| v.message().contains("h1")));
-        assert!(!md033_violations.iter().any(|v| v.message().contains("p")));
-        assert!(!md033_violations.iter().any(|v| v.message().contains("hr")));
-    }
-
-    #[test]
-    fn test_case_insensitive_allowed_elements() {
-        let config = test_config_with_allowed_elements(vec!["h1", "P"]);
-        let input = "# Regular heading
-
-<h1>Lower case tag, lower case config - allowed</h1>
-
-<H1>Upper case tag, lower case config - allowed</H1>
-
-<p>Lower case tag, upper case config - allowed</p>
-
-<P>Upper case tag, upper case config - allowed</P>
-
-<h2>Not allowed</h2>";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // Should find only 1 violation: <h2>
-        assert_eq!(md033_violations.len(), 1);
-        assert!(md033_violations[0].message().contains("h2"));
-    }
-
-    #[test]
-    fn test_nested_html_tags() {
-        let config = test_config_with_allowed_elements(vec!["h1"]);
-        let input = "<h1>This <h2>is not</h2> allowed</h1>";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // Should find 1 violation: <h2> (h1 is allowed)
-        assert_eq!(md033_violations.len(), 1);
-        assert!(md033_violations[0].message().contains("h2"));
-    }
-
-    #[test]
-    fn test_html_in_code_blocks_ignored() {
-        let config = test_config_default();
-        let input = "# Heading
-
-```html
-<h1>This should not trigger</h1>
-<p>Neither should this</p>
-```
-
-    <h1>This shouldn't trigger as it's inside an indented code block</h1>
-
-But <p>this should trigger</p>";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // Should find only 1 violation: the <p> outside code blocks
-        assert_eq!(md033_violations.len(), 1);
-        assert!(md033_violations[0].message().contains("p"));
-    }
-
-    #[test]
-    fn test_html_in_code_spans_ignored() {
-        let config = test_config_default();
-        let input = "# Heading
-
-Text `<code>` text should not trigger.
-
-Text `<p>some text</p>` should not trigger.
-
-But <span>this should trigger</span>.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // Should find only 1 violation: <span>
-        assert_eq!(md033_violations.len(), 1);
-        assert!(md033_violations[0].message().contains("span"));
-    }
-
-    #[test]
-    fn test_only_opening_tags_reported() {
-        let config = test_config_default();
-        let input = "# Heading
-
-<p>Opening and closing tags</p>
-
-<div>
-Content
-</div>";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // Should find only 2 violations: <p> and <div> opening tags, not the closing tags
-        assert_eq!(md033_violations.len(), 2);
-        assert!(md033_violations.iter().any(|v| v.message().contains("p")));
-        assert!(md033_violations.iter().any(|v| v.message().contains("div")));
-    }
-
-    // Both expectations below were checked against markdownlint-cli2 v0.23.3.
-
-    #[test]
-    fn test_autolinks_are_not_inline_html() {
-        let config = test_config_default();
-        let input = "See <https://example.com/a?b=c&d=e> and <foo@example.com> here.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // CommonMark allows only whitespace or `/` after a tag name, so these are links
-        assert_eq!(md033_violations.len(), 0);
-    }
-
-    #[test]
-    fn test_real_tags_still_reported_beside_autolinks() {
-        let config = test_config_default();
-        let input = "<https://example.com> then <div>raw</div> and <br/>";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        assert_eq!(md033_violations.len(), 2);
-    }
-
-    #[test]
-    fn test_hyphenated_tag_names_are_html() {
-        let config = test_config_default();
-        let input = "<ne-text>content</ne-text> and <my-widget/>";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md033_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD033")
-            .collect();
-
-        // markdownlint reports ne-text and my-widget, not the closing tag
-        assert_eq!(md033_violations.len(), 2);
-        assert!(md033_violations
-            .iter()
-            .any(|v| v.message().contains("ne-text")));
-        assert!(md033_violations
-            .iter()
-            .any(|v| v.message().contains("my-widget")));
-    }
-    /// CommonMark's tag grammar is what micromark tokenizes, so it is what markdownlint can see.
-    /// `<br \>` is not a tag — a backslash cannot start an attribute name — and micromark leaves it
-    /// as literal text. Accepting any `[^>]*` after the name reported it anyway: 132 false positives
-    /// on the vault corpus, all from HTML tables using `<br \>` as a line break. Every expectation
-    /// here is a markdownlint-cli2 0.23.3 measurement.
-    #[test]
-    fn test_only_well_formed_tags_are_inline_html() {
-        fn count(input: &str) -> usize {
-            let mut linter = MultiRuleLinter::new_for_document(
-                PathBuf::from("test.md"),
-                test_config_default(),
-                input,
-            );
-            linter
-                .analyze()
+    fn matches_markdownlint() {
+        for &(source, expected) in CASES {
+            let found = tags(source);
+            let reported: Vec<Tag<'_>> = found
                 .iter()
-                .filter(|v| v.rule().id == "MD033")
-                .count()
+                .map(|(line, column, width, element)| (*line, *column, *width, element.as_str()))
+                .collect();
+            assert_eq!(expected, reported.as_slice(), "source {source:?}");
         }
+    }
 
-        // A backslash is not an attribute name, so none of these are tags.
-        assert_eq!(0, count("a <br \\> b\n"));
-        assert_eq!(0, count("中文 <br \\> 中文\n"));
+    /// A tag after a multi-byte character. markdownlint counts UTF-16 units, so its column is
+    /// smaller than the byte-based one quickmark reports. That is the byte-column convention every
+    /// rule shares, not an MD033 difference.
+    #[test]
+    fn positions_count_bytes() {
+        // markdownlint: [(1, 3, 5, "div")]
+        assert_eq!(vec![(1, 5, 5, "div".to_string())], tags("你 <div> 好\n"));
+    }
+
+    /// micromark re-tokenizes a non-comment HTML block's content as inline markdown, and this scan
+    /// redoes only the code-span part of that: inline math inside an HTML block still hides its
+    /// contents from markdownlint and not from here. markdownlint reports only `div`.
+    #[test]
+    fn inline_math_inside_an_html_block_is_not_masked() {
         assert_eq!(
-            3,
-            count("<table><tr><td>x<br \\>y</td></tr></table>\n"),
-            "the three real tags in the HTML block, not the <br \\>"
+            vec![(1, 1, 5, "div".to_string()), (2, 3, 3, "B".to_string())],
+            tags("<div>\n$A<B>C$\n</div>\n")
         );
+    }
 
-        // Well-formed shapes, in an inline and a block context alike.
-        assert_eq!(1, count("a <br/> b\n"));
-        assert_eq!(1, count("a <br /> b\n"));
-        assert_eq!(1, count("a <img src=x> y\n"));
-        assert_eq!(1, count("a <input disabled> y\n"));
-        assert_eq!(1, count("a <a href=\"x\" title='y'> y\n"));
-        assert_eq!(1, count("a <ne-text>x</ne-text> y\n"), "hyphenated name");
-        assert_eq!(1, count("a <b\n  class=\"x\"> y\n"), "a tag spanning lines");
-        // A closing tag is not reported, so `<b>x</b>` is one violation, not two.
-        assert_eq!(1, count("a <b>x</b> y\n"));
+    #[test]
+    fn allowed_elements_is_case_insensitive() {
+        // markdownlint with `allowed_elements: ["div"]` and with `["DIV"]` both report only `span`.
+        for allowed in [vec!["div".to_string()], vec!["DIV".to_string()]] {
+            let config = test_config_with_settings(
+                vec![("no-inline-html", RuleSeverity::Error)],
+                LintersSettingsTable {
+                    inline_html: MD033InlineHtmlTable {
+                        allowed_elements: allowed,
+                    },
+                    ..Default::default()
+                },
+            );
+            let found = tags_with(config, "a <div> b <span>c</span> <DIV>d</DIV>\n");
+            let elements: Vec<&str> = found.iter().map(|tag| tag.3.as_str()).collect();
+            assert_eq!(vec!["span"], elements);
+        }
+    }
 
-        // Not elements: an autolink, an email autolink, a comment, a declaration, a code span.
-        assert_eq!(0, count("a <https://example.com> y\n"));
-        assert_eq!(0, count("a <foo@example.com> y\n"));
-        assert_eq!(0, count("a <!-- c --> y\n"));
-        assert_eq!(0, count("a <!DOCTYPE html> y\n"));
-        assert_eq!(0, count("a `x <b> y` z\n"));
+    #[test]
+    fn a_document_without_html_is_quiet() {
+        assert_eq!(0, tags("plain *text* with `code` and $math$\n").len());
     }
 }
