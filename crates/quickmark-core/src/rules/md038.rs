@@ -21,161 +21,180 @@ impl MD038Linter {
         }
     }
 
-    fn check_inline_content(&mut self, node: &Node) {
-        let text = {
-            let content = self.context.get_document_content();
-            node.utf8_text(content.as_bytes()).unwrap_or("").to_string()
-        };
-        let node_start_byte = node.start_byte();
+    /// The whitespace runs markdownlint reports in one inline subtree, as absolute byte ranges.
+    fn runs(&self, root: Node) -> Vec<(usize, usize)> {
+        let source = self.context.get_document_content();
+        let mut runs = Vec::new();
+        let mut cursor = root.walk();
+        let mut depth = 0;
+        loop {
+            let node = cursor.node();
+            if node.kind() == "code_span" {
+                runs.extend(padded_runs(
+                    &source[node.start_byte()..node.end_byte()],
+                    node.start_byte(),
+                ));
+            }
 
-        // Find all code spans using a proper parser
-        let code_spans = self.find_code_spans(&text);
-        for (content, start, len) in code_spans {
-            self.check_code_span_content(&content, node_start_byte + start, len);
-        }
-    }
-
-    fn find_code_spans(&self, text: &str) -> Vec<(String, usize, usize)> {
-        let mut spans = Vec::new();
-        let mut i = 0;
-        let chars: Vec<char> = text.chars().collect();
-
-        while i < chars.len() {
-            if chars[i] == '`' {
-                // Count opening backticks
-                let start_pos = i;
-                let mut backtick_count = 0;
-                while i < chars.len() && chars[i] == '`' {
-                    backtick_count += 1;
-                    i += 1;
+            if cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+            loop {
+                if depth == 0 {
+                    return runs;
                 }
-
-                // Look for closing backticks of the same count
-                let content_start = i;
-                let mut found_closing = false;
-
-                while i < chars.len() {
-                    if chars[i] == '`' {
-                        let closing_start = i;
-                        let mut closing_count = 0;
-                        while i < chars.len() && chars[i] == '`' {
-                            closing_count += 1;
-                            i += 1;
-                        }
-
-                        if closing_count == backtick_count {
-                            // Found matching closing backticks
-                            let content_end = closing_start;
-                            let content: String =
-                                chars[content_start..content_end].iter().collect();
-                            let content_byte_start = text
-                                .char_indices()
-                                .nth(content_start)
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
-                            let content_len = content.len();
-                            spans.push((content, content_byte_start, content_len));
-                            found_closing = true;
-                            break;
-                        }
-                        // Continue looking if backtick count doesn't match
-                    } else {
-                        i += 1;
-                    }
+                if cursor.goto_next_sibling() {
+                    break;
                 }
-
-                // If we didn't find a closing sequence, backtrack and continue
-                if !found_closing {
-                    i = start_pos + 1;
-                }
-            } else {
-                i += 1;
+                cursor.goto_parent();
+                depth -= 1;
             }
         }
-
-        spans
     }
 
-    fn check_code_span_content(
-        &mut self,
-        code_content: &str,
-        content_start_byte: usize,
-        content_len: usize,
-    ) {
-        // If the content is only whitespace, allow it (per recent clarification)
-        if code_content.trim().is_empty() {
-            return;
-        }
+    fn report(&mut self, start: usize, end: usize) {
+        self.violations.push(RuleViolation::new(
+            &MD038,
+            VIOLATION_MESSAGE.to_string(),
+            self.context.file_path.clone(),
+            range_from_node_range(&crate::ast::NodeRange {
+                start_byte: start,
+                end_byte: end,
+                start_point: self.context.point_at(start),
+                end_point: self.context.point_at(end),
+            }),
+        ));
+    }
+}
 
-        // Check for leading whitespace violations
-        let leading_whitespace: String = code_content
-            .chars()
-            .take_while(|c| c.is_whitespace())
-            .collect();
-        let leading_is_violation = match leading_whitespace.as_str() {
-            "" => false,  // No leading whitespace - OK
-            " " => false, // Single space - OK per CommonMark spec
-            _ => true,    // Multiple spaces, tabs, or other whitespace - violation
+/// The whitespace markdownlint reports inside one code span's raw text, as absolute byte ranges.
+///
+/// It reads micromark's `codeText` token, which is this node, and the `codeTextPadding` and
+/// `codeTextData` tokens inside it. CommonMark strips one space from each end when the content both
+/// begins and ends with one and is not nothing but spaces; those two are the padding and what is
+/// left is the data. A violation is whitespace the strip did not account for, so a single space that
+/// was stripped is quiet and one that was not is not: `` ` a` `` is reported, `` ` a ` `` is not.
+fn padded_runs(raw: &str, base: usize) -> Vec<(usize, usize)> {
+    let delimiter = raw.bytes().take_while(|&byte| byte == b'`').count();
+    // The closing run is as long as the opening one; that is what made this a code span.
+    let content = &raw[delimiter..raw.len() - delimiter];
+    let content_start = base + delimiter;
+    let content_end = content_start + content.len();
+
+    let padded = content.len() >= 2
+        && content.starts_with(' ')
+        && content.ends_with(' ')
+        && !content.bytes().all(|byte| byte == b' ');
+    let data = if padded {
+        &content[1..content.len() - 1]
+    } else {
+        content
+    };
+    let data_start = content_start + usize::from(padded);
+
+    // micromark splits the data at line endings and emits no token for an empty piece, and only the
+    // first and last of what is left are examined: `` `a \nb` `` is quiet, `` ` a\nb` `` is not.
+    let Some((first, last)) = outer_chunks(data, data_start) else {
+        return Vec::new();
+    };
+
+    let leading = Edge::leading(&data[first.0 - data_start..first.1 - data_start], padded);
+    let trailing = Edge::trailing(&data[last.0 - data_start..last.1 - data_start], padded);
+    // A space on both sides that the strip already took is safe to delete along with the extra one
+    // beside it, so the report covers the padding too — unless either side abuts a backtick, where
+    // deleting would change what the code span says.
+    let remove_padding = leading.count > 0
+        && trailing.count > 0
+        && padded
+        && !leading.abuts_backtick
+        && !trailing.abuts_backtick;
+
+    let mut runs = Vec::new();
+    if leading.count > 0 {
+        let from = if remove_padding {
+            content_start
+        } else {
+            first.0
         };
+        let length = leading.count + usize::from(remove_padding);
+        runs.push((from, from + length));
+    }
+    if trailing.count > 0 {
+        let to = if remove_padding { content_end } else { last.1 };
+        let length = trailing.count + usize::from(remove_padding);
+        runs.push((to - length, to));
+    }
+    runs
+}
 
-        if leading_is_violation {
-            let leading_byte_len = leading_whitespace.len();
-            let violation_range = crate::ast::NodeRange {
-                start_byte: content_start_byte,
-                end_byte: content_start_byte + leading_byte_len,
-                start_point: self.context.point_at(content_start_byte),
-                end_point: self.context.point_at(content_start_byte + leading_byte_len),
-            };
+/// One end of a code span's data: how much whitespace sits there, and whether a backtick is beside
+/// it. markdownlint counts one less in the second case when nothing was stripped, because `` `` `x ``
+/// is how a literal backtick is written and the space before it belongs to the code.
+struct Edge {
+    count: usize,
+    abuts_backtick: bool,
+}
 
-            self.violations.push(RuleViolation::new(
-                &MD038,
-                format!("{VIOLATION_MESSAGE} [Context: leading whitespace]"),
-                self.context.file_path.clone(),
-                range_from_node_range(&violation_range),
-            ));
-        }
+impl Edge {
+    /// micromark's `/^(\s+)(\S)/` over the first data token.
+    fn leading(text: &str, padded: bool) -> Self {
+        let width = text.len() - text.trim_start_matches(char::is_whitespace).len();
+        // Nothing but whitespace means the pattern does not match at all, so there is no count.
+        let next = (width < text.len()).then(|| text.as_bytes()[width]);
+        Edge::new(width, next, padded)
+    }
 
-        // Check for trailing whitespace violations
-        let trailing_whitespace: String = code_content
-            .chars()
-            .rev()
-            .take_while(|c| c.is_whitespace())
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let trailing_is_violation = match trailing_whitespace.as_str() {
-            "" => false,  // No trailing whitespace - OK
-            " " => false, // Single space - OK per CommonMark spec
-            _ => true,    // Multiple spaces, tabs, or other whitespace - violation
-        };
+    /// micromark's `/(\S)(\s+)$/` over the last data token.
+    fn trailing(text: &str, padded: bool) -> Self {
+        let width = text.len() - text.trim_end_matches(char::is_whitespace).len();
+        // A multi-byte character before the run is asked about by its last byte, which is a
+        // continuation byte and so is never a backtick — the same answer the character gives.
+        let previous = (width < text.len()).then(|| text.as_bytes()[text.len() - width - 1]);
+        Edge::new(width, previous, padded)
+    }
 
-        if trailing_is_violation {
-            let trailing_byte_len = trailing_whitespace.len();
-            let violation_end_byte = content_start_byte + content_len;
-            let violation_start_byte = violation_end_byte - trailing_byte_len;
-
-            let violation_range = crate::ast::NodeRange {
-                start_byte: violation_start_byte,
-                end_byte: violation_end_byte,
-                start_point: self.context.point_at(violation_start_byte),
-                end_point: self.context.point_at(violation_end_byte),
-            };
-
-            self.violations.push(RuleViolation::new(
-                &MD038,
-                format!("{VIOLATION_MESSAGE} [Context: trailing whitespace]"),
-                self.context.file_path.clone(),
-                range_from_node_range(&violation_range),
-            ));
+    fn new(width: usize, neighbour: Option<u8>, padded: bool) -> Self {
+        let abuts_backtick = neighbour == Some(b'`');
+        Self {
+            count: match neighbour {
+                Some(_) if abuts_backtick && !padded => width.saturating_sub(1),
+                Some(_) => width,
+                None => 0,
+            },
+            abuts_backtick,
         }
     }
 }
 
+/// The absolute byte ranges of the first and last non-empty line of `data`, or `None` when it holds
+/// no text at all — a code span of nothing but line endings has no data token to examine.
+fn outer_chunks(data: &str, base: usize) -> Option<((usize, usize), (usize, usize))> {
+    let mut first = None;
+    let mut last = None;
+    let mut offset = 0;
+    for line in data.split(['\n', '\r']) {
+        if !line.is_empty() {
+            let chunk = (base + offset, base + offset + line.len());
+            if first.is_none() {
+                first = Some(chunk);
+            }
+            last = Some(chunk);
+        }
+        // `\r\n` splits into an empty piece the offset still has to step over.
+        offset += line.len() + 1;
+    }
+    Some((first?, last?))
+}
+
 impl RuleLinter for MD038Linter {
     fn feed(&mut self, node: &Node) {
-        if node.kind() == "inline" {
-            self.check_inline_content(node);
+        if node.kind() != "inline" {
+            return;
+        }
+        let runs = self.runs(*node);
+        for (start, end) in runs {
+            self.report(start, end);
         }
     }
 
@@ -202,257 +221,119 @@ mod test {
     use crate::linter::MultiRuleLinter;
     use crate::test_utils::test_helpers::test_config_with_rules;
 
-    fn test_config() -> crate::config::QuickmarkConfig {
-        test_config_with_rules(vec![("no-space-in-code", RuleSeverity::Error)])
+    /// `(line, column)` of one reported run, both 1-based, which is markdownlint's `errorRange`
+    /// start. The column is where the whitespace begins, not where the code span does.
+    type Position = (usize, usize);
+
+    fn positions(source: &str) -> Vec<Position> {
+        let config = test_config_with_rules(vec![("no-space-in-code", RuleSeverity::Error)]);
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, source);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let range = &violation.location().range;
+                (range.start.line + 1, range.start.character + 1)
+            })
+            .collect()
     }
 
-    #[test]
-    fn test_no_violations_valid_code_spans() {
-        let config = test_config();
-        let input = "This has `valid code` spans.";
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output with
+    /// MD038's defaults.
+    ///
+    /// Columns count UTF-8 bytes here and UTF-16 units there, so the one case with a multi-byte
+    /// character before the reported space is asserted separately in [`positions_count_bytes`].
+    const CASES: &[(&str, &[Position])] = &[
+        // One space at either end and not both is the whole rule.
+        ("`a`\n", &[]),
+        ("` a`\n", &[(1, 2)]),
+        ("`a `\n", &[(1, 3)]),
+        ("` a `\n", &[]),
+        ("`  a  `\n", &[(1, 2), (1, 5)]),
+        ("`  a`\n", &[(1, 2)]),
+        ("`a  `\n", &[(1, 3)]),
+        ("`\ta`\n", &[(1, 2)]),
+        ("`a\t`\n", &[(1, 3)]),
+        ("` `\n", &[]),
+        ("`  `\n", &[]),
+        ("`` a``\n", &[(1, 3)]),
+        ("``  `a`  ``\n", &[(1, 4), (1, 8)]),
+        ("`` `a` ``\n", &[]),
+        ("```  a  ```\n", &[(1, 4), (1, 7)]),
+        // Only the first and last line of a multi-line span are examined.
+        ("`a\nb`\n", &[]),
+        ("` a\nb`\n", &[(1, 2)]),
+        ("`a\nb `\n", &[(2, 2)]),
+        ("`a\n b`\n", &[]),
+        ("`a \nb`\n", &[]),
+        ("` a\nb `\n", &[]),
+        ("`` ``\n", &[]),
+        ("```a```\n", &[]),
+        // The same span in every inline context, and the ones that are not spans at all.
+        ("x ` a` y `b ` z\n", &[(1, 4), (1, 12)]),
+        ("# h ` a`\n", &[(1, 6)]),
+        ("> ` a`\n", &[(1, 4)]),
+        ("- ` a`\n", &[(1, 4)]),
+        ("| h |\n|---|\n| ` a` |\n", &[(3, 4)]),
+        ("[` a`](http://x)\n", &[(1, 3)]),
+        ("**` a`**\n", &[(1, 4)]),
+        ("` a``b `\n", &[]),
+        ("<div>` a`</div>\n", &[]),
+        ("$x` a`y$\n", &[]),
+        ("` a`\n\n`b `\n", &[(1, 2), (3, 3)]),
+        // Line endings, and content that is nothing but whitespace.
+        ("`a \n`\n", &[(1, 3)]),
+        ("`\n a`\n", &[(2, 1)]),
+        ("`a\n`\n", &[]),
+        ("`\n`\n", &[]),
+        ("` \n `\n", &[]),
+        ("`  a\n  b  `\n", &[(1, 2), (2, 4)]),
+        ("`a\r\nb `\n", &[(2, 2)]),
+        ("`a\rb `\n", &[(2, 2)]),
+        ("` x\ny `\n", &[]),
+        // Whitespace other than a space, and delimiters longer than one backtick.
+        ("`\t\ta`\n", &[(1, 2)]),
+        ("` \u{a0}a`\n", &[(1, 2)]),
+        ("`a\u{a0} `\n", &[(1, 3)]),
+        ("`` a` `\n", &[]),
+        ("``a ``\n", &[(1, 4)]),
+        ("` \t `\n", &[]),
+        ("`\t `\n", &[]),
+        ("` \t`\n", &[]),
+        ("`   `\n", &[]),
+        ("` \u{b} a`\n", &[(1, 2)]),
+        ("``  a  ``\n", &[(1, 3), (1, 6)]),
+        ("`  ``a``  `\n", &[(1, 3), (1, 9)]),
+        ("` `` `\n", &[]),
+        ("``` `\n", &[]),
+        ("` ```\n", &[]),
+        ("`\u{2003}a`\n", &[(1, 2)]),
+        ("`a\u{2003}`\n", &[(1, 3)]),
+    ];
 
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 0);
+    #[test]
+    fn matches_markdownlint() {
+        for &(source, expected) in CASES {
+            assert_eq!(expected, positions(source).as_slice(), "source {source:?}");
+        }
     }
 
+    /// A line separator before the reported space. markdownlint counts UTF-16 units, quickmark
+    /// counts bytes, and U+2028 is three of one and one of the other. That is the byte-column
+    /// convention every rule shares, not an MD038 difference.
     #[test]
-    fn test_no_violations_single_space_padding() {
-        // Single leading and trailing space is allowed by CommonMark spec
-        let config = test_config();
-        let input = "This has ` code ` spans with single space padding.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 0);
+    fn positions_count_bytes() {
+        // markdownlint: [(1, 5)]
+        assert_eq!(vec![(1, 7)], positions("`a\u{2028}b `\n"));
     }
 
+    /// A code span the parser did not close is text, so its backticks and spaces are none of this
+    /// rule's business.
     #[test]
-    fn test_no_violations_code_spans_only_spaces() {
-        // Code spans containing only spaces should be allowed
-        let config = test_config();
-        let input = "This has `   ` code spans with only spaces.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 0);
-    }
-
-    #[test]
-    fn test_violations_multiple_leading_spaces() {
-        let config = test_config();
-        let input = "This has `  code` with multiple leading spaces.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 1);
-    }
-
-    #[test]
-    fn test_violations_multiple_trailing_spaces() {
-        let config = test_config();
-        let input = "This has `code  ` with multiple trailing spaces.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 1);
-    }
-
-    #[test]
-    fn test_violations_multiple_leading_and_trailing_spaces() {
-        let config = test_config();
-        let input = "This has `  code  ` with multiple leading and trailing spaces.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 2);
-    }
-
-    #[test]
-    fn test_violations_tabs_instead_of_spaces() {
-        let config = test_config();
-        let input = "This has `\tcode\t` with tabs.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 2);
-    }
-
-    #[test]
-    fn test_violations_mixed_whitespace() {
-        let config = test_config();
-        let input = "This has ` \tcode \t` with mixed whitespace.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 2);
-    }
-
-    #[test]
-    fn test_violations_only_leading_spaces() {
-        let config = test_config();
-        let input = "This has `  code` with only leading spaces.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 1);
-    }
-
-    #[test]
-    fn test_violations_only_trailing_spaces() {
-        let config = test_config();
-        let input = "This has `code  ` with only trailing spaces.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 1);
-    }
-
-    #[test]
-    fn test_no_violations_double_backtick_code_spans() {
-        let config = test_config();
-        let input = "This has ``valid code`` with double backticks.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 0);
-    }
-
-    #[test]
-    fn test_violations_double_backtick_with_spaces() {
-        let config = test_config();
-        let input = "This has ``  code  `` with double backticks and spaces.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 2);
-    }
-
-    #[test]
-    fn test_multiple_code_spans_on_same_line() {
-        let config = test_config();
-        let input = "This has `valid` and `  invalid  ` code spans.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 2);
-    }
-
-    #[test]
-    fn test_code_spans_in_different_contexts() {
-        let config = test_config();
-        let input = "# Heading with `  invalid  ` code span
-
-Paragraph with `valid` and `  invalid  ` spans.
-
-- List item with `  invalid  ` code span
-- Another item with `valid` span
-
-> Blockquote with `  invalid  ` code span";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 8); // 2 violations per invalid span (leading + trailing)
-    }
-
-    #[test]
-    fn test_no_violations_empty_code_span() {
-        let config = test_config();
-        let input = "This has `` empty code spans.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 0);
-    }
-
-    #[test]
-    fn test_code_span_with_backtick_content() {
-        // Test code span that contains backticks - should use double backticks
-        let config = test_config();
-        let input = "This shows `` ` `` a backtick character.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        // Single space padding is allowed in this case
-        assert_eq!(md038_violations.len(), 0);
-    }
-
-    #[test]
-    fn test_code_span_with_backtick_content_extra_spaces() {
-        // Test code span that contains backticks with extra spaces
-        let config = test_config();
-        let input = "This shows ``  `  `` a backtick with extra spaces.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        let md038_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule().id == "MD038")
-            .collect();
-        assert_eq!(md038_violations.len(), 2);
+    fn an_unclosed_run_is_not_a_code_span() {
+        assert!(positions("This has `` empty code spans.\n").is_empty());
+        assert!(positions("a ` b\n").is_empty());
+        assert!(positions("a `` b ` c\n").is_empty());
     }
 }
