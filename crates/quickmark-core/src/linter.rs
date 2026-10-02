@@ -103,6 +103,8 @@ pub struct Context {
     pub node_cache: RefCell<HashMap<&'static str, Vec<NodeInfo>>>,
     /// Original document content for byte-based access - initialized once per document
     pub document_content: RefCell<String>,
+    /// Byte offset of each line's first byte, indexed by row. Backs [`Context::point_at`].
+    line_starts: Vec<usize>,
 }
 
 /// Lightweight node information for caching
@@ -134,6 +136,13 @@ impl Context {
                 .collect()
         };
         let node_cache = Self::build_node_cache(tree);
+        let line_starts: Vec<usize> = if source.is_empty() {
+            vec![0]
+        } else {
+            (0..index.line_count())
+                .map(|row| index.line_start_byte(row) as usize)
+                .collect()
+        };
 
         Self {
             file_path,
@@ -141,6 +150,21 @@ impl Context {
             lines: RefCell::new(lines),
             node_cache: RefCell::new(node_cache),
             document_content: RefCell::new(source.to_string()),
+            line_starts,
+        }
+    }
+
+    /// The row and column a byte offset falls on. Columns count UTF-8 bytes from the start of the
+    /// line, which is what every position in [`crate::ast`] means, so a violation built from this
+    /// lines up with the nodes around it.
+    pub fn point_at(&self, byte: usize) -> ast::Point {
+        let row = self
+            .line_starts
+            .partition_point(|&start| start <= byte)
+            .saturating_sub(1);
+        ast::Point {
+            row,
+            column: byte - self.line_starts[row],
         }
     }
 

@@ -51,17 +51,16 @@ impl MD034Linter {
 
             // Skip if this link is already properly formatted
             if !self.is_link_properly_formatted(text, link_start, link_text, link.kind()) {
+                // The URL's own bytes, not an offset from the paragraph's first line: a bare URL on
+                // a wrapped continuation line belongs to that line, and adding a byte offset to the
+                // paragraph's column put every such URL on the paragraph's first line instead.
+                let start_byte = paragraph_range.start_byte + link_start;
+                let end_byte = paragraph_range.start_byte + link_end;
                 let violation_range = crate::ast::NodeRange {
-                    start_byte: paragraph_range.start_byte + link_start,
-                    end_byte: paragraph_range.start_byte + link_end,
-                    start_point: crate::ast::Point {
-                        row: paragraph_range.start_point.row,
-                        column: paragraph_range.start_point.column + link_start,
-                    },
-                    end_point: crate::ast::Point {
-                        row: paragraph_range.start_point.row,
-                        column: paragraph_range.start_point.column + link_end,
-                    },
+                    start_byte,
+                    end_byte,
+                    start_point: self.context.point_at(start_byte),
+                    end_point: self.context.point_at(end_byte),
                 };
 
                 self.violations.push(RuleViolation::new(
@@ -500,5 +499,46 @@ Use <https://angle-bracketed.com> or `https://code-span.com`.
 
         assert!(violation_contexts.contains(&"https://müller.example".to_string()));
         assert!(violation_contexts.contains(&"ünser@müller.example".to_string()));
+    }
+
+    /// A wrapped paragraph is one node spanning several lines, so a URL's position has to come from
+    /// its own bytes. Attributing it to the node's first line put every wrapped URL on the wrong
+    /// line — measured, that was 353 misplaced reports on the vault corpus.
+    ///
+    /// Every expectation is a markdownlint-cli2 0.23.3 measurement, converted to 0-based.
+    #[test]
+    fn test_reports_the_line_the_url_is_on() {
+        fn positions(input: &str) -> Vec<(usize, usize)> {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD034")
+                .map(|v| {
+                    (
+                        v.location().range.start.line,
+                        v.location().range.start.character,
+                    )
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            vec![(0, 4), (1, 4)],
+            positions("one https://a.example/x\ntwo https://b.example/y\n")
+        );
+        assert_eq!(
+            vec![(1, 2)],
+            positions("text before\n  https://example.com/a\n")
+        );
+        assert_eq!(
+            vec![(1, 2)],
+            positions("> quoted\n> https://example.com/a\n")
+        );
+        assert_eq!(
+            vec![(1, 9)],
+            positions("para one\npara two https://example.com/a\npara three\n")
+        );
     }
 }

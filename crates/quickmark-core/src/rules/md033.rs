@@ -32,7 +32,6 @@ pub(crate) struct MD033Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
     allowed_elements: HashSet<String>,
-    line_starts: Vec<usize>,
 }
 
 impl MD033Linter {
@@ -48,38 +47,16 @@ impl MD033Linter {
             .map(|element| element.to_lowercase())
             .collect();
 
-        // Pre-calculate line starts for efficient line/col lookup
-        let line_starts: Vec<usize> = std::iter::once(0)
-            .chain(
-                context
-                    .document_content
-                    .borrow()
-                    .match_indices('\n')
-                    .map(|(i, _)| i + 1),
-            )
-            .collect();
-
         Self {
             context,
             violations: Vec::new(),
             allowed_elements,
-            line_starts,
         }
     }
 
     fn is_allowed_element(&self, element_name: &str) -> bool {
         // O(1) lookup in pre-computed HashSet
         self.allowed_elements.contains(&element_name.to_lowercase())
-    }
-
-    fn byte_to_line_col(&self, byte_pos: usize) -> (usize, usize) {
-        let line = match self.line_starts.binary_search(&byte_pos) {
-            Ok(line) => line,
-            Err(line) => line - 1,
-        };
-        let line_start = self.line_starts[line];
-        let col = byte_pos - line_start;
-        (line, col)
     }
 
     fn process_html_in_node(&mut self, node: &Node) {
@@ -146,21 +123,13 @@ impl MD033Linter {
                     // Calculate precise position of the HTML tag
                     let tag_start_byte = start_byte + tag_start;
                     let tag_end_byte = start_byte + tag_end;
-                    let (start_line, start_col) = self.byte_to_line_col(tag_start_byte);
-                    let (end_line, end_col) = self.byte_to_line_col(tag_end_byte);
 
                     // Create precise crate::ast::NodeRange for this violation
                     let range = range_from_node_range(&crate::ast::NodeRange {
                         start_byte: tag_start_byte,
                         end_byte: tag_end_byte,
-                        start_point: crate::ast::Point {
-                            row: start_line,
-                            column: start_col,
-                        },
-                        end_point: crate::ast::Point {
-                            row: end_line,
-                            column: end_col,
-                        },
+                        start_point: self.context.point_at(tag_start_byte),
+                        end_point: self.context.point_at(tag_end_byte),
                     });
 
                     let violation = RuleViolation::new(

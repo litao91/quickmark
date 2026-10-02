@@ -51,23 +51,14 @@ pub(crate) struct MD050Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
     first_strong_marker: Option<StrongMarkerType>,
-    line_start_bytes: Vec<usize>,
 }
 
 impl MD050Linter {
     pub fn new(context: Rc<Context>) -> Self {
-        let line_start_bytes = {
-            let content = context.get_document_content();
-            std::iter::once(0)
-                .chain(content.match_indices('\n').map(|(i, _)| i + 1))
-                .collect()
-        };
-
         Self {
             context,
             violations: Vec::new(),
             first_strong_marker: None,
-            line_start_bytes,
         }
     }
 
@@ -231,8 +222,8 @@ impl MD050Linter {
                         let range = crate::ast::NodeRange {
                             start_byte: char_start_byte,
                             end_byte: char_end_byte,
-                            start_point: self.byte_to_point(char_start_byte),
-                            end_point: self.byte_to_point(char_end_byte),
+                            start_point: self.context.point_at(char_start_byte),
+                            end_point: self.context.point_at(char_end_byte),
                         };
 
                         self.violations.push(RuleViolation::new(
@@ -252,12 +243,6 @@ impl MD050Linter {
                 i += 1;
             }
         }
-    }
-
-    fn byte_to_point(&self, byte_pos: usize) -> crate::ast::Point {
-        let line = self.line_start_bytes.partition_point(|&x| x <= byte_pos) - 1;
-        let column = byte_pos - self.line_start_bytes[line];
-        crate::ast::Point { row: line, column }
     }
 }
 

@@ -123,8 +123,8 @@ impl MD038Linter {
             let violation_range = crate::ast::NodeRange {
                 start_byte: content_start_byte,
                 end_byte: content_start_byte + leading_byte_len,
-                start_point: self.byte_to_point(content_start_byte),
-                end_point: self.byte_to_point(content_start_byte + leading_byte_len),
+                start_point: self.context.point_at(content_start_byte),
+                end_point: self.context.point_at(content_start_byte + leading_byte_len),
             };
 
             self.violations.push(RuleViolation::new(
@@ -158,8 +158,8 @@ impl MD038Linter {
             let violation_range = crate::ast::NodeRange {
                 start_byte: violation_start_byte,
                 end_byte: violation_end_byte,
-                start_point: self.byte_to_point(violation_start_byte),
-                end_point: self.byte_to_point(violation_end_byte),
+                start_point: self.context.point_at(violation_start_byte),
+                end_point: self.context.point_at(violation_end_byte),
             };
 
             self.violations.push(RuleViolation::new(
@@ -169,26 +169,6 @@ impl MD038Linter {
                 range_from_node_range(&violation_range),
             ));
         }
-    }
-
-    fn byte_to_point(&self, byte_pos: usize) -> crate::ast::Point {
-        let source = self.context.get_document_content();
-        let mut line = 0;
-        let mut column = 0;
-
-        for (i, ch) in source.char_indices() {
-            if i >= byte_pos {
-                break;
-            }
-            if ch == '\n' {
-                line += 1;
-                column = 0;
-            } else {
-                column += 1;
-            }
-        }
-
-        crate::ast::Point { row: line, column }
     }
 }
 

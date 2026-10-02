@@ -96,26 +96,13 @@ fn find_html_image_violations(content: &str) -> Vec<(usize, usize)> {
 pub(crate) struct MD045Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
-    line_starts: Vec<usize>,
 }
 
 impl MD045Linter {
     pub fn new(context: Rc<Context>) -> Self {
-        // Pre-calculate line starts for efficient line/col lookup
-        let line_starts: Vec<usize> = std::iter::once(0)
-            .chain(
-                context
-                    .document_content
-                    .borrow()
-                    .match_indices('\n')
-                    .map(|(i, _)| i + 1),
-            )
-            .collect();
-
         Self {
             context,
             violations: Vec::new(),
-            line_starts,
         }
     }
 
@@ -188,30 +175,12 @@ impl MD045Linter {
     }
 
     fn range_at(&self, start_byte: usize, end_byte: usize) -> NodeRange {
-        let (start_row, start_col) = self.byte_to_line_col(start_byte);
-        let (end_row, end_col) = self.byte_to_line_col(end_byte);
         NodeRange {
             start_byte,
             end_byte,
-            start_point: crate::ast::Point {
-                row: start_row,
-                column: start_col,
-            },
-            end_point: crate::ast::Point {
-                row: end_row,
-                column: end_col,
-            },
+            start_point: self.context.point_at(start_byte),
+            end_point: self.context.point_at(end_byte),
         }
-    }
-
-    fn byte_to_line_col(&self, byte_pos: usize) -> (usize, usize) {
-        let line = match self.line_starts.binary_search(&byte_pos) {
-            Ok(line) => line,
-            Err(line) => line - 1,
-        };
-        let line_start = self.line_starts[line];
-        let col = byte_pos - line_start;
-        (line, col)
     }
 }
 
