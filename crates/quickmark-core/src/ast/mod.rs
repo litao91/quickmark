@@ -132,22 +132,11 @@ pub const KIND_NAMES: &[&str] = &[
 
 /// Kinds that must stay out of [`KIND_NAMES`].
 ///
-/// No parser produces these. They appear in rule `match` arms as spellings of a kind that does not
-/// exist — `md059` asks for `"html_tag"` and `"inline_html"` where the real kind is `html_inline`,
-/// `md041` asks for `"html_flow"` where the tree emits `html_block`, `md013` asks for `"table"` and
-/// `"table_row"` where the tree emits `pipe_table` and `pipe_table_row`. Those arms have never
-/// executed and must not be "fixed" into existence by a well-meaning facade; the rules need fixing
-/// instead.
-pub const KIND_NAMES_FORBIDDEN: &[&str] = &[
-    "label",
-    "html_tag",
-    "html_flow",
-    "blockquote",
-    "code_block",
-    "table",
-    "table_row",
-    "inline_html",
-];
+/// No parser produces these. `md041` spells four kinds this way in `is_html_comment` and
+/// `is_content_node` where the tree emits `html_block`, `block_quote` and `pipe_table`, so those arms
+/// have never executed and must not be "fixed" into existence by a well-meaning facade — the rule
+/// needs fixing instead.
+pub const KIND_NAMES_FORBIDDEN: &[&str] = &["html_flow", "blockquote", "code_block", "table"];
 
 impl Kind {
     pub fn name(self) -> &'static str {
@@ -162,10 +151,11 @@ impl Kind {
     /// Whether this kind lives under an `inline` node.
     ///
     /// Inline nodes are in the tree but are neither fed to rules nor cached — see
-    /// [`crate::linter::MultiRuleLinter`]. Nine rules have both a dead `match` arm on an inline kind
-    /// and a live regex path over the enclosing `inline` text, so feeding them would report every
-    /// violation twice. A rule opts in by walking into `inline` itself and deleting its regex path
-    /// in the same change.
+    /// [`crate::linter::MultiRuleLinter`]. md037, md039, md042, md044, md049, md050, md051, md052
+    /// and md053 each still have a dead `match` arm on an inline kind next to a live regex path over
+    /// the enclosing `inline` text, so feeding them would report every violation twice. A rule opts
+    /// in by walking into `inline` itself and deleting its regex path in the same change; md045 is
+    /// what that looks like when it is finished.
     pub fn is_inline(self) -> bool {
         matches!(
             self,

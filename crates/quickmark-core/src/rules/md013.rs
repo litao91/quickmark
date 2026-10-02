@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::ast::Node;
@@ -52,6 +53,9 @@ impl Default for MD013LineLengthTable {
 pub(crate) struct MD013Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
+    heading_lines: HashSet<usize>,
+    code_lines: HashSet<usize>,
+    table_lines: HashSet<usize>,
 }
 
 impl MD013Linter {
@@ -59,25 +63,56 @@ impl MD013Linter {
         Self {
             context,
             violations: Vec::new(),
+            heading_lines: HashSet::new(),
+            code_lines: HashSet::new(),
+            table_lines: HashSet::new(),
         }
     }
 
-    /// Analyze all lines and store all violations for reporting via finalize()
-    /// Context cache is already initialized by MultiRuleLinter
+    /// Records every 0-based line the node covers. A block's end row is the row *after* its last
+    /// content row, because block ends swallow the trailing newline; at EOF without one the end row
+    /// is the last content row itself. markdownlint's tokens end on their last content line, so the
+    /// two need this compensation to agree.
+    fn cover(lines: &mut HashSet<usize>, node: &Node) {
+        let start = node.start_position().row;
+        let end = node.end_position();
+        let last = if end.column == 0 {
+            end.row.saturating_sub(1).max(start)
+        } else {
+            end.row
+        };
+        lines.extend(start..=last);
+    }
+
+    /// Runs once every node has been fed, so it lives in `finalize` rather than in `feed`.
     fn analyze_all_lines(&mut self) {
+        let settings = &self.context.config.linters.settings.line_length;
         let lines = self.context.lines.borrow();
 
         for (line_index, line) in lines.iter().enumerate() {
-            let node_kind = self.context.get_node_type_for_line(line_index);
-            let should_check = self.should_check_node_type(node_kind);
-            let should_violate = if should_check {
-                self.should_violate_line(line, line_index, node_kind)
+            let in_code = self.code_lines.contains(&line_index);
+            let is_heading = self.heading_lines.contains(&line_index);
+            let in_table = self.table_lines.contains(&line_index);
+
+            if (in_code && !settings.code_blocks)
+                || (is_heading && !settings.headings)
+                || (in_table && !settings.tables)
+            {
+                continue;
+            }
+
+            // markdownlint's precedence: a code line is measured against the code limit even when it
+            // is also something else, then headings, then everything else at the plain limit.
+            let limit = if in_code {
+                settings.code_block_line_length
+            } else if is_heading {
+                settings.heading_line_length
             } else {
-                false
+                settings.line_length
             };
 
-            if should_violate {
-                let violation = self.create_violation_for_line(line, line_index, node_kind);
+            if self.should_violate_line(line, limit) {
+                let violation = self.create_violation_for_line(line, line_index, limit);
                 self.violations.push(violation);
             }
         }
@@ -121,60 +156,8 @@ impl MD013Linter {
         !beyond_limit.contains(' ')
     }
 
-    fn should_check_node_type(&self, node_kind: &str) -> bool {
+    fn should_violate_line(&self, line: &str, limit: usize) -> bool {
         let settings = &self.context.config.linters.settings.line_length;
-        match node_kind {
-            // Heading nodes
-            s if s.starts_with("atx_h") && s.ends_with("_marker") => settings.headings,
-            s if s.starts_with("setext_h") && s.ends_with("_underline") => settings.headings,
-            "atx_heading" | "setext_heading" => settings.headings,
-            // Code block nodes
-            "fenced_code_block" | "indented_code_block" | "code_fence_content" => {
-                settings.code_blocks
-            }
-            // Table nodes
-            "table" | "table_row" => settings.tables,
-            _ => true, // Check regular text content
-        }
-    }
-
-    fn is_heading_line(&self, line: &str) -> bool {
-        let trimmed = line.trim_start();
-        // ATX headings start with #
-        trimmed.starts_with('#') && (trimmed.len() > 1 && trimmed.chars().nth(1) == Some(' '))
-    }
-
-    fn get_line_limit(&self, node_kind: &str) -> usize {
-        let settings = &self.context.config.linters.settings.line_length;
-        match node_kind {
-            // Heading nodes
-            s if s.starts_with("atx_h") && s.ends_with("_marker") => settings.heading_line_length,
-            s if s.starts_with("setext_h") && s.ends_with("_underline") => {
-                settings.heading_line_length
-            }
-            "atx_heading" | "setext_heading" => settings.heading_line_length,
-            // Code block nodes
-            "fenced_code_block" | "indented_code_block" | "code_fence_content" => {
-                settings.code_block_line_length
-            }
-            _ => settings.line_length,
-        }
-    }
-
-    fn should_violate_line(&self, line: &str, _line_number: usize, node_kind: &str) -> bool {
-        let settings = &self.context.config.linters.settings.line_length;
-
-        // Check if this is a heading line and headings are disabled
-        if self.is_heading_line(line) && !settings.headings {
-            return false;
-        }
-
-        // Skip if this node type shouldn't be checked
-        if !self.should_check_node_type(node_kind) {
-            return false;
-        }
-
-        let limit = self.get_line_limit(node_kind);
 
         // Check if line exceeds limit
         if line.len() <= limit {
@@ -218,9 +201,8 @@ impl MD013Linter {
         &self,
         line: &str,
         line_number: usize,
-        node_kind: &str,
+        limit: usize,
     ) -> RuleViolation {
-        let limit = self.get_line_limit(node_kind);
         RuleViolation::new(
             &MD013,
             format!(
@@ -248,15 +230,16 @@ impl MD013Linter {
 
 impl RuleLinter for MD013Linter {
     fn feed(&mut self, node: &Node) {
-        // Analyze all lines when we see the document node
-        // Context cache is already initialized by MultiRuleLinter
-        if node.kind() == "document" {
-            self.analyze_all_lines();
+        match node.kind() {
+            "atx_heading" | "setext_heading" => Self::cover(&mut self.heading_lines, node),
+            "fenced_code_block" | "indented_code_block" => Self::cover(&mut self.code_lines, node),
+            "pipe_table" => Self::cover(&mut self.table_lines, node),
+            _ => {}
         }
     }
 
     fn finalize(&mut self) -> Vec<RuleViolation> {
-        // Return all pending violations at once
+        self.analyze_all_lines();
         std::mem::take(&mut self.violations)
     }
 }
@@ -267,7 +250,13 @@ pub const MD013: Rule = Rule {
     tags: &["line_length"],
     description: "Line length should not exceed the configured limit",
     rule_type: RuleType::Line,
-    required_nodes: &[], // Line-based rules don't require specific nodes
+    required_nodes: &[
+        "atx_heading",
+        "setext_heading",
+        "fenced_code_block",
+        "indented_code_block",
+        "pipe_table",
+    ],
     new_linter: |context| Box::new(MD013Linter::new(context)),
 };
 
@@ -588,6 +577,107 @@ mod test {
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(0, violations.len());
+    }
+
+    /// Everything below is a markdownlint-cli2 0.23.3 measurement at `line_length = 20`, one config
+    /// per assertion; the expected lines are `range.start.line`, which is 0-based, so they are one
+    /// less than the line markdownlint prints.
+    ///
+    /// `headings` and `tables` were inert until MD013 stopped asking the node cache which kind a line
+    /// belonged to. That lookup picked the smallest covering node, and on a heading or table line
+    /// several nodes tie, so `HashMap` iteration order decided the answer and the same document could
+    /// lint differently in two processes.
+    #[test]
+    fn test_headings_disabled_covers_every_heading_shape() {
+        fn lines(input: &str, headings: bool) -> Vec<usize> {
+            let config = test_config_with_line_length(MD013LineLengthTable {
+                line_length: 20,
+                heading_line_length: 20,
+                code_block_line_length: 20,
+                headings,
+                ..MD013LineLengthTable::default()
+            });
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+            linter
+                .analyze()
+                .iter()
+                .map(|v| v.location().range.start.line)
+                .collect()
+        }
+
+        // `## …` was never exempt before: the text heuristic only recognised `# `. The exemption has
+        // to stop at the heading's last line, so the paragraph on line 4 is still reported.
+        let atx = "# H\n\n## a heading whose last word is way out here\n\
+                   a paragraph line whose last word is way out here\n";
+        assert_eq!(lines(atx, true), vec![2, 3]);
+        assert_eq!(lines(atx, false), vec![3]);
+
+        // A setext heading spans two lines; neither is reported once headings are off.
+        let setext = "# H\n\na setext heading whose last word is out here\n\
+                      =============================================\n";
+        assert_eq!(lines(setext, true), vec![2]);
+        assert_eq!(lines(setext, false), Vec::<usize>::new());
+
+        // A heading at EOF has no trailing newline, so its end row *is* its last content row.
+        let eof = "# H\n\n## a heading whose last word is way out here";
+        assert_eq!(lines(eof, true), vec![2]);
+        assert_eq!(lines(eof, false), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_tables_disabled() {
+        fn lines(input: &str, tables: bool) -> Vec<usize> {
+            let config = test_config_with_line_length(MD013LineLengthTable {
+                line_length: 20,
+                heading_line_length: 20,
+                code_block_line_length: 20,
+                tables,
+                ..MD013LineLengthTable::default()
+            });
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+            linter
+                .analyze()
+                .iter()
+                .map(|v| v.location().range.start.line)
+                .collect()
+        }
+
+        let input = "# H\n\n| a | b |\n|---|---|\n| xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | y |\n\n\
+                     xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx paragraph after table\n";
+        assert_eq!(lines(input, true), vec![4, 6]);
+        assert_eq!(lines(input, false), vec![6]);
+    }
+
+    #[test]
+    fn test_code_blocks_disabled_covers_both_code_shapes() {
+        fn lines(input: &str, code_blocks: bool) -> Vec<usize> {
+            let config = test_config_with_line_length(MD013LineLengthTable {
+                line_length: 20,
+                heading_line_length: 20,
+                code_block_line_length: 20,
+                code_blocks,
+                ..MD013LineLengthTable::default()
+            });
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+            linter
+                .analyze()
+                .iter()
+                .map(|v| v.location().range.start.line)
+                .collect()
+        }
+
+        let fenced = "# H\n\n```text\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx inside a fence here\n```\n\
+                      xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx paragraph right after\n";
+        assert_eq!(lines(fenced, true), vec![3, 5]);
+        assert_eq!(lines(fenced, false), vec![5]);
+
+        let indented = "# H\n\n    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx indented code here\n\n\
+                        xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx paragraph after code\n";
+        assert_eq!(lines(indented, true), vec![2, 4]);
+        assert_eq!(lines(indented, false), vec![4]);
     }
 
     #[test]

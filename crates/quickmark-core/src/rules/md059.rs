@@ -84,11 +84,10 @@ impl MD059Linter {
 
 impl RuleLinter for MD059Linter {
     fn feed(&mut self, node: &Node) {
-        // Process different possible link node types
-        match node.kind() {
-            "link" => self.check_link_text(node),
-            "inline" => self.check_inline_for_links(node),
-            _ => {}
+        // `link` is an inline kind, so it is in the tree but never fed here; the regex scan over the
+        // enclosing `inline` is what finds link text.
+        if node.kind() == "inline" {
+            self.check_inline_for_links(node);
         }
     }
 
@@ -137,22 +136,6 @@ impl MD059Linter {
         }
     }
 
-    fn check_link_text(&mut self, link_node: &Node) {
-        // Extract the link text content from tree-sitter link nodes
-        if let Some(text) = self.extract_link_text(link_node) {
-            // Check if the link contains code or HTML content - if so, skip validation
-            if self.contains_allowed_elements(link_node) {
-                return;
-            }
-
-            let normalized_text = normalize_text(&text);
-
-            if self.prohibited_texts.contains(&normalized_text) {
-                self.create_violation(link_node, &text);
-            }
-        }
-    }
-
     fn check_label_for_prohibited_text(&mut self, label_text: &str, node: &Node) {
         // Check if label text contains code or HTML - if so, skip
         if label_text.contains('`') || label_text.contains('<') {
@@ -163,57 +146,6 @@ impl MD059Linter {
 
         if self.prohibited_texts.contains(&normalized_text) {
             self.create_violation(node, label_text);
-        }
-    }
-
-    fn extract_link_text(&self, link_node: &Node) -> Option<String> {
-        // Navigate the tree-sitter AST to find the link text
-        // Links in markdown have structure like: link -> label -> [text content]
-        let document_content = self.context.document_content.borrow();
-        let document_bytes = document_content.as_bytes();
-
-        // Look for label child node
-        for child in link_node.children(&mut link_node.walk()) {
-            if child.kind() == "label" {
-                // Extract text from label, excluding the brackets
-                let label_text = child.utf8_text(document_bytes).unwrap_or("");
-
-                // Remove the surrounding brackets
-                if label_text.starts_with('[') && label_text.ends_with(']') {
-                    let inner_text = &label_text[1..label_text.len() - 1];
-                    return Some(inner_text.to_string());
-                }
-            }
-        }
-
-        // Fallback: try to extract from the full link text
-        let full_text = link_node.utf8_text(document_bytes).unwrap_or("");
-        if let Some(start) = full_text.find('[') {
-            if let Some(end) = full_text[start..].find(']') {
-                let inner_text = &full_text[start + 1..start + end];
-                return Some(inner_text.to_string());
-            }
-        }
-
-        None
-    }
-
-    fn contains_allowed_elements(&self, link_node: &Node) -> bool {
-        // Check if the link contains code or HTML elements, which are allowed.
-        // This is an efficient, allocation-free, iterative pre-order traversal.
-        let allowed_types: &[&str] = &["code_span", "html_tag", "inline_html"];
-        let mut cursor = link_node.walk();
-        loop {
-            if allowed_types.contains(&cursor.node().kind()) {
-                return true;
-            }
-            if !cursor.goto_first_child() {
-                while !cursor.goto_next_sibling() {
-                    if !cursor.goto_parent() {
-                        return false;
-                    }
-                }
-            }
         }
     }
 
@@ -248,7 +180,7 @@ pub const MD059: Rule = Rule {
     tags: &["accessibility", "links"],
     description: "Link text should be descriptive",
     rule_type: RuleType::Token,
-    required_nodes: &["link", "inline"],
+    required_nodes: &["inline"],
     new_linter: |context| Box::new(MD059Linter::new(context)),
 };
 

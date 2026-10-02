@@ -72,22 +72,6 @@ impl MD033Linter {
         self.allowed_elements.contains(&element_name.to_lowercase())
     }
 
-    fn is_in_code_context(&self, node: &Node) -> bool {
-        // Check if this node is inside a code span or code block
-        let mut current = node.parent();
-        while let Some(parent) = current {
-            match parent.kind() {
-                "code_span" | "fenced_code_block" | "indented_code_block" => {
-                    return true;
-                }
-                _ => {
-                    current = parent.parent();
-                }
-            }
-        }
-        false
-    }
-
     fn byte_to_line_col(&self, byte_pos: usize) -> (usize, usize) {
         let line = match self.line_starts.binary_search(&byte_pos) {
             Ok(line) => line,
@@ -194,19 +178,10 @@ impl MD033Linter {
 
 impl RuleLinter for MD033Linter {
     fn feed(&mut self, node: &Node) {
-        // Process inline and html_block nodes that may contain HTML
         match node.kind() {
-            "inline" => {
-                // Check if this inline node is inside a code span by looking at its parent
-                if !self.is_in_code_context(node) {
-                    self.process_html_in_node(node);
-                }
-            }
-            "html_block" => {
-                // HTML blocks should always be processed unless they are in code blocks
-                // But html_block nodes are typically not inside code blocks by tree-sitter design
-                self.process_html_in_node(node);
-            }
+            // A code span is a leaf, so nothing inside one is ever fed here; the spans are masked
+            // out of the raw text by `process_html_in_node` instead.
+            "inline" | "html_block" => self.process_html_in_node(node),
             _ => (),
         }
     }

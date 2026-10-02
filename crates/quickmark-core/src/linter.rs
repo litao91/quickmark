@@ -156,9 +156,8 @@ impl Context {
     /// and each kind's bucket comes out line-sorted — the property `md046` and `md048` relied on
     /// when they re-sorted defensively.
     ///
-    /// Inline nodes are left out. `get_node_type_for_line` picks the smallest node covering a line
-    /// and every inline node is smaller than the block around it, so caching them would change which
-    /// kind MD013 sees on every line.
+    /// Inline nodes are left out, so `get_nodes` hands a rule one entry per *block* of the kind it
+    /// asked for and never an inline descendant it did not.
     fn build_node_cache(tree: &FacadeTree) -> HashMap<&'static str, Vec<NodeInfo>> {
         let mut cache: HashMap<&'static str, Vec<NodeInfo>> = HashMap::new();
         for index in 0..tree.node_count() {
@@ -185,28 +184,6 @@ impl Context {
             }
         }
         result
-    }
-
-    /// Get the most specific node type that contains a given line number
-    pub fn get_node_type_for_line(&self, line_number: usize) -> &'static str {
-        let cache = self.node_cache.borrow();
-        // Find the most specific (smallest range) node that contains this line
-        let mut best_match: Option<&NodeInfo> = None;
-        let mut smallest_range = usize::MAX;
-
-        for nodes in cache.values() {
-            for node in nodes {
-                if line_number >= node.line_start && line_number <= node.line_end {
-                    let range_size = node.line_end - node.line_start;
-                    if range_size < smallest_range {
-                        smallest_range = range_size;
-                        best_match = Some(node);
-                    }
-                }
-            }
-        }
-
-        best_match.map(|n| n.kind).unwrap_or("text")
     }
 }
 
@@ -423,12 +400,11 @@ Second heading
         assert_eq!(2, violations[1].location().range.start.line);
     }
 
-    /// The node cache must hold block kinds only. `get_node_type_for_line` picks the smallest node
-    /// covering a line, and every inline node is smaller than the block around it, so caching them
-    /// would change which kind MD013 sees on every line of every document.
+    /// The node cache must hold block kinds only, so that `get_nodes` returns one entry per block of
+    /// the kind a rule asked for and never an inline descendant it did not ask for.
     ///
     /// The matching invariant for `feed` — that no rule is handed an inline node — is asserted by the
-    /// exact violation counts in md037, md039, md042, md044, md049, md050, md051, md052 and md059,
+    /// exact violation counts in md037, md039, md042, md044, md049, md050, md051, md052 and md053,
     /// each of which has a dead `match` arm that would double-report if it were fed.
     #[test]
     fn node_cache_holds_no_inline_kinds() {
