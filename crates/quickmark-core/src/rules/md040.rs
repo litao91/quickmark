@@ -35,16 +35,22 @@ impl MD040Linter {
     /// Returns `(Option<language>, has_extra_info)`. The language is a slice
     /// of the input line to avoid allocations.
     fn extract_code_block_language<'a>(&self, line: &'a str) -> (Option<&'a str>, bool) {
-        let trimmed = line.trim_start();
-        let marker = if trimmed.starts_with("```") {
-            "```"
-        } else if trimmed.starts_with("~~~") {
-            "~~~"
-        } else {
+        // A fenced block inside a block quote or a list item opens on a line that starts with that
+        // container's prefix, so `- ```sql` and `> ```java` need it skipped before the fence. The
+        // indent limit is unlimited because the tree has already settled that this line opens a
+        // fence: inside a list item the fence sits at the item's content column, which is further
+        // right than the three spaces CommonMark allows at document level.
+        let content = &line[crate::ast::synth::content_column(line.as_bytes(), usize::MAX)..];
+        let bytes = content.as_bytes();
+        let Some(marker) = bytes.first().copied().filter(|&b| b == b'`' || b == b'~') else {
             return (None, false);
         };
 
-        let info_string = trimmed[marker.len()..].trim();
+        // The fence is the whole run, not the first three characters: ```` opens a four-backtick
+        // fence whose info string starts after the fourth, and taking only three left a stray
+        // backtick behind and read it as the language.
+        let run = bytes.iter().take_while(|&&b| b == marker).count();
+        let info_string = content[run..].trim();
 
         if info_string.is_empty() {
             return (None, false);
@@ -520,5 +526,48 @@ def hello():
 
         // Should find 1 violation: the first block has no language
         assert_eq!(md040_violations.len(), 1);
+    }
+    /// A fence inside a container opens on a line that starts with the container's prefix, and the
+    /// fence itself is the whole run of backticks or tildes rather than the first three. Getting
+    /// either wrong reads the language as missing. Every expectation is a markdownlint-cli2 0.23.3
+    /// measurement.
+    #[test]
+    fn test_reads_the_info_string_past_container_prefixes_and_long_fences() {
+        fn rows(input: &str) -> Vec<usize> {
+            let mut linter = MultiRuleLinter::new_for_document(
+                PathBuf::from("test.md"),
+                test_config_default(),
+                input,
+            );
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD040")
+                .map(|v| v.location().range.start.line)
+                .collect()
+        }
+
+        // The language is there, behind a list marker, a quote marker, both, and an ordered marker.
+        assert!(rows("- ```sql\n  x\n").is_empty());
+        assert!(rows("> ```java\n> x\n").is_empty());
+        assert!(rows("> - ```py\n>   x\n").is_empty());
+        assert!(rows("1. ```js\n   x\n").is_empty());
+        assert!(rows("  > ```py\n  > x\n").is_empty());
+
+        // Inside a list item the fence sits at the item's content column, further right than the
+        // three spaces allowed at document level.
+        assert!(rows("1. step\n\n   sub\n\n      ```java\n      x\n").is_empty());
+
+        // The fence is the whole run, so a stray backtick is not the language.
+        assert!(rows("- a\n- ````````txt\n  x\n").is_empty());
+        assert!(rows("`````lang\nx\n`````\n").is_empty());
+        assert!(rows("```py{#id}\nx\n```\n").is_empty());
+
+        // And the ones that genuinely have no language, including a long fence with no info string.
+        assert_eq!(vec![0], rows("````\nx\n````\n"));
+        assert_eq!(vec![0], rows("~~~\nx\n~~~\n"));
+        assert_eq!(vec![0], rows("> ```\n> x\n"));
+        assert_eq!(vec![0], rows("- ```\n  x\n"));
+        assert_eq!(vec![0], rows("   ```\n   x\n"));
     }
 }

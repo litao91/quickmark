@@ -283,19 +283,35 @@ pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
     regions
 }
 
-/// The column a line's `$` run starts at and how long it is, once leading indentation, any block
-/// quote markers and a list marker are removed — or `None` when the line does not open with a run of
-/// at least two `$`.
+/// The column a line's `$` run starts at and how long it is — or `None` when the line does not open
+/// with a run of at least two `$` once [`content_column`] has skipped the container prefixes.
 ///
-/// `indent` is how many leading spaces may precede the run. Three at document level, where four would
-/// make the line an indented code block; for a region's *closer* it is the column the region opened
-/// at plus three, because inside a list item the whole block sits that much further right and a
-/// closer indented four from the margin is only two past the item's content column.
-///
-/// Only the opener's own line carries a list marker; the closer lines that follow are indented to the
-/// item's content column and start with their `$` run directly.
+/// For a region's *closer*, `indent` is the column the region opened at plus three, because inside a
+/// list item the whole block sits that much further right and a closer indented four from the margin
+/// is only two past the item's content column. Only the opener's own line carries a list marker; the
+/// closer lines that follow are indented to the item's content column and start with their `$` run
+/// directly.
 fn dollar_run(lines: &LineIndex<'_>, row: usize, indent: usize) -> Option<(usize, usize)> {
     let bytes = lines.content(row).as_bytes();
+    let start = content_column(bytes, indent);
+    let mut column = start;
+    while bytes.get(column) == Some(&b'$') {
+        column += 1;
+    }
+    (column - start >= 2).then_some((start, column - start))
+}
+
+/// Where a line's own content begins, once up to `indent` spaces of indentation, any block quote
+/// markers and one list marker have been skipped.
+///
+/// `indent` is how many leading spaces may precede the content. Three at document level, where four
+/// would make the line an indented code block; for something inside a list item it is the column the
+/// item's content starts at plus three, because a line indented four from the margin is only two past
+/// the item's content column.
+///
+/// Only a container's *first* line carries its list marker; the lines that follow are indented to the
+/// item's content column and start with their own content directly.
+pub(crate) fn content_column(bytes: &[u8], indent: usize) -> usize {
     let mut column = 0usize;
     let mut limit = indent;
     loop {
@@ -334,11 +350,7 @@ fn dollar_run(lines: &LineIndex<'_>, row: usize, indent: usize) -> Option<(usize
             _ => break,
         }
     }
-    let start = column;
-    while bytes.get(column) == Some(&b'$') {
-        column += 1;
-    }
-    (column - start >= 2).then_some((start, column - start))
+    column
 }
 
 /// The column a list item's content starts at, given the column just after its marker. One to four
