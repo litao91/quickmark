@@ -11,21 +11,39 @@ use crate::{
 pub(crate) struct MD034Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
+    finder: LinkFinder,
 }
 
 impl MD034Linter {
     pub fn new(context: Rc<Context>) -> Self {
+        // linkify only looks for scheme-less domains when told to, and GFM autolinks `www.example.com`
+        // without a scheme. Everything else it would find that way — `example.com`, `foo.bar` — is
+        // literal text to micromark, so `is_gfm_autolink` filters it back out.
+        let mut finder = LinkFinder::new();
+        finder.url_must_have_scheme(false);
         Self {
             context,
             violations: Vec::new(),
+            finder,
         }
     }
 }
 
+/// Whether `url` starts with one of the schemes GFM's autolink-literal extension recognises. Those,
+/// plus email addresses, are the only things micromark turns into a `literalAutolink` token, so
+/// `ftp://`, `file://`, `git://` and `oss://` are literal text and MD034 must leave them alone.
+fn is_gfm_autolink(url: &str) -> bool {
+    ["http://", "https://", "www."].iter().any(|scheme| {
+        url.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    })
+}
+
 impl RuleLinter for MD034Linter {
     fn feed(&mut self, node: &Node) {
-        // Process paragraph nodes to find bare URLs within them
-        if node.kind() == "paragraph" {
+        // `inline`, not `paragraph`: micromark's `literalAutolink` tokens live in headings and table
+        // cells too, and matching only paragraphs left every bare URL in a table unreported.
+        if node.kind() == "inline" {
             let content = self.context.document_content.borrow();
             let text = node.utf8_text(content.as_bytes()).unwrap_or("").to_string();
             let node_range = node.range();
@@ -42,9 +60,7 @@ impl RuleLinter for MD034Linter {
 
 impl MD034Linter {
     fn check_for_bare_urls_in_text(&mut self, text: &str, paragraph_range: &crate::ast::NodeRange) {
-        let finder = LinkFinder::new();
-
-        for link in finder.links(text) {
+        for link in self.finder.links(text) {
             let link_start = link.start();
             let link_end = link.end();
             let link_text = link.as_str();
@@ -81,7 +97,12 @@ impl MD034Linter {
         link_kind: &LinkKind,
     ) -> bool {
         match link_kind {
-            LinkKind::Url => self.is_url_properly_formatted(text, link_start, link_text),
+            // linkify recognises far more schemes than GFM's autolink-literal extension does, and
+            // only an autolinked URL is a bare one as far as markdownlint is concerned.
+            LinkKind::Url => {
+                !is_gfm_autolink(link_text)
+                    || self.is_url_properly_formatted(text, link_start, link_text)
+            }
             LinkKind::Email => self.is_email_properly_formatted(text, link_start, link_text),
             _ => true, // Other link types are not handled by MD034
         }
@@ -94,12 +115,15 @@ impl MD034Linter {
             return true;
         }
 
-        // Check if URL is in angle brackets: <https://example.com>
-        if url_start > 0 && text.chars().nth(url_start - 1) == Some('<') {
-            let url_end = url_start + url_text.len();
-            if url_end < text.len() && text.chars().nth(url_end) == Some('>') {
-                return true;
-            }
+        // Check if URL is in angle brackets: <https://example.com>. `url_start` is a byte offset, so
+        // the neighbours have to be read as bytes — indexing characters with it looked one character
+        // too far left for every non-ASCII byte upstream and missed the bracket.
+        let bytes = text.as_bytes();
+        if url_start > 0
+            && bytes[url_start - 1] == b'<'
+            && bytes.get(url_start + url_text.len()) == Some(&b'>')
+        {
+            return true;
         }
 
         // Check if URL is in markdown link: [text](https://example.com)
@@ -181,22 +205,20 @@ impl MD034Linter {
             }
         }
 
-        // Check if email is in angle brackets: <user@example.com> or <mailto:user@example.com>
+        // Check if email is in angle brackets: <user@example.com> or <mailto:user@example.com>.
+        // Byte offsets index bytes; see the same note in `is_url_properly_formatted`.
+        let bytes = text.as_bytes();
         let mut check_start = email_start;
 
         // Look backward for opening angle bracket, potentially with "mailto:" prefix
         while check_start > 0 {
-            let char_at = text.chars().nth(check_start - 1);
-            if char_at == Some('<') {
-                let email_end = email_start + email_text.len();
-                if email_end < text.len() && text.chars().nth(email_end) == Some('>') {
+            let byte_before = bytes[check_start - 1];
+            if byte_before == b'<' {
+                if bytes.get(email_start + email_text.len()) == Some(&b'>') {
                     return true;
                 }
                 break;
-            } else if char_at
-                .map(|c| c.is_alphabetic() || c == ':')
-                .unwrap_or(false)
-            {
+            } else if byte_before.is_ascii_alphabetic() || byte_before == b':' {
                 // Continue looking backward through "mailto:" prefix
                 check_start -= 1;
             } else {
@@ -241,7 +263,7 @@ pub const MD034: Rule = Rule {
     tags: &["links", "url"],
     description: "Bare URL used",
     rule_type: RuleType::Token,
-    required_nodes: &["text"], // Look for text nodes that might contain URLs
+    required_nodes: &["inline"],
     new_linter: |context| Box::new(MD034Linter::new(context)),
 };
 
@@ -540,5 +562,82 @@ Use <https://angle-bracketed.com> or `https://code-span.com`.
             vec![(1, 9)],
             positions("para one\npara two https://example.com/a\npara three\n")
         );
+    }
+
+    /// markdownlint reports a bare URL wherever micromark makes a `literalAutolink` token, which is
+    /// anywhere inline: a heading and a table cell as much as a paragraph. All measured.
+    #[test]
+    fn test_finds_bare_urls_in_headings_and_table_cells() {
+        fn count(input: &str) -> usize {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD034")
+                .count()
+        }
+
+        assert_eq!(1, count("## https://example.com/a\n"));
+        assert_eq!(
+            1,
+            count("| a | b |\n|---|---|\n| x | https://example.com/a |\n")
+        );
+        // A proper link in either place is not bare.
+        assert_eq!(0, count("## [text](https://example.com/a)\n"));
+        assert_eq!(
+            0,
+            count("| a | b |\n|---|---|\n| x | [t](https://example.com/a) |\n")
+        );
+    }
+
+    /// GFM's autolink-literal extension recognises `http://`, `https://`, `www.` and email
+    /// addresses, and nothing else. linkify finds far more schemes, so the rest have to be filtered
+    /// out — micromark leaves `oss://bucket/object` as literal text and markdownlint never reports
+    /// it. All measured.
+    #[test]
+    fn test_only_gfm_schemes_are_bare_urls() {
+        fn count(input: &str) -> usize {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD034")
+                .count()
+        }
+
+        assert_eq!(1, count("http://example.com/a\n"));
+        assert_eq!(1, count("HTTP://EXAMPLE.COM/a\n"));
+        assert_eq!(1, count("www.example.com/a\n"));
+        assert_eq!(1, count("someone@example.com\n"));
+        assert_eq!(0, count("ftp://example.com/a\n"));
+        assert_eq!(0, count("file:///tmp/x\n"));
+        assert_eq!(0, count("git://example.com/a\n"));
+        assert_eq!(0, count("oss://bucket/object.tar.gz\n"));
+        // Only the https one of the two is bare.
+        assert_eq!(1, count("oss://b/o and https://ok.example/a\n"));
+    }
+
+    /// The angle-bracket test reads the neighbours of a byte offset, so it has to index bytes. With
+    /// character indexing, every non-ASCII byte upstream shifted the test off the bracket and an
+    /// autolink after CJK text was reported as bare. Measured.
+    #[test]
+    fn test_angle_brackets_after_multibyte_text_are_not_bare() {
+        fn count(input: &str) -> usize {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD034")
+                .count()
+        }
+
+        assert_eq!(0, count("POC参考文档:<https://example.com/a> 相比ADB\n"));
+        assert_eq!(0, count("café <https://example.com/a>\n"));
+        assert_eq!(0, count("<https://example.com/a>\n"));
+        // The same line without the brackets is bare.
+        assert_eq!(1, count("see 中文 https://example.com/a here\n"));
     }
 }
