@@ -43,6 +43,32 @@ impl MD007Linter {
     }
 }
 
+/// The column just past the line's innermost block quote prefix, or zero when it has none.
+///
+/// A prefix is a `>` and the one space or tab after it; nested quotes stack, and up to three spaces
+/// of indentation may precede each level. This is markdownlint's `blockQuotePrefix`, whose end column
+/// it subtracts from a list item's start column.
+fn quote_prefix_end(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut end = 0;
+    let mut column = 0;
+    loop {
+        let indent = column;
+        while column - indent < 3 && bytes.get(column) == Some(&b' ') {
+            column += 1;
+        }
+        if bytes.get(column) != Some(&b'>') {
+            break;
+        }
+        column += 1;
+        if matches!(bytes.get(column), Some(b' ') | Some(b'\t')) {
+            column += 1;
+        }
+        end = column;
+    }
+    end
+}
+
 impl RuleLinter for MD007Linter {
     fn feed(&mut self, node: &Node) {
         if node.kind() == "list" && self.is_unordered_list(node) {
@@ -120,16 +146,23 @@ impl MD007Linter {
         }
     }
 
+    /// A list item's indentation: the column its marker sits at, less the block quote prefixes the
+    /// line carries.
+    ///
+    /// markdownlint measures the indent inside the quote, so neither the quote's marker nor the
+    /// indentation that opens it counts as one — `>   - a` is indented two, not four.
     fn get_list_item_indentation(&self, list_item: &Node) -> usize {
-        let content = self.context.document_content.borrow();
-        let start_line = list_item.start_position().row;
-
-        if let Some(line) = content.lines().nth(start_line) {
-            // Count leading spaces/tabs (treating tabs as single characters for now)
-            line.chars().take_while(|&c| c == ' ' || c == '\t').count()
-        } else {
-            0
+        let lines = self.context.lines.borrow();
+        let Some(line) = lines.get(list_item.start_position().row) else {
+            return 0;
+        };
+        let prefix = quote_prefix_end(line);
+        let bytes = line.as_bytes();
+        let mut column = prefix;
+        while matches!(bytes.get(column), Some(b' ') | Some(b'\t')) {
+            column += 1;
         }
+        column - prefix
     }
 
     fn calculate_expected_indent(
@@ -454,5 +487,61 @@ Some text
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(0, violations.len());
+    }
+
+    /// One report: markdownlint's line, and the expected and actual indent it names.
+    type Report = (usize, usize, usize);
+
+    fn reports(source: &str) -> Vec<Report> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), source);
+        linter
+            .analyze()
+            .iter()
+            .filter_map(|violation| {
+                let (expected, actual) = violation
+                    .message()
+                    .split_once("[Expected: ")
+                    .and_then(|(_, rest)| rest.split_once("; Actual: "))
+                    .and_then(|(expected, actual)| {
+                        Some((
+                            expected.parse().ok()?,
+                            actual.trim_end_matches(']').parse().ok()?,
+                        ))
+                    })?;
+                Some((violation.location().range.start.line + 1, expected, actual))
+            })
+            .collect()
+    }
+
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output with
+    /// MD007's defaults.
+    ///
+    /// The block quote cases are the point: markdownlint subtracts its `blockQuotePrefix` from the
+    /// item's column, so an indent is measured inside the quote. A tab counts as one column, which is
+    /// what makes `- a` followed by a tab-indented `- b` an actual indent of 1.
+    #[test]
+    fn matches_markdownlint() {
+        let cases: &[(&str, &[Report])] = &[
+            ("- a\n  - b\n", &[]),
+            ("- a\n    - b\n", &[(2, 2, 4)]),
+            ("> - a\n>   - b\n", &[]),
+            ("> - a\n>     - b\n", &[(2, 2, 4)]),
+            ("> > - a\n> >   - b\n", &[]),
+            ("  - a\n", &[(1, 0, 2)]),
+            ("  > - a\n", &[]),
+            ("- a\n\t- b\n", &[(2, 2, 1)]),
+            ("1. a\n   - b\n", &[]),
+            ("- a\n\n  - b\n", &[]),
+            ("> - a\n> - b\n", &[]),
+            ("- a\n  - b\n    - c\n", &[]),
+            (">   - a\n>     - b\n", &[(1, 0, 2), (2, 2, 4)]),
+            ("- a\n- b\n", &[]),
+            (">\t- a\n", &[]),
+            ("- a\n > - b\n", &[]),
+        ];
+        for &(source, expected) in cases {
+            assert_eq!(expected, reports(source).as_slice(), "source {source:?}");
+        }
     }
 }
