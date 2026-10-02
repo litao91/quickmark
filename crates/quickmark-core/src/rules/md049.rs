@@ -41,21 +41,15 @@ impl Default for MD049EmphasisStyleTable {
     }
 }
 
-// The four helpers below belong to md036, md037 and md050, which still decide what is emphasis by
-// scanning raw text. md049 and md045 read the inline tree instead, so a code span, a link
-// destination or a math region simply never reaches them as text.
+// The two helpers below belong to md036, which still decides what is emphasis by scanning raw text.
+// Every other emphasis rule reads the inline tree instead, so a code span, a link destination or a
+// math region simply never reaches it as text.
 
 /// Code spans. The content class is dotall: a span may cross lines, and a URL like `l_orderkey__0`
 /// inside one is literal text rather than strong emphasis. Runs of one, two or three backticks are
 /// matched longest first.
 pub(crate) static CODE_SPAN_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)```.*?```|``.*?``|`[^`]*`").expect("Invalid code span regex"));
-
-/// Link and image destinations, and autolinks. Emphasis markers inside a URL are literal text —
-/// `http://example.com/s?__biz=1` is not strong emphasis. markdownlint never sees them because
-/// micromark tokenises a destination separately from inline content.
-pub(crate) static LINK_DESTINATION_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\]\([^)\n]*\)|<[^<>\n]*>").expect("Invalid link destination regex"));
 
 /// Math regions. markdownlint's micromark tokenises `$...$` and `$$...$$` as math, so their content
 /// never becomes inline text and no emphasis rule sees it. Display math may span lines; inline math
@@ -67,25 +61,14 @@ pub(crate) static MATH_REGEX: Lazy<Regex> = Lazy::new(|| {
         .expect("Invalid math regex")
 });
 
-/// Byte ranges within `text` that hold literal content — code spans, link destinations and math —
-/// where an emphasis marker does not count.
-pub(crate) fn literal_ranges(text: &str) -> Vec<(usize, usize)> {
-    CODE_SPAN_REGEX
-        .find_iter(text)
-        .chain(LINK_DESTINATION_REGEX.find_iter(text))
-        .chain(MATH_REGEX.find_iter(text))
-        .map(|m| (m.start(), m.end()))
-        .collect()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Marker {
+pub(crate) enum Marker {
     Asterisk,
     Underscore,
 }
 
 impl Marker {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Marker::Asterisk => "asterisk",
             Marker::Underscore => "underscore",

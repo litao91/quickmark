@@ -5,10 +5,8 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{Rule, RuleType},
+    rules::{md049::Marker, Rule, RuleType},
 };
-
-use super::md049::literal_ranges;
 
 // MD050-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
@@ -41,16 +39,13 @@ impl Default for MD050StrongStyleTable {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
-enum StrongMarkerType {
-    Asterisk,
-    Underscore,
-}
+/// How wide a strong delimiter is: `**` and `__` are both two bytes.
+const WIDTH: usize = 2;
 
 pub(crate) struct MD050Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
-    first_strong_marker: Option<StrongMarkerType>,
+    document_style: Option<Marker>,
 }
 
 impl MD050Linter {
@@ -58,198 +53,115 @@ impl MD050Linter {
         Self {
             context,
             violations: Vec::new(),
-            first_strong_marker: None,
+            document_style: None,
         }
     }
 
-    fn is_in_code_context(&self, node: &Node) -> bool {
-        // Check if this node is inside a code span or code block
-        let mut current = Some(*node);
-        while let Some(node_to_check) = current {
-            if matches!(
-                node_to_check.kind(),
-                "code_span" | "fenced_code_block" | "indented_code_block"
-            ) {
-                return true;
+    /// Walks the inline subtree, which `feed` never descends into because inline kinds are filtered
+    /// out of dispatch. Pre-order matches markdownlint's token order, which is what makes
+    /// `style = "consistent"` mean "whatever came first in the document".
+    fn walk(&mut self, root: Node) {
+        let mut cursor = root.walk();
+        let mut depth = 0;
+        loop {
+            let node = cursor.node();
+            if node.kind() == "strong_emphasis" {
+                self.check(node);
             }
-            current = node_to_check.parent();
+            if cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+            loop {
+                if depth == 0 {
+                    return;
+                }
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                cursor.goto_parent();
+                depth -= 1;
+            }
         }
-        false
     }
 
-    fn find_strong_violations_in_text(&mut self, node: &Node) {
-        if self.is_in_code_context(node) {
+    fn check(&mut self, node: Node) {
+        let (start, end) = (node.start_byte(), node.end_byte());
+        let Some(marker) = self.marker_at(start) else {
+            return;
+        };
+
+        let expected = match self.context.config.linters.settings.strong_style.style {
+            StrongStyle::Asterisk => Marker::Asterisk,
+            StrongStyle::Underscore => Marker::Underscore,
+            // The first strong emphasis in the document sets the style and is never a violation.
+            StrongStyle::Consistent => *self.document_style.get_or_insert(marker),
+        };
+        if expected == marker {
             return;
         }
 
-        let node_start_byte = node.start_byte();
-        let text = {
-            let content = self.context.get_document_content();
-            node.utf8_text(content.as_bytes()).unwrap_or("").to_string()
-        };
+        // markdownlint only exempts intraword emphasis when the expected style is underscore, and
+        // only on its own `/^\w$/` — ASCII, so a CJK character beside the marker does not count.
+        if expected == Marker::Underscore && self.is_intraword(start, end) {
+            return;
+        }
 
-        if !text.is_empty() {
-            self.find_strong_patterns(&text, node_start_byte);
+        // markdownlint reports the opening and the closing delimiter separately, since each is its
+        // own edit; match that so the violation counts agree.
+        let message = format!("Expected: {}; Actual: {}", expected.name(), marker.name());
+        let start_point = node.start_position();
+        let end_point = node.end_position();
+        for (marker_byte, from, to) in [
+            (
+                start,
+                start_point,
+                crate::ast::Point::new(start_point.row, start_point.column + WIDTH),
+            ),
+            (
+                end - WIDTH,
+                crate::ast::Point::new(end_point.row, end_point.column - WIDTH),
+                end_point,
+            ),
+        ] {
+            let range = crate::ast::NodeRange {
+                start_byte: marker_byte,
+                end_byte: marker_byte + WIDTH,
+                start_point: from,
+                end_point: to,
+            };
+            self.violations.push(RuleViolation::new(
+                &MD050,
+                message.clone(),
+                self.context.file_path.clone(),
+                range_from_node_range(&range),
+            ));
         }
     }
 
-    fn find_strong_patterns(&mut self, text: &str, text_start_byte: usize) {
-        let config = &self.context.config.linters.settings.strong_style;
-
-        // Look for all strong emphasis markers - both opening and closing
-        let mut i = 0;
-        let chars: Vec<char> = text.chars().collect();
-
-        // Byte offset of each char, so a marker found at char `i` can be tested against the
-        // code span ranges below without re-walking the string.
-        let mut char_offsets: Vec<usize> = Vec::with_capacity(chars.len() + 1);
-        let mut acc = 0;
-        for c in &chars {
-            char_offsets.push(acc);
-            acc += c.len_utf8();
+    /// Which marker a `strong_emphasis` node was written with. The node's own source starts at its
+    /// opening delimiter, so the first byte settles it.
+    fn marker_at(&self, byte: usize) -> Option<Marker> {
+        match self.context.get_document_content().as_bytes().get(byte) {
+            Some(b'*') => Some(Marker::Asterisk),
+            Some(b'_') => Some(Marker::Underscore),
+            _ => None,
         }
-        char_offsets.push(acc);
+    }
 
-        // Markers inside literal content — a code span or a link destination — are not emphasis, so
-        // they must neither set nor violate the document's consistent style.
-        let literal_spans = literal_ranges(text);
-
-        while i < chars.len() {
-            if i + 1 < chars.len() {
-                let current_char = chars[i];
-                let next_char = chars[i + 1];
-
-                // Check for strong emphasis markers (both ** and __)
-                if (current_char == '*' && next_char == '*')
-                    || (current_char == '_' && next_char == '_')
-                {
-                    let marker_start = char_offsets[i];
-                    let marker_end = char_offsets[i + 2];
-                    if literal_spans
-                        .iter()
-                        .any(|(s, e)| marker_start < *e && marker_end > *s)
-                    {
-                        i += 2;
-                        continue;
-                    }
-
-                    // CommonMark forbids intraword emphasis with `_`, so the `__` in an identifier
-                    // like `ANALYTICDB__29` is not a delimiter run at all.
-                    if current_char == '_' {
-                        let bytes = text.as_bytes();
-                        let intraword = marker_start
-                            .checked_sub(1)
-                            .and_then(|p| bytes.get(p))
-                            .is_some_and(u8::is_ascii_alphanumeric)
-                            && bytes.get(marker_end).is_some_and(u8::is_ascii_alphanumeric);
-                        if intraword {
-                            i += 2;
-                            continue;
-                        }
-                    }
-
-                    // Skip if this is part of a longer sequence that would make it invalid
-                    // e.g., ____ should not be detected as __ + __
-                    if i + 2 < chars.len() && chars[i + 2] == current_char {
-                        // This is at least a triple marker, could be *** or ___
-                        if i + 3 < chars.len() && chars[i + 3] == current_char {
-                            // This is a quadruple marker like ____ or ****
-                            // Skip the entire sequence
-                            let mut skip_count = 4;
-                            while i + skip_count < chars.len()
-                                && chars[i + skip_count] == current_char
-                            {
-                                skip_count += 1;
-                            }
-                            i += skip_count;
-                            continue;
-                        }
-                        // Triple marker (*** or ___) - handle as strong emphasis
-                    }
-
-                    let marker_type = if current_char == '*' {
-                        StrongMarkerType::Asterisk
-                    } else {
-                        StrongMarkerType::Underscore
-                    };
-
-                    // Check if we should report a violation for this marker
-                    let should_report_violation = match config.style {
-                        StrongStyle::Consistent => {
-                            if self.first_strong_marker.is_none() {
-                                self.first_strong_marker = Some(marker_type.clone());
-                                false
-                            } else {
-                                self.first_strong_marker.as_ref() != Some(&marker_type)
-                            }
-                        }
-                        StrongStyle::Asterisk => marker_type != StrongMarkerType::Asterisk,
-                        StrongStyle::Underscore => marker_type != StrongMarkerType::Underscore,
-                    };
-
-                    if should_report_violation {
-                        let expected_style = match config.style {
-                            StrongStyle::Asterisk => "asterisk",
-                            StrongStyle::Underscore => "underscore",
-                            StrongStyle::Consistent => {
-                                match self.first_strong_marker.as_ref().unwrap() {
-                                    StrongMarkerType::Asterisk => "asterisk",
-                                    StrongMarkerType::Underscore => "underscore",
-                                }
-                            }
-                        };
-
-                        let actual_style = match marker_type {
-                            StrongMarkerType::Asterisk => "asterisk",
-                            StrongMarkerType::Underscore => "underscore",
-                        };
-
-                        // Calculate byte position - markdownlint reports position of the second character for double markers,
-                        // and the third character for opening triple markers only
-                        let is_opening_triple_marker = i + 2 < chars.len()
-                            && chars[i + 2] == current_char
-                            && (i == 0 || (i > 0 && chars[i - 1] != current_char));
-                        let position_offset = if is_opening_triple_marker { 2 } else { 1 };
-                        let char_start_byte = text_start_byte
-                            + text
-                                .chars()
-                                .take(i + position_offset)
-                                .map(|c| c.len_utf8())
-                                .sum::<usize>()
-                            - 1;
-                        let char_end_byte = char_start_byte + current_char.len_utf8();
-
-                        let range = crate::ast::NodeRange {
-                            start_byte: char_start_byte,
-                            end_byte: char_end_byte,
-                            start_point: self.context.point_at(char_start_byte),
-                            end_point: self.context.point_at(char_end_byte),
-                        };
-
-                        self.violations.push(RuleViolation::new(
-                            &MD050,
-                            format!("Expected: {expected_style}; Actual: {actual_style}"),
-                            self.context.file_path.clone(),
-                            range_from_node_range(&range),
-                        ));
-                    }
-
-                    // Move past this marker pair
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        }
+    /// Whether a word character sits immediately outside either delimiter, making the emphasis
+    /// intraword. Both offsets are character boundaries because they came from a node's own span.
+    fn is_intraword(&self, start: usize, end: usize) -> bool {
+        let source = self.context.get_document_content();
+        let word = |ch: Option<char>| ch.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        word(source[..start].chars().next_back()) || word(source[end..].chars().next())
     }
 }
 
 impl RuleLinter for MD050Linter {
     fn feed(&mut self, node: &Node) {
-        if matches!(node.kind(), "text" | "inline") {
-            self.find_strong_violations_in_text(node);
+        if node.kind() == "inline" {
+            self.walk(*node);
         }
     }
 
@@ -264,7 +176,7 @@ pub const MD050: Rule = Rule {
     tags: &["emphasis"],
     description: "Strong style should be consistent",
     rule_type: RuleType::Token,
-    required_nodes: &["strong_emphasis"],
+    required_nodes: &["inline"],
     new_linter: |context| Box::new(MD050Linter::new(context)),
 };
 
@@ -530,5 +442,133 @@ mod test {
             .collect();
 
         assert_eq!(md050_violations.len(), 0);
+    }
+
+    /// One report: markdownlint's line and column, and the styles it names. Its `errorRange` covers
+    /// the delimiter, so the opening and the closing one are two reports.
+    type Report<'a> = (usize, usize, &'a str);
+
+    /// The same report with an owned message, which is what a violation hands back.
+    type Found = (usize, usize, String);
+
+    fn owned(expected: &[Report<'_>]) -> Vec<Found> {
+        expected
+            .iter()
+            .map(|&(line, column, detail)| (line, column, detail.to_string()))
+            .collect()
+    }
+
+    fn found(source: &str) -> Vec<Found> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), source);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let range = &violation.location().range;
+                (
+                    range.start.line + 1,
+                    range.start.character + 1,
+                    violation.message().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output with
+    /// MD050's defaults.
+    ///
+    /// Columns count UTF-8 bytes here and UTF-16 units there, and every case below is ASCII, so the
+    /// two agree throughout.
+    const CASES: &[(&str, &[Report])] = &[
+        (
+            "**a** and __b__\n",
+            &[
+                (1, 11, "Expected: asterisk; Actual: underscore"),
+                (1, 14, "Expected: asterisk; Actual: underscore"),
+            ],
+        ),
+        ("__a__\n", &[]),
+        ("**a**\n", &[]),
+        ("std::__1::future_error\n", &[]),
+        ("(__syncthreads)\n", &[]),
+        ("__libc_start_main()\n", &[]),
+        ("a__b__c\n", &[]),
+        (
+            "**a** __b__\n",
+            &[
+                (1, 7, "Expected: asterisk; Actual: underscore"),
+                (1, 10, "Expected: asterisk; Actual: underscore"),
+            ],
+        ),
+        ("___a___\n", &[]),
+        ("**_a_**\n", &[]),
+        ("_**a**_\n", &[]),
+        (
+            "__a__ **b**\n",
+            &[
+                (1, 7, "Expected: underscore; Actual: asterisk"),
+                (1, 10, "Expected: underscore; Actual: asterisk"),
+            ],
+        ),
+        ("`__a__`\n", &[]),
+        ("$__a__$\n", &[]),
+        ("[__a__](http://x)\n", &[]),
+        ("http://x/__a__\n", &[]),
+        ("<div>__a__</div>\n", &[]),
+        (
+            "**a**\n\n__b__\n",
+            &[
+                (3, 1, "Expected: asterisk; Actual: underscore"),
+                (3, 4, "Expected: asterisk; Actual: underscore"),
+            ],
+        ),
+        ("__a__ *b* __c__\n", &[]),
+        ("x __a__\n", &[]),
+        (
+            "__a__\n\n**b** **c**\n",
+            &[
+                (3, 1, "Expected: underscore; Actual: asterisk"),
+                (3, 4, "Expected: underscore; Actual: asterisk"),
+                (3, 7, "Expected: underscore; Actual: asterisk"),
+                (3, 10, "Expected: underscore; Actual: asterisk"),
+            ],
+        ),
+        (
+            "**a**\n\n__b__\n\n__c__\n",
+            &[
+                (3, 1, "Expected: asterisk; Actual: underscore"),
+                (3, 4, "Expected: asterisk; Actual: underscore"),
+                (5, 1, "Expected: asterisk; Actual: underscore"),
+                (5, 4, "Expected: asterisk; Actual: underscore"),
+            ],
+        ),
+        (
+            "- __a__\n- **b**\n",
+            &[
+                (2, 3, "Expected: underscore; Actual: asterisk"),
+                (2, 6, "Expected: underscore; Actual: asterisk"),
+            ],
+        ),
+        (
+            "> __a__\n>\n> **b**\n",
+            &[
+                (3, 3, "Expected: underscore; Actual: asterisk"),
+                (3, 6, "Expected: underscore; Actual: asterisk"),
+            ],
+        ),
+        ("| __a__ |\n|---|\n", &[]),
+        ("# __a__\n", &[]),
+        ("__a\nb__\n", &[]),
+        ("***a***\n", &[]),
+        ("**a*b**\n", &[]),
+        ("__**a**__\n", &[]),
+    ];
+
+    #[test]
+    fn matches_markdownlint() {
+        for &(source, expected) in CASES {
+            assert_eq!(owned(expected), found(source), "source {source:?}");
+        }
     }
 }
