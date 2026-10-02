@@ -30,10 +30,12 @@ impl MD040Linter {
         }
     }
 
-    /// Extracts the language identifier from a fenced code block's first line.
-    /// This handles common variations like attributes (e.g., ```rust{{...}}).
-    /// Returns `(Option<language>, has_extra_info)`. The language is a slice
-    /// of the input line to avoid allocations.
+    /// The language a fenced code block's opening line specifies, and whether anything follows it.
+    ///
+    /// The language is the info string's first whitespace-delimited token, verbatim: markdownlint
+    /// takes micromark's `codeFencedFenceInfo`, which stops at the first space and keeps everything
+    /// else, so `` ```py{#id} `` specifies `py{#id}` and `` ```{.python .numberLines} `` specifies
+    /// `{.python`. Cutting either at a `{` reads a language that is not there.
     fn extract_code_block_language<'a>(&self, line: &'a str) -> (Option<&'a str>, bool) {
         // A fenced block inside a block quote or a list item opens on a line that starts with that
         // container's prefix, so `- ```sql` and `> ```java` need it skipped before the fence. The
@@ -52,22 +54,11 @@ impl MD040Linter {
         let run = bytes.iter().take_while(|&&b| b == marker).count();
         let info_string = content[run..].trim();
 
-        if info_string.is_empty() {
-            return (None, false);
-        }
-
         let mut parts = info_string.split_whitespace();
-        // The unwrap is safe because we've checked that info_string is not empty.
-        let language_part = parts.next().unwrap();
-        let has_extra_info = parts.next().is_some();
-
-        // The unwrap is safe because split always returns an iterator with at least one element.
-        let language = language_part.split('{').next().unwrap();
-
-        if language.is_empty() {
-            (None, has_extra_info)
-        } else {
-            (Some(language), has_extra_info)
+        match parts.next() {
+            // An empty info string has no first token, which is the missing language this reports.
+            None => (None, false),
+            Some(language) => (Some(language), parts.next().is_some()),
         }
     }
 }
@@ -563,11 +554,64 @@ def hello():
         assert!(rows("`````lang\nx\n`````\n").is_empty());
         assert!(rows("```py{#id}\nx\n```\n").is_empty());
 
+        // An attribute-style info string specifies a language as far as this rule is concerned:
+        // markdownlint takes micromark's `codeFencedFenceInfo`, which is the first token and stops
+        // there, so `{.python` is one and a lone `{` is one too.
+        assert!(rows("```{.python .numberLines}\nx\n```\n").is_empty());
+        assert!(rows("```{.python}\nx\n```\n").is_empty());
+        assert!(rows("```{hl_lines=[18]}\nx\n```\n").is_empty());
+        assert!(rows("```{.cpp .numberLines startFrom=\"14\"}\nx\n```\n").is_empty());
+        assert!(rows("```{.graph .center caption=\"x y\"}\nx\n```\n").is_empty());
+        assert!(rows("```{ }\nx\n```\n").is_empty());
+        assert!(rows("```{\nx\n```\n").is_empty());
+        assert!(rows("```{}\nx\n```\n").is_empty());
+        assert!(rows("``` python\nx\n```\n").is_empty());
+
         // And the ones that genuinely have no language, including a long fence with no info string.
         assert_eq!(vec![0], rows("````\nx\n````\n"));
         assert_eq!(vec![0], rows("~~~\nx\n~~~\n"));
         assert_eq!(vec![0], rows("> ```\n> x\n"));
         assert_eq!(vec![0], rows("- ```\n  x\n"));
         assert_eq!(vec![0], rows("   ```\n   x\n"));
+    }
+
+    /// The language is the info string's whole first token, so an allow-list has to name it whole
+    /// and `language_only` reads everything after it as meta. Both are markdownlint-cli2 0.23.3
+    /// measurements.
+    #[test]
+    fn test_the_info_token_is_the_language_whole() {
+        fn messages(config: crate::config::QuickmarkConfig, input: &str) -> Vec<String> {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD040")
+                .map(|v| v.message().to_string())
+                .collect()
+        }
+
+        let attributes = "```py{#id}\nx\n```\n";
+        assert_eq!(
+            vec![r#""py{#id}" is not allowed"#],
+            messages(test_config_with_allowed_languages(vec!["py"]), attributes)
+        );
+        assert!(messages(
+            test_config_with_allowed_languages(vec!["py{#id}"]),
+            attributes
+        )
+        .is_empty());
+        assert!(messages(
+            test_config_with_allowed_languages(vec!["{.python}"]),
+            "```{.python}\nx\n```\n"
+        )
+        .is_empty());
+
+        let pandoc = "```{.python .numberLines}\nx\n```\n";
+        assert_eq!(
+            vec![r#"Info string contains more than language: "```{.python .numberLines}""#],
+            messages(test_config_with_language_only(true), pandoc)
+        );
+        assert!(messages(test_config_with_language_only(true), attributes).is_empty());
     }
 }
