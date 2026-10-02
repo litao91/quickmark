@@ -114,29 +114,20 @@ impl MD059Linter {
     }
 
     fn check_text_for_link_patterns(&mut self, text: &str, node: &Node) {
-        for caps in RE_INLINE_LINK.captures_iter(text) {
-            if let Some(label_match) = caps.get(1) {
-                let label_text = label_match.as_str();
-                self.check_label_for_prohibited_text(label_text, node);
-            }
-        }
-
-        for caps in RE_REF_LINK.captures_iter(text) {
-            if let Some(label_match) = caps.get(1) {
-                let label_text = label_match.as_str();
-                self.check_label_for_prohibited_text(label_text, node);
-            }
-        }
-
-        for caps in RE_COLLAPSED_REF_LINK.captures_iter(text) {
-            if let Some(label_match) = caps.get(1) {
-                let label_text = label_match.as_str();
-                self.check_label_for_prohibited_text(label_text, node);
+        let base = node.start_byte();
+        for re in [&*RE_INLINE_LINK, &*RE_REF_LINK, &*RE_COLLAPSED_REF_LINK] {
+            for caps in re.captures_iter(text) {
+                if let Some(label) = caps.get(1) {
+                    // markdownlint reports at the label's own line. An `inline` node spans a whole
+                    // wrapped paragraph, so reporting at its range put every link in the paragraph on
+                    // the paragraph's first line.
+                    self.check_label_for_prohibited_text(label.as_str(), base + label.start());
+                }
             }
         }
     }
 
-    fn check_label_for_prohibited_text(&mut self, label_text: &str, node: &Node) {
+    fn check_label_for_prohibited_text(&mut self, label_text: &str, label_byte: usize) {
         // Check if label text contains code or HTML - if so, skip
         if label_text.contains('`') || label_text.contains('<') {
             return;
@@ -145,18 +136,24 @@ impl MD059Linter {
         let normalized_text = normalize_text(label_text);
 
         if self.prohibited_texts.contains(&normalized_text) {
-            self.create_violation(node, label_text);
+            self.create_violation(label_byte, label_text);
         }
     }
 
-    fn create_violation(&mut self, node: &Node, link_text: &str) {
+    fn create_violation(&mut self, label_byte: usize, link_text: &str) {
+        let end_byte = label_byte + link_text.len();
         let message = format!("Link text should be descriptive: '{link_text}'");
 
         self.violations.push(RuleViolation::new(
             &MD059,
             message,
             self.context.file_path.clone(),
-            range_from_node_range(&node.range()),
+            range_from_node_range(&crate::ast::NodeRange {
+                start_byte: label_byte,
+                end_byte,
+                start_point: self.context.point_at(label_byte),
+                end_point: self.context.point_at(end_byte),
+            }),
         ));
     }
 }
@@ -355,5 +352,38 @@ mod test {
 
         // Images should be ignored by this rule
         assert_eq!(0, violations.len());
+    }
+    /// An `inline` node spans a whole wrapped paragraph, so a violation built from its range lands
+    /// on the paragraph's first line no matter where the link is. markdownlint reports at the label's
+    /// own line. Every expectation is a markdownlint-cli2 0.23.3 measurement, 0-based.
+    #[test]
+    fn test_reports_the_line_the_link_label_is_on() {
+        fn rows(input: &str) -> Vec<usize> {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD059")
+                .map(|v| v.location().range.start.line)
+                .collect()
+        }
+
+        assert_eq!(
+            vec![1],
+            rows("intro text here\nand [click here](/a) on line two\n")
+        );
+        assert_eq!(
+            vec![0],
+            rows("[here](/a) then more words\non a second line\n")
+        );
+        assert_eq!(vec![0, 0], rows("one [link](/x) and two [more](/y) here\n"));
+        assert_eq!(vec![0, 2], rows("a [here](/x) b\n\nc [more](/y) d\n"));
+        // Inside a list item, a block quote and a table cell.
+        assert_eq!(vec![3], rows("- item\n\n  text\n  [click here](/a)\n"));
+        assert_eq!(vec![1], rows("> quote\n> [more](/y) here\n"));
+        assert_eq!(vec![2], rows("| a |\n|---|\n| [here](/x) |\n"));
+        // A label holding a code span is exempt.
+        assert!(rows("see [`here`](/x) ok\n").is_empty());
     }
 }
