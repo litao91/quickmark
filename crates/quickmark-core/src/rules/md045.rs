@@ -1,4 +1,4 @@
-use crate::ast::Node;
+use crate::ast::{Node, NodeRange};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::rc::Rc;
@@ -8,33 +8,90 @@ use crate::{
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
-// Pre-compiled regex patterns for image parsing
-static IMG_TAG_REGEX: Lazy<Regex> = Lazy::new(|| {
-    // Use DOTALL flag to match across newlines and case-insensitive flag
-    Regex::new(r"(?si)<(/?)img\b[^>]*>").expect("Invalid img tag regex")
-});
+/// Finds `<img …>` inside an `html_block`, which comrak hands over as one opaque literal. Inline
+/// HTML arrives as its own node, so this only ever runs over block-level HTML.
+static IMG_TAG_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?si)<(/?)img\b[^>]*>").expect("Invalid img tag regex"));
 
+/// markdownlint spells both attribute patterns `/\sNAME\s*=\s*['"]?([^'"\s>]*)/iu`. The leading
+/// `\s` is load-bearing: a `\b` would accept `data-alt="x"` as an `alt` attribute, and markdownlint
+/// reports that image while a word boundary would not.
 static ALT_ATTRIBUTE_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?si)\balt\s*=\s*(?:[\"']([^\"']*)['"]|([^\s>]+))"#)
-        .expect("Invalid alt attribute regex")
+    Regex::new(r#"(?i)\salt\s*=\s*['"]?([^'"\s>]*)"#).expect("Invalid alt attribute regex")
 });
 
 static ARIA_HIDDEN_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?si)aria-hidden\s*=\s*(?:[\"']([^\"']*)['"]|([^\s>]+))"#)
-        .expect("Invalid aria-hidden regex")
+    Regex::new(r#"(?i)\saria-hidden\s*=\s*['"]?([^'"\s>]*)"#).expect("Invalid aria-hidden regex")
 });
 
-// Regex patterns for Markdown images
-static MARKDOWN_IMAGE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"!\[([^\]]*)\]\([^)]+\)").expect("Invalid markdown image regex"));
+/// The tag name markdownlint's `getHtmlTagInfo` extracts with `/^<([^!>][^/\s>]*)/`, keeping a
+/// leading `/` on a closing tag. `None` when the text is not a tag at all — `<!--`, `<!DOCTYPE`,
+/// or the tail of a run-on literal.
+fn html_tag_name(tag: &str) -> Option<&str> {
+    let after_lt = tag.strip_prefix('<')?;
+    let first = after_lt.chars().next()?;
+    if first == '!' || first == '>' {
+        return None;
+    }
+    let rest = &after_lt[first.len_utf8()..];
+    let stop = rest
+        .find(|c: char| c == '/' || c.is_whitespace() || c == '>')
+        .unwrap_or(rest.len());
+    Some(&after_lt[..first.len_utf8() + stop])
+}
 
-static MARKDOWN_REFERENCE_IMAGE_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"!\[([^\]]*)\]\[([^\]]*)\]").expect("Invalid markdown reference image regex")
-});
+fn aria_hidden_is_true(tag: &str) -> bool {
+    ARIA_HIDDEN_REGEX
+        .captures(tag)
+        .and_then(|captures| captures.get(1))
+        .is_some_and(|value| value.as_str().eq_ignore_ascii_case("true"))
+}
 
-static MARKDOWN_REFERENCE_IMAGE_SHORTCUT_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"!\[([^\]]*)\]\[]").expect("Invalid markdown reference image shortcut regex")
-});
+fn img_tag_missing_alt(tag: &str) -> bool {
+    html_tag_name(tag).is_some_and(|name| {
+        // A closing tag's name keeps its `/`, so `</img>` never reaches the attribute tests.
+        name.eq_ignore_ascii_case("img")
+            && !ALT_ATTRIBUTE_REGEX.is_match(tag)
+            && !aria_hidden_is_true(tag)
+    })
+}
+
+/// Spans of `<!-- … -->` inside an HTML block, which comrak hands over as one opaque literal.
+/// micromark does not subtokenize a comment flow, so an `<img>` written inside one never becomes an
+/// `htmlText` token and MD045 must not see it. A `<!--` with no later `-->` is deliberately not a
+/// span: measured, markdownlint still reports an image in that case.
+fn comment_spans(content: &str) -> Vec<(usize, usize)> {
+    const OPEN: &str = "<!--";
+    const CLOSE: &str = "-->";
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = content[at..].find(OPEN) {
+        let start = at + offset;
+        let after_open = start + OPEN.len();
+        // No CLOSE after this OPEN means none after any later OPEN either.
+        let Some(close) = content[after_open..].find(CLOSE) else {
+            break;
+        };
+        let end = after_open + close + CLOSE.len();
+        spans.push((start, end));
+        at = end;
+    }
+    spans
+}
+
+fn find_html_image_violations(content: &str) -> Vec<(usize, usize)> {
+    let comments = comment_spans(content);
+    IMG_TAG_REGEX
+        .find_iter(content)
+        .filter(|tag| img_tag_missing_alt(tag.as_str()))
+        .filter(|tag| {
+            !comments
+                .iter()
+                .any(|&(start, end)| tag.start() >= start && tag.end() <= end)
+        })
+        .map(|tag| (tag.start(), tag.end()))
+        .collect()
+}
 
 pub(crate) struct MD045Linter {
     context: Rc<Context>,
@@ -62,121 +119,89 @@ impl MD045Linter {
         }
     }
 
-    fn is_in_code_context(&self, node: &Node) -> bool {
-        // Check if this node is inside a code span or code block
-        let mut current = node.parent();
-        while let Some(parent) = current {
-            match parent.kind() {
-                "code_span" | "fenced_code_block" | "indented_code_block" => {
-                    return true;
+    /// Walks the inline subtree, which `feed` never descends into because inline kinds are filtered
+    /// out of dispatch.
+    fn feed_inline(&mut self, root: Node) {
+        let mut cursor = root.walk();
+        let mut depth = 0;
+        loop {
+            let node = cursor.node();
+            let violation = match node.kind() {
+                // comrak gives an image no children exactly when the label between `![` and `]` is
+                // empty, which is markdownlint's entire test — a whitespace-only label keeps its
+                // `text` child and is not a violation. An image whose reference never resolves is
+                // not an `image` node in comrak or in micromark, so `![][undefined]` stays silent.
+                "image" if node.child_count() == 0 => Some(node.range()),
+                "html_inline" => {
+                    let range = node.range();
+                    let missing_alt = {
+                        let content = self.context.document_content.borrow();
+                        img_tag_missing_alt(&content[range.start_byte..range.end_byte])
+                    };
+                    missing_alt.then_some(range)
                 }
-                _ => {
-                    current = parent.parent();
-                }
+                _ => None,
+            };
+            if let Some(range) = violation {
+                self.add_violation(&range);
             }
-        }
-        false
-    }
 
-    fn contains_inline_code_with_images(&self, content: &str) -> bool {
-        // Check if the entire content is a single inline code span containing images
-        static CODE_SPAN_WITH_IMG_REGEX: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"^`[^`]*(?:<img|!\[)[^`]*`\s*(?:and\s*`[^`]*(?:<img|!\[)[^`]*`\s*)*$")
-                .expect("Invalid code span with image regex")
-        });
-        CODE_SPAN_WITH_IMG_REGEX.is_match(content.trim())
-    }
-
-    fn find_markdown_image_violations(&self, content: &str) -> Vec<(usize, usize)> {
-        let mut ranges = Vec::new();
-
-        // Check inline images: ![alt](url)
-        for captures in MARKDOWN_IMAGE_REGEX.captures_iter(content) {
-            if let (Some(alt_text), Some(full_match)) = (captures.get(1), captures.get(0)) {
-                if alt_text.as_str().is_empty() {
-                    ranges.push((full_match.start(), full_match.end()));
-                }
-            }
-        }
-
-        // Check reference images: ![alt][ref]
-        for captures in MARKDOWN_REFERENCE_IMAGE_REGEX.captures_iter(content) {
-            if let (Some(alt_text), Some(full_match)) = (captures.get(1), captures.get(0)) {
-                if alt_text.as_str().is_empty() {
-                    ranges.push((full_match.start(), full_match.end()));
-                }
-            }
-        }
-
-        // Check shortcut reference images: ![alt][]
-        for captures in MARKDOWN_REFERENCE_IMAGE_SHORTCUT_REGEX.captures_iter(content) {
-            if let (Some(alt_text), Some(full_match)) = (captures.get(1), captures.get(0)) {
-                if alt_text.as_str().is_empty() {
-                    ranges.push((full_match.start(), full_match.end()));
-                }
-            }
-        }
-
-        ranges
-    }
-
-    fn find_html_image_violations(&self, content: &str) -> Vec<(usize, usize)> {
-        let mut ranges = Vec::new();
-        for img_match in IMG_TAG_REGEX.find_iter(content) {
-            let img_tag = img_match.as_str();
-
-            // Skip closing tags
-            if img_tag.starts_with("</") {
+            if cursor.goto_first_child() {
+                depth += 1;
                 continue;
             }
-
-            // Check for aria-hidden="true" first
-            if let Some(aria_cap) = ARIA_HIDDEN_REGEX.captures(img_tag) {
-                let value = aria_cap.get(1).or(aria_cap.get(2));
-                if let Some(value_match) = value {
-                    if value_match.as_str().to_lowercase() == "true" {
-                        continue; // Skip images with aria-hidden="true"
-                    }
+            loop {
+                if depth == 0 {
+                    return;
                 }
-            }
-
-            // Check for alt attribute with value
-            let has_valid_alt = ALT_ATTRIBUTE_REGEX.captures(img_tag).is_some();
-
-            if !has_valid_alt {
-                ranges.push((img_match.start(), img_match.end()));
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                cursor.goto_parent();
+                depth -= 1;
             }
         }
-        ranges
     }
 
-    fn add_violation(&mut self, node: &Node, start_offset: usize, end_offset: usize) {
-        let start_byte = node.start_byte() + start_offset;
-        let end_byte = node.start_byte() + end_offset;
+    fn feed_html_block(&mut self, node: Node) {
+        let (ranges, base) = {
+            let content = self.context.document_content.borrow();
+            (
+                find_html_image_violations(&content[node.start_byte()..node.end_byte()]),
+                node.start_byte(),
+            )
+        };
+        for (start, end) in ranges {
+            let range = self.range_at(base + start, base + end);
+            self.add_violation(&range);
+        }
+    }
 
-        let (start_line, start_col) = self.byte_to_line_col(start_byte);
-        let (end_line, end_col) = self.byte_to_line_col(end_byte);
-
-        let range = range_from_node_range(&crate::ast::NodeRange {
-            start_byte,
-            end_byte,
-            start_point: crate::ast::Point {
-                row: start_line,
-                column: start_col,
-            },
-            end_point: crate::ast::Point {
-                row: end_line,
-                column: end_col,
-            },
-        });
-
+    fn add_violation(&mut self, range: &NodeRange) {
         let violation = RuleViolation::new(
             &MD045,
             MD045.description.to_string(),
             self.context.file_path.clone(),
-            range,
+            range_from_node_range(range),
         );
         self.violations.push(violation);
+    }
+
+    fn range_at(&self, start_byte: usize, end_byte: usize) -> NodeRange {
+        let (start_row, start_col) = self.byte_to_line_col(start_byte);
+        let (end_row, end_col) = self.byte_to_line_col(end_byte);
+        NodeRange {
+            start_byte,
+            end_byte,
+            start_point: crate::ast::Point {
+                row: start_row,
+                column: start_col,
+            },
+            end_point: crate::ast::Point {
+                row: end_row,
+                column: end_col,
+            },
+        }
     }
 
     fn byte_to_line_col(&self, byte_pos: usize) -> (usize, usize) {
@@ -203,36 +228,8 @@ pub const MD045: Rule = Rule {
 impl RuleLinter for MD045Linter {
     fn feed(&mut self, node: &Node) {
         match node.kind() {
-            "inline" | "html_block" => {
-                if self.is_in_code_context(node) {
-                    return;
-                }
-
-                let (markdown_ranges, html_ranges) = {
-                    let document_content = self.context.document_content.borrow();
-                    let content = &document_content[node.start_byte()..node.end_byte()];
-
-                    if self.contains_inline_code_with_images(content) {
-                        (vec![], vec![])
-                    } else if node.kind() == "inline" {
-                        (
-                            self.find_markdown_image_violations(content),
-                            self.find_html_image_violations(content),
-                        )
-                    } else {
-                        // html_block
-                        (vec![], self.find_html_image_violations(content))
-                    }
-                };
-
-                for (start, end) in markdown_ranges {
-                    self.add_violation(node, start, end);
-                }
-
-                for (start, end) in html_ranges {
-                    self.add_violation(node, start, end);
-                }
-            }
+            "inline" => self.feed_inline(*node),
+            "html_block" => self.feed_html_block(*node),
             _ => {}
         }
     }
@@ -255,6 +252,16 @@ mod test {
             ("no-alt-text", RuleSeverity::Error),
             ("no-inline-html", RuleSeverity::Off),
         ])
+    }
+
+    fn md045_count(input: &str) -> usize {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+        linter
+            .analyze()
+            .iter()
+            .filter(|v| v.rule().id == "MD045")
+            .count()
     }
 
     #[test]
@@ -317,7 +324,7 @@ mod test {
             .filter(|v| v.rule().id == "MD045")
             .collect();
 
-        // Should find 4 violations:
+        // Should find 5 violations:
         // Line 2: <img src="image.jpg" />
         // Line 4: <img src="image.jpg" alt>
         // Line 6: <IMG SRC="image.jpg" />
@@ -426,5 +433,101 @@ mod test {
 
         // Should only find 1 violation (the actual image outside code blocks)
         assert_eq!(md045_violations.len(), 1);
+    }
+
+    /// Every expectation below is a markdownlint-cli2 0.23.3 (markdownlint 0.41.1) measurement with
+    /// `{"default": false, "no-alt-text": true}`, one fixture per assertion.
+    #[test]
+    fn test_empty_alt_shapes_measured_against_markdownlint() {
+        // An inline image with an empty destination is still an image.
+        assert_eq!(md045_count("![]()\n"), 1);
+        assert_eq!(md045_count("![](/a.png \"t\")\n"), 1);
+        assert_eq!(md045_count("![](<a.png>)\n"), 1);
+        assert_eq!(md045_count("x ![](  /a.png  ) y\n"), 1);
+        assert_eq!(md045_count("![](/a.png\n)\n"), 1);
+
+        // A label holding only whitespace is alt text as far as markdownlint is concerned.
+        assert_eq!(md045_count("![ ](/a.png)\n"), 0);
+        assert_eq!(md045_count("![\t](/a.png)\n"), 0);
+        assert_eq!(md045_count("![&nbsp;](/a.png)\n"), 0);
+
+        // Balanced brackets and escapes stay inside the label.
+        assert_eq!(md045_count("![a[b]c](/x.png)\n"), 0);
+        assert_eq!(md045_count("![a\\]](/x.png)\n"), 0);
+
+        // A link, not an image.
+        assert_eq!(md045_count("[](/a.png)\n"), 0);
+    }
+
+    #[test]
+    fn test_reference_images_only_count_when_the_reference_resolves() {
+        // `![][]` is not an image at all — an empty label cannot be a reference.
+        assert_eq!(md045_count("![][]\n"), 0);
+        assert_eq!(md045_count("![alt][]\n"), 0);
+        assert_eq!(md045_count("![][ ]\n"), 0);
+        assert_eq!(md045_count("![ ][]\n"), 0);
+
+        // An unresolved reference is literal text, so there is no image to report.
+        assert_eq!(md045_count("![][ref]\n"), 0);
+
+        // Resolved, so the empty label is a violation. Lookup is case-folded.
+        assert_eq!(md045_count("![][ref]\n\n[ref]: /i.png\n"), 1);
+        assert_eq!(md045_count("![][REF]\n\n[ref]: /i.png\n"), 1);
+        assert_eq!(md045_count("![][é]\n\n[é]: /i.png\n"), 1);
+
+        // A resolved reference whose label has alt text.
+        assert_eq!(md045_count("![a][ref]\n\n[ref]: /i.png\n"), 0);
+    }
+
+    #[test]
+    fn test_html_img_attribute_shapes_measured_against_markdownlint() {
+        // `data-alt` is not `alt`; markdownlint's pattern anchors on preceding whitespace.
+        assert_eq!(md045_count("<img src=\"a.png\" data-alt=\"x\">\n"), 1);
+        assert_eq!(md045_count("<img src=\"a.png\" alt=x>\n"), 0);
+        assert_eq!(md045_count("<img src=\"a.png\" alt=\"\">\n"), 0);
+        assert_eq!(md045_count("<img src=\"a.png\" alt>\n"), 1);
+        assert_eq!(md045_count("<img\n  src=\"a.png\"\n  alt=\"y\">\n"), 0);
+        assert_eq!(md045_count("<IMG SRC=\"a.png\">\n"), 1);
+        assert_eq!(md045_count("</img>\n"), 0);
+        assert_eq!(md045_count("<imgx src=\"a.png\">\n"), 0);
+        assert_eq!(md045_count("<img src=\"a.png\" aria-hidden=\"TRUE\">\n"), 0);
+        assert_eq!(
+            md045_count("<img src=\"a.png\" aria-hidden=\"false\">\n"),
+            1
+        );
+
+        // Inline, in a paragraph and inside an HTML block alike.
+        assert_eq!(md045_count("text <img src=\"a.png\"> text\n"), 1);
+        assert_eq!(md045_count("<div><img src=\"a.png\"></div>\n"), 1);
+        assert_eq!(md045_count("<div>\n<img src=\"a.png\">\n</div>\n"), 1);
+
+        // A code span hides it.
+        assert_eq!(md045_count("`<img src=\"a.png\">`\n"), 0);
+    }
+
+    /// micromark does not subtokenize a comment flow, so an `<img>` inside `<!-- … -->` is not an
+    /// image. A `<!--` that is never closed is not a comment as far as markdownlint is concerned
+    /// either — it still reports the image.
+    #[test]
+    fn test_img_inside_html_comment_is_not_an_image() {
+        assert_eq!(md045_count("<!-- <img src=\"a.png\"> -->\n"), 0);
+        assert_eq!(md045_count("<!--\n<img src=\"a.png\">\n-->\n"), 0);
+        assert_eq!(md045_count("<!-- <!-- <img src=\"a.png\"> --> -->\n"), 0);
+        assert_eq!(md045_count("<div><!-- <img src=\"a.png\"> --></div>\n"), 0);
+        assert_eq!(md045_count("<!--- <img src=\"a.png\"> --->\n"), 0);
+
+        assert_eq!(md045_count("<!-- unclosed\n<img src=\"a.png\">\n"), 1);
+        assert_eq!(md045_count("<!-- c -->\n<img src=\"a.png\">\n"), 1);
+        assert_eq!(
+            md045_count("<img src=\"a.png\">\n<!-- <img src=\"b.png\"> -->\n"),
+            1
+        );
+        assert_eq!(
+            md045_count("<!-- <img src=\"a.png\"> -->\n<img src=\"b.png\">\n"),
+            1
+        );
+
+        // An inline comment already arrives as one `html_inline` node whose name starts with `!`.
+        assert_eq!(md045_count("text <!-- <img src=\"a.png\"> --> text\n"), 0);
     }
 }
