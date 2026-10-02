@@ -303,6 +303,28 @@ const CASES: &[(&str, &str, &str)] = &[
 "#,
     ),
     (
+        "code in a block quote",
+        ">     code\n\n>     more\n\n> para\n",
+        r#"(document 0:0-5:0 0-31
+  (section 0:0-5:0 0-31
+    (block_quote 0:0-1:0 0-11
+      (indented_code_block 0:2-1:0 2-11)
+    )
+    (block_quote 2:0-3:0 12-23
+      (indented_code_block 2:2-3:0 14-23)
+    )
+    (block_quote 4:0-5:0 24-31
+      (paragraph 4:2-5:0 26-31
+        (inline 4:2-4:6 26-30
+          (text 4:2-4:6 26-30)
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
         "table",
         "| a | b |\n|:--|--:|\n| 1 |\n",
         r#"(document 0:0-3:0 0-26

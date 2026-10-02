@@ -378,9 +378,30 @@ impl<'a> Builder<'a> {
         let prefix = continuation_prefix(&self.nodes, parents, &self.lines, index, start_row);
         let indent = prefix + 4;
 
+        // Trailing blank rows belong to the block's range too, so it runs on to whatever follows.
+        let parent = parents[index];
+        let (siblings, parent_end) = if parent == u32::MAX {
+            (top_level, self.document_end())
+        } else {
+            (
+                self.nodes[parent as usize].children.as_slice(),
+                self.nodes[parent as usize].end(),
+            )
+        };
+
+        // The scan stops at the container's last row. A blank row looks the same from inside a block
+        // quote as from outside it, so without this a quoted code block followed by a blank row and
+        // an identical quote claims the rows of the second one.
+        let last_parent_row = if parent_end.1 == 0 {
+            parent_end.0.saturating_sub(1)
+        } else {
+            parent_end.0
+        };
+        let limit = (self.lines.line_count() as u32).min(last_parent_row + 1);
+
         let mut last_code = start_row;
         let mut row = start_row + 1;
-        while row < self.lines.line_count() as u32 {
+        while row < limit {
             match self.content_indent(parents, index, row) {
                 // Blank once container prefixes are stripped, so still inside the block.
                 None => row += 1,
@@ -398,16 +419,6 @@ impl<'a> Builder<'a> {
             (last_code, self.lines.content_len(last_code as usize))
         };
 
-        // Trailing blank rows belong to the block's range too, so it runs on to whatever follows.
-        let parent = parents[index];
-        let (siblings, parent_end) = if parent == u32::MAX {
-            (top_level, self.document_end())
-        } else {
-            (
-                self.nodes[parent as usize].children.as_slice(),
-                self.nodes[parent as usize].end(),
-            )
-        };
         let followed = siblings
             .iter()
             .position(|&sibling| sibling as usize == index)
