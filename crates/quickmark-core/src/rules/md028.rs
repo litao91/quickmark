@@ -1,18 +1,11 @@
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::ast::Node;
 
-use crate::{
-    linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
-};
+use crate::linter::{CharPosition, Range, RuleViolation};
 
-/// MD028 Blank lines inside blockquote Rule Linter
-///
-/// **SINGLE-USE CONTRACT**: This linter is designed for one-time use only.
-/// After processing a document (via feed() calls and finalize()), the linter
-/// should be discarded. The violations state is not cleared between uses.
+use crate::rules::{Context, Rule, RuleLinter, RuleType};
+
 pub(crate) struct MD028Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
@@ -26,80 +19,79 @@ impl MD028Linter {
         }
     }
 
-    fn analyze_all_lines(&mut self) {
-        let code_block_lines = self.get_code_block_lines();
-        let lines = self.context.lines.borrow();
-
-        let mut last_line_was_blockquote = false;
-        let mut blank_line_sequence_start: Option<usize> = None;
-
-        for (i, line) in lines.iter().enumerate() {
-            if code_block_lines.contains(&(i + 1)) {
-                last_line_was_blockquote = false;
-                blank_line_sequence_start = None;
-                continue;
-            }
-
-            if self.is_blockquote_line(line) {
-                if let Some(blank_idx) = blank_line_sequence_start {
-                    self.violations.push(RuleViolation::new(
-                        &MD028,
-                        "Blank line inside blockquote".to_string(),
-                        self.context.file_path.clone(),
-                        range_from_node_range(&crate::ast::NodeRange {
-                            start_byte: 0,
-                            end_byte: 0,
-                            start_point: crate::ast::Point {
-                                row: blank_idx,
-                                column: 0,
-                            },
-                            end_point: crate::ast::Point {
-                                row: blank_idx,
-                                column: lines[blank_idx].len(),
-                            },
-                        }),
-                    ));
-                }
-                last_line_was_blockquote = true;
-                blank_line_sequence_start = None;
-            } else if self.is_blank_line(line) {
-                if last_line_was_blockquote && blank_line_sequence_start.is_none() {
-                    blank_line_sequence_start = Some(i);
-                }
-            } else {
-                last_line_was_blockquote = false;
-                blank_line_sequence_start = None;
-            }
+    /// Reports the blank rows between one block quote and whatever follows it, when that is another
+    /// block quote.
+    ///
+    /// markdownlint walks the token's siblings and collects blank line endings until it meets
+    /// something that is not one, and a block quote is the only thing that turns them into
+    /// violations — a paragraph, an indented code block or an HTML block in between ends the run
+    /// quietly. Reading that off the tree rather than off lines beginning with `>` is what keeps a
+    /// `>` inside a fenced code block from looking like a quote, which is why this rule needs no
+    /// list of code block lines to exclude.
+    fn check(&mut self, node: Node) {
+        let Some(next) = next_sibling(node) else {
+            return;
+        };
+        if next.kind() != "block_quote" {
+            return;
+        }
+        let blanks = {
+            let lines = self.context.lines.borrow();
+            (last_row(node) + 1..next.start_position().row)
+                .filter(|&row| lines.get(row).is_some_and(|line| line.trim().is_empty()))
+                .collect::<Vec<_>>()
+        };
+        for row in blanks {
+            self.violations.push(RuleViolation::new(
+                &MD028,
+                "Blank line inside blockquote".to_string(),
+                self.context.file_path.clone(),
+                Range {
+                    start: CharPosition {
+                        line: row,
+                        character: 0,
+                    },
+                    end: CharPosition {
+                        line: row,
+                        character: self
+                            .context
+                            .lines
+                            .borrow()
+                            .get(row)
+                            .map_or(0, |line| line.len()),
+                    },
+                },
+            ));
         }
     }
+}
 
-    fn get_code_block_lines(&self) -> HashSet<usize> {
-        let node_cache = self.context.node_cache.borrow();
-        let mut code_block_lines = HashSet::new();
-        let node_types = ["indented_code_block", "fenced_code_block", "html_block"];
-        for node_type in &node_types {
-            if let Some(nodes) = node_cache.get(*node_type) {
-                for node_info in nodes {
-                    code_block_lines.extend((node_info.line_start + 1)..=(node_info.line_end + 1));
-                }
-            }
-        }
-        code_block_lines
-    }
+/// The node after `node` under the same parent.
+fn next_sibling<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    let parent = node.parent()?;
+    let position = (0..parent.child_count()).find(|&index| {
+        parent
+            .child(index)
+            .is_some_and(|child| child.id() == node.id())
+    })?;
+    parent.child(position + 1)
+}
 
-    fn is_blockquote_line(&self, line: &str) -> bool {
-        line.trim_start().starts_with('>')
-    }
-
-    fn is_blank_line(&self, line: &str) -> bool {
-        line.trim().is_empty()
+/// The row a block's last content is on: a block's end swallows its trailing newline, which puts
+/// `end_position` on the row after it.
+fn last_row(node: Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 {
+        end.row.saturating_sub(1)
+    } else {
+        end.row
     }
 }
 
 impl RuleLinter for MD028Linter {
     fn feed(&mut self, node: &Node) {
-        if node.kind() == "document" {
-            self.analyze_all_lines();
+        if node.kind() == "block_quote" {
+            self.check(*node);
         }
     }
 
@@ -113,13 +105,8 @@ pub const MD028: Rule = Rule {
     alias: "no-blanks-blockquote",
     tags: &["blockquote", "whitespace"],
     description: "Blank lines inside blockquotes",
-    rule_type: RuleType::Hybrid,
-    required_nodes: &[
-        "document",
-        "indented_code_block",
-        "fenced_code_block",
-        "html_block",
-    ],
+    rule_type: RuleType::Token,
+    required_nodes: &["block_quote"],
     new_linter: |context| Box::new(MD028Linter::new(context)),
 };
 
@@ -241,5 +228,58 @@ Some text here.
             !violations.is_empty(),
             "Should detect blank lines in nested blockquotes"
         );
+    }
+
+    /// The lines markdownlint reports, 1-based: every blank one between the two quotes.
+    type Line = usize;
+
+    fn lines(source: &str) -> Vec<Line> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), source);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| violation.location().range.start.line + 1)
+            .collect()
+    }
+
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output with
+    /// MD028's defaults.
+    ///
+    /// What sits between the quotes decides, not what the lines look like: a fenced code block
+    /// holding a `>` is not a quote, and a quote holding a fenced code block still is one.
+    const CASES: &[(&str, &[Line])] = &[
+        ("> a\n\n> b\n", &[2]),
+        ("> a\n\n\n> b\n", &[2, 3]),
+        ("> a\n\nb\n", &[]),
+        ("> a\n\ntext\n\n> b\n", &[]),
+        ("text\n\n> a\n\n> b\n", &[4]),
+        ("> a\n> c\n\n> b\n", &[3]),
+        ("> a\n\n> b\n\n> c\n", &[2, 4]),
+        ("- x\n\n> a\n\n> b\n", &[4]),
+        ("> a\n\n    code\n\n> b\n", &[]),
+        ("> a\n\n> b\n\ntext\n", &[2]),
+        ("> ```\n> x\n> ```\n\n> b\n", &[4]),
+        ("> a\n\n<div>\n</div>\n\n> b\n", &[]),
+        ("> > a\n>\n> > b\n", &[]),
+        ("> > a\n\n> > b\n", &[2]),
+        ("- > a\n  > b\n", &[]),
+        ("- > a\n\n  > b\n", &[2]),
+        ("> a\r\n\r\n> b\r\n", &[2]),
+        ("> a\n\n\n\n> b\n", &[2, 3, 4]),
+        ("> a\n# h\n\n> b\n", &[]),
+        ("> a\n\n> b\n> c\n\n> d\n", &[2, 5]),
+        ("> a\n\n> b\n\n> c\n\n> d\n", &[2, 4, 6]),
+        ("```\n> a\n```\n\n> b\n", &[]),
+        ("> a\n\n> b\ntext\n", &[2]),
+    ];
+
+    #[test]
+    fn matches_markdownlint() {
+        for &(source, expected) in CASES {
+            let mut found = lines(source);
+            found.sort_unstable();
+            assert_eq!(expected, found.as_slice(), "source {source:?}");
+        }
     }
 }
