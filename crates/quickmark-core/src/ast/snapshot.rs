@@ -636,6 +636,27 @@ const CASES: &[(&str, &str, &str)] = &[
 )
 "#,
     ),
+    (
+        "inline math",
+        "text $a_b$ and $$x^*$$ then *em*\n",
+        r#"(document 0:0-1:0 0-33
+  (section 0:0-1:0 0-33
+    (paragraph 0:0-1:0 0-33
+      (inline 0:0-0:32 0-32
+        (text 0:0-0:5 0-5)
+        (math 0:5-0:10 5-10)
+        (text 0:10-0:15 10-15)
+        (math 0:15-0:22 15-22)
+        (text 0:22-0:28 22-28)
+        (emphasis 0:28-0:32 28-32
+          (text 0:29-0:31 29-31)
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
 ];
 
 #[test]

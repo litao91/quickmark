@@ -416,8 +416,9 @@ Second heading
             "link",
             "image",
             "html_inline",
+            "math",
         ];
-        let source = "text *em* **strong** `code` [link](/u) ![img](/i) <b>html</b>\n";
+        let source = "text *em* **strong** `code` [link](/u) ![img](/i) <b>html</b> $math$\n";
         let tree = crate::ast::build::parse(source);
         let emitted = (0..tree.node_count())
             .map(|index| tree.node(index as u32))

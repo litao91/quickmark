@@ -412,9 +412,8 @@ mod test {
 
     #[test]
     fn test_inline_math_is_not_emphasis() {
-        // `_b_` sits between word characters, so comrak makes no emphasis out of it and `*emph*`
-        // sets the style. This passes on the intraword rule, not on math: `math_dollars` is off, so
-        // `$ _a_ $` would still count as emphasis here where markdownlint sees only math.
+        // `$a_b_c$` is one math node, so nothing inside it is a delimiter and `*emph*` sets the
+        // style.
         assert!(md049_messages("text $a_b_c$ more *emph*").is_empty());
     }
 
@@ -479,5 +478,32 @@ mod test {
                 .all(|m| m == "Expected: underscore; Actual: asterisk"),
             "unexpected: {messages:?}"
         );
+    }
+
+    /// markdownlint parses with micromark's `math()` at its defaults, so `$…$` is a math token and
+    /// an asterisk inside it is not a delimiter. comrak needs `extension.math_dollars` for the same,
+    /// and it applies micromark's constraint that the opening `$` is not followed by whitespace and
+    /// the closing one is not preceded by whitespace.
+    #[test]
+    fn test_asterisks_inside_inline_math_are_not_emphasis() {
+        assert!(md049_messages("_x_\n\n$X_1^*$ and $T_n^*$ here\n").is_empty());
+        assert!(md049_messages("_x_\n\n$G^* = (T^*, E^*)$ of a graph\n").is_empty());
+        // The `*` inside `\stackrel{*}` is math, so the trailing `*y*` is the only emphasis and it
+        // is the asterisk half of a document whose style `_x_` set to underscore.
+        assert_eq!(
+            2,
+            md049_messages("_x_\n\n$\\alpha \\stackrel{*}{\\Rightarrow} \\beta$ and *y*\n").len()
+        );
+
+        // A `$` amount is not a math delimiter, and neither is a `$` with whitespace inside it.
+        assert_eq!(
+            2,
+            md049_messages("_x_\n\nprice $5 and $10 then *y*\n").len()
+        );
+        assert_eq!(2, md049_messages("_x_\n\n$ a_b $ not math *y*\n").len());
+
+        // Math does not hide real emphasis beside it, and a code span still wins over math.
+        assert_eq!(2, md049_messages("_x_\n\n$a$ plain *y*\n").len());
+        assert_eq!(2, md049_messages("_x_\n\n`$a*$` code span *y*\n").len());
     }
 }

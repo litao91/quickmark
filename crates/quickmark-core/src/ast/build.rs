@@ -53,6 +53,10 @@ pub fn comrak_options() -> Options<'static> {
     options.extension.table = true;
     options.extension.tasklist = true;
     options.extension.front_matter_delimiter = Some("---".into());
+    // markdownlint parses with micromark's `math()` at its defaults, so `$…$` is a math token there
+    // and its contents are never emphasis, HTML or a link. Without this, comrak leaves the `$` as
+    // text and every inline rule sees through it.
+    options.extension.math_dollars = true;
     options.parse.sourcepos_chars = false;
     options.parse.smart = false;
     options.parse.ignore_setext = false;
@@ -938,6 +942,8 @@ impl<'a> Builder<'a> {
             NodeValue::Link(_) => Kind::Link,
             NodeValue::Image(_) => Kind::Image,
             NodeValue::HtmlInline(_) => Kind::HtmlInline,
+            // comrak's math is inline-only and carries its contents as a literal, so this is a leaf.
+            NodeValue::Math(_) => Kind::Math,
             // A line break carries no structure a rule can use, and the `text` nodes either side of
             // it already cover the bytes. `Raw` and `EscapedTag` are comrak's text-like leftovers.
             NodeValue::SoftBreak

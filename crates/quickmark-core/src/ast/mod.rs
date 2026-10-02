@@ -51,6 +51,7 @@ pub enum Kind {
     Link,
     Image,
     HtmlInline,
+    Math,
     FencedCodeBlock,
     IndentedCodeBlock,
     CodeFenceContent,
@@ -105,6 +106,7 @@ pub const KIND_NAMES: &[&str] = &[
     "link",
     "image",
     "html_inline",
+    "math",
     "fenced_code_block",
     "indented_code_block",
     "code_fence_content",
@@ -166,6 +168,7 @@ impl Kind {
                 | Kind::Link
                 | Kind::Image
                 | Kind::HtmlInline
+                | Kind::Math
         )
     }
 }
