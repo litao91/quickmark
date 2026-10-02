@@ -63,18 +63,6 @@ impl MD052Linter {
         }
     }
 
-    fn normalize_reference(&self, label: &str) -> String {
-        // Normalize reference labels according to CommonMark spec:
-        // - Convert to lowercase
-        // - Trim whitespace
-        // - Collapse consecutive whitespace to single spaces
-        label
-            .to_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
     /// Finds the reference syntax in one inline subtree.
     ///
     /// A reference the parser resolved is a `link` or `image` node, so what is left to find here is
@@ -105,7 +93,7 @@ impl MD052Linter {
                     == Some(&b'!');
                 let start = if is_image { start - 1 } else { start };
                 let Some((label, is_shortcut)) =
-                    self.classify(&scanned[capture.range()], &text[capture.range()])
+                    classify(&scanned[capture.range()], &text[capture.range()])
                 else {
                     continue;
                 };
@@ -117,30 +105,6 @@ impl MD052Linter {
             }
         }
         self.references.extend(found);
-    }
-
-    /// The label a bracket run refers to and whether it is a shortcut, or `None` when micromark would
-    /// not have made a reference out of it at all.
-    ///
-    /// `scanned` and `real` are the same run with and without the spans [`Spans`] blanked out. The
-    /// brackets come from the first and the label from the second, so a code span inside a label
-    /// neither splits the run nor ends up in the message.
-    fn classify(&self, scanned: &str, real: &str) -> Option<(String, bool)> {
-        let groups = bracket_groups(scanned);
-        // micromark pairs the last opener it can, so the run stands for its last non-empty group;
-        // an empty one is a collapsed reference's `[]` and defers to the group before it. That is
-        // why `[a][b][c]` reports `c`, `[x][y][z][]` reports `z` and `[a][][]` reports `a`.
-        let label = groups.iter().rev().find(|&&(from, to)| from < to)?;
-        // With no opener text there is nothing to pair, so `[][b]` and `[ ][b]` are no reference at
-        // all rather than a shortcut for `b`.
-        let opener = groups.first()?;
-        if real[opener.0..opener.1].trim().is_empty() || real[label.0..label.1].trim().is_empty() {
-            return None;
-        }
-        Some((
-            self.normalize_reference(&real[label.0..label.1]),
-            groups.len() == 1,
-        ))
     }
 
     /// A reference spanning lines is reported on the line it opens on, and only as far as that line
@@ -238,7 +202,7 @@ impl Spans {
 }
 
 /// The byte range of each `[...]` group's contents in a chain, in order.
-fn bracket_groups(chain: &str) -> Vec<(usize, usize)> {
+pub(crate) fn bracket_groups(chain: &str) -> Vec<(usize, usize)> {
     let bytes = chain.as_bytes();
     let mut groups = Vec::new();
     let mut index = 0;
@@ -258,6 +222,46 @@ fn bracket_groups(chain: &str) -> Vec<(usize, usize)> {
     groups
 }
 
+/// The group a run of bracket groups stands for: the last non-empty one, since micromark pairs the
+/// last opener it can and an empty group is a collapsed reference's `[]` deferring to the group
+/// before it. That is why `[a][b][c]` is a reference to `c`, `[x][y][z][]` to `z` and `[a][][]` to
+/// `a`.
+fn label_group(groups: &[(usize, usize)]) -> Option<(usize, usize)> {
+    groups.iter().rev().copied().find(|&(from, to)| from < to)
+}
+
+/// The byte range of the label a bracket run names, or `None` when every group is empty.
+pub(crate) fn bracket_label(chain: &str) -> Option<(usize, usize)> {
+    label_group(&bracket_groups(chain))
+}
+
+/// A label as CommonMark matches it: lowercased, trimmed, and with runs of whitespace collapsed.
+pub(crate) fn normalize_label(label: &str) -> String {
+    label
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The label a bracket run refers to and whether it is a shortcut, or `None` when micromark would not
+/// have made a reference out of it at all.
+///
+/// `scanned` and `real` are the same run with and without the spans [`Spans`] blanked out. The
+/// brackets come from the first and the label from the second, so a code span inside a label neither
+/// splits the run nor ends up in the message.
+fn classify(scanned: &str, real: &str) -> Option<(String, bool)> {
+    let groups = bracket_groups(scanned);
+    let label = label_group(&groups)?;
+    // With no opener text there is nothing to pair, so `[][b]` and `[ ][b]` are no reference at all
+    // rather than a shortcut for `b`.
+    let opener = groups.first()?;
+    if real[opener.0..opener.1].trim().is_empty() || real[label.0..label.1].trim().is_empty() {
+        return None;
+    }
+    Some((normalize_label(&real[label.0..label.1]), groups.len() == 1))
+}
+
 impl RuleLinter for MD052Linter {
     fn feed(&mut self, node: &Node) {
         if node.kind() == "inline" {
@@ -271,7 +275,7 @@ impl RuleLinter for MD052Linter {
         let ignored_labels: HashSet<String> = config
             .ignored_labels
             .iter()
-            .map(|label| self.normalize_reference(label))
+            .map(|label| normalize_label(label))
             .collect();
 
         for reference in std::mem::take(&mut self.references) {

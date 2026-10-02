@@ -2,285 +2,207 @@ use crate::ast::Node;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::{
-    linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    linter::{CharPosition, Range, RuleViolation},
+    rules::{
+        md052::{bracket_label, normalize_label},
+        Context, Rule, RuleLinter, RuleType,
+    },
 };
 
 // MD053-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
 pub struct MD053LinkImageReferenceDefinitionsTable {
-    #[serde(default)]
+    // Not `#[serde(default)]`: a settings table that sets nothing still gets the default ignored
+    // definitions, which is what markdownlint's `config.ignored_definitions || ["//"]` does.
+    #[serde(default = "default_ignored_definitions")]
     pub ignored_definitions: Vec<String>,
+}
+
+fn default_ignored_definitions() -> Vec<String> {
+    vec!["//".to_string()]
 }
 
 impl Default for MD053LinkImageReferenceDefinitionsTable {
     fn default() -> Self {
         Self {
-            ignored_definitions: vec!["//".to_string()],
+            ignored_definitions: default_ignored_definitions(),
         }
     }
 }
 
-// Pre-compiled regex patterns for performance
-static FULL_REFERENCE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[([^\]]*)\]\[([^\]]*)\]").unwrap());
-
-static COLLAPSED_REFERENCE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[([^\]]+)\]\[\]").unwrap());
-
-static SHORTCUT_REFERENCE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[([^\]]+)\]").unwrap());
-
-static REFERENCE_DEFINITION_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^\s*\[([^\]]+)\]:\s*").unwrap());
+/// The label on a definition's first line. The node's shape is the parser's business — this only cuts
+/// the label out, and a label may hold escapes, so `\]` does not end it.
+static DEFINITION_LABEL: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^[ \t]{0,3}\[((?:[^\]\\]|\\.)*)\]:").expect("Invalid definition label pattern")
+});
 
 #[derive(Debug, Clone)]
-struct ReferenceDefinition {
+struct Definition {
     label: String,
-    range: crate::ast::NodeRange,
+    row: usize,
 }
 
 pub(crate) struct MD053Linter {
     context: Rc<Context>,
-    definitions: HashMap<String, Vec<ReferenceDefinition>>, // Track multiple definitions per label
-    references: HashSet<String>,                            // All referenced labels
+    /// The first definition of each label, in document order.
+    definitions: Vec<Definition>,
+    /// Every definition after the first of its label, in document order.
+    duplicates: Vec<Definition>,
+    seen: HashSet<String>,
+    used: HashSet<String>,
 }
 
 impl MD053Linter {
     pub fn new(context: Rc<Context>) -> Self {
         Self {
             context,
-            definitions: HashMap::new(),
-            references: HashSet::new(),
+            definitions: Vec::new(),
+            duplicates: Vec::new(),
+            seen: HashSet::new(),
+            used: HashSet::new(),
         }
     }
 
-    fn normalize_reference(&self, label: &str) -> String {
-        // Normalize reference labels according to CommonMark spec:
-        // - Convert to lowercase
-        // - Trim whitespace
-        // - Collapse consecutive whitespace to single spaces
-        let mut result = String::with_capacity(label.len());
-        let mut prev_was_space = false;
-
-        for ch in label.chars() {
-            if ch.is_whitespace() {
-                if !prev_was_space && !result.is_empty() {
-                    result.push(' ');
-                    prev_was_space = true;
-                }
-            } else {
-                result.push(ch.to_lowercase().next().unwrap_or(ch));
-                prev_was_space = false;
-            }
-        }
-
-        // Remove trailing space if present
-        if result.ends_with(' ') {
-            result.pop();
-        }
-
-        result
-    }
-
-    fn extract_reference_definition(&self, node: &Node) -> Vec<ReferenceDefinition> {
-        // Extract the label from reference definition nodes
-        // [label]: url "title"
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let document_content = self.context.document_content.borrow();
-        let content = &document_content[start_byte..end_byte];
-
-        REFERENCE_DEFINITION_PATTERN
-            .captures_iter(content)
-            .filter_map(|cap| {
-                cap.get(1).map(|label| {
-                    let normalized_label = self.normalize_reference(label.as_str());
-                    ReferenceDefinition {
-                        label: normalized_label,
-                        range: node.range(),
-                    }
+    /// Records one definition, keeping the first of each label and listing the rest as duplicates —
+    /// markdownlint splits them the same way, and a later definition of a label is unreachable
+    /// whichever way round the two are reported.
+    fn add_definition(&mut self, node: Node) {
+        let definition = {
+            let source = self.context.document_content.borrow();
+            let text = &source[node.start_byte()..node.end_byte()];
+            // A definition runs on to the lines carrying its title, and its label is on the first.
+            let first_line = text.split(['\n', '\r']).next().unwrap_or(text);
+            DEFINITION_LABEL.captures(first_line).and_then(|found| {
+                found.get(1).map(|label| Definition {
+                    label: normalize_label(label.as_str()),
+                    row: node.start_position().row,
                 })
             })
-            .collect()
+        };
+        let Some(definition) = definition else {
+            return;
+        };
+        if self.seen.insert(definition.label.clone()) {
+            self.definitions.push(definition);
+        } else {
+            self.duplicates.push(definition);
+        }
     }
 
-    fn extract_reference_links(&self, node: &Node) -> Vec<String> {
-        // Extract reference links in different formats:
-        // Full: [text][label]
-        // Collapsed: [label][]
-        // Shortcut: [label]
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let document_content = self.context.document_content.borrow();
-        let content = &document_content[start_byte..end_byte];
+    /// The labels one inline subtree refers to.
+    ///
+    /// Only what the parser resolved counts, and a resolved reference is a `link` or `image` node
+    /// whose own text still holds the label. Syntax that resolved to nothing names no definition, so
+    /// it has nothing to keep from being reported unused.
+    fn collect_uses(&mut self, root: Node) {
+        let mut found = Vec::new();
+        {
+            let source = self.context.document_content.borrow();
+            let mut cursor = root.walk();
+            let mut depth = 0;
+            loop {
+                let node = cursor.node();
+                if matches!(node.kind(), "link" | "image") {
+                    if let Ok(text) = node.utf8_text(source.as_bytes()) {
+                        // An inline link ends in `)` and an autolink in `>`; only reference syntax
+                        // names a label, and it ends in the `]` that closed it.
+                        if text.ends_with(']') {
+                            found.extend(
+                                bracket_label(text)
+                                    .map(|(from, to)| normalize_label(&text[from..to])),
+                            );
+                        }
+                    }
+                }
 
-        let mut links = Vec::new();
-
-        // Check for inline links first (contain parentheses - not reference links)
-        if content.contains('(') && content.contains(')') {
-            return links; // This is an inline link, not a reference link
-        }
-
-        // Full reference: [text][label]
-        for cap in FULL_REFERENCE_PATTERN.captures_iter(content) {
-            if let Some(label) = cap.get(2) {
-                let label_str = label.as_str();
-                if !label_str.is_empty() {
-                    links.push(self.normalize_reference(label_str));
+                if cursor.goto_first_child() {
+                    depth += 1;
+                    continue;
+                }
+                loop {
+                    if depth == 0 {
+                        self.used.extend(found);
+                        return;
+                    }
+                    if cursor.goto_next_sibling() {
+                        break;
+                    }
+                    cursor.goto_parent();
+                    depth -= 1;
                 }
             }
         }
+    }
 
-        // Collapsed reference: [label][]
-        for cap in COLLAPSED_REFERENCE_PATTERN.captures_iter(content) {
-            if let Some(label) = cap.get(1) {
-                links.push(self.normalize_reference(label.as_str()));
-            }
-        }
-
-        // Shortcut reference: [label] - check all potential shortcuts
-        // We need to be careful not to double-count references that were already caught by full/collapsed patterns
-        let mut shortcut_candidates = Vec::new();
-        for cap in SHORTCUT_REFERENCE_PATTERN.captures_iter(content) {
-            if let Some(label) = cap.get(1) {
-                let full_match = cap.get(0).expect("regex match should have group 0");
-                let start = full_match.start();
-                let end = full_match.end();
-                let remaining = &content[end..];
-
-                // Check if this looks like a shortcut (not immediately followed by [] or [label])
-                // We only reject if immediately followed by brackets, not if there's whitespace/newline first
-                let immediately_followed_by_bracket = remaining.starts_with('[');
-                if !immediately_followed_by_bracket {
-                    shortcut_candidates.push((
-                        start,
-                        end,
-                        self.normalize_reference(label.as_str()),
-                    ));
-                }
-            }
-        }
-
-        // Filter out shortcut candidates that overlap with already found full/collapsed references
-        // Use a HashSet for O(1) lookup performance
-        let mut existing_labels: HashSet<String> = links.iter().cloned().collect();
-        for (_start, _end, normalized_label) in shortcut_candidates {
-            // Check if this shortcut overlaps with any full/collapsed reference we already found
-            // For now, we'll use a simple heuristic: if we didn't find this as a full/collapsed reference,
-            // and it's not followed by brackets, treat it as a shortcut
-            if !existing_labels.contains(&normalized_label) {
-                existing_labels.insert(normalized_label.clone());
-                links.push(normalized_label);
-            }
-        }
-
-        links
+    /// markdownlint's `errorRange` for a definition is its whole first line, however many lines the
+    /// definition itself spans.
+    fn report(&self, kind: &str, definition: &Definition) -> RuleViolation {
+        let width = self
+            .context
+            .lines
+            .borrow()
+            .get(definition.row)
+            .map_or(0, |line| line.len());
+        RuleViolation::new(
+            &MD053,
+            format!(
+                "{kind} link or image reference definition: \"{}\"",
+                definition.label
+            ),
+            self.context.file_path.clone(),
+            Range {
+                start: CharPosition {
+                    line: definition.row,
+                    character: 0,
+                },
+                end: CharPosition {
+                    line: definition.row,
+                    character: width,
+                },
+            },
+        )
     }
 }
 
 impl RuleLinter for MD053Linter {
     fn feed(&mut self, node: &Node) {
         match node.kind() {
-            // Handle reference definitions like [label]: url
-            "link_reference_definition" => {
-                let definitions = self.extract_reference_definition(node);
-                for definition in definitions {
-                    self.definitions
-                        .entry(definition.label.clone())
-                        .or_default()
-                        .push(definition);
-                }
-            }
-            // Handle paragraphs for reference links
-            "paragraph" => {
-                let links = self.extract_reference_links(node);
-                for link in links {
-                    self.references.insert(link);
-                }
-            }
-            // Handle reference links [text][label], [label][], [label]
-            "link" | "image" => {
-                let links = self.extract_reference_links(node);
-                for link in links {
-                    self.references.insert(link);
-                }
-            }
-            _ => {
-                // Ignore other node types
-            }
+            "link_reference_definition" => self.add_definition(*node),
+            "inline" => self.collect_uses(*node),
+            _ => {}
         }
     }
 
     fn finalize(&mut self) -> Vec<RuleViolation> {
-        let mut violations = Vec::new();
         let config = &self
             .context
             .config
             .linters
             .settings
             .link_image_reference_definitions;
-        let ignored_definitions: HashSet<String> = config
+        let ignored: HashSet<String> = config
             .ignored_definitions
             .iter()
-            .map(|label| self.normalize_reference(label))
+            .map(|label| normalize_label(label))
             .collect();
 
-        // Check for unused definitions and duplicates
-        for (label, definitions) in &self.definitions {
-            // Skip if label is in ignored list
-            if ignored_definitions.contains(label) {
-                continue;
-            }
-
-            // Check if definition is unused (no references to it)
-            let is_unused = !self.references.contains(label);
-
-            if definitions.len() > 1 {
-                // Handle duplicate definitions
-                if is_unused {
-                    // If unused, report the first definition as unused
-                    let first_def = &definitions[0];
-                    violations.push(RuleViolation::new(
-                        &MD053,
-                        format!(
-                            "Unused link or image reference definition: \"{}\"",
-                            first_def.label
-                        ),
-                        self.context.file_path.clone(),
-                        range_from_node_range(&first_def.range),
-                    ));
-                }
-                // Report all subsequent definitions as duplicates (first definition wins per CommonMark)
-                for definition in &definitions[1..] {
-                    violations.push(RuleViolation::new(
-                        &MD053,
-                        format!(
-                            "Duplicate link or image reference definition: \"{}\"",
-                            definition.label
-                        ),
-                        self.context.file_path.clone(),
-                        range_from_node_range(&definition.range),
-                    ));
-                }
-            } else if is_unused {
-                // Single definition that is unused
-                let def = &definitions[0];
-                violations.push(RuleViolation::new(
-                    &MD053,
-                    format!(
-                        "Unused link or image reference definition: \"{}\"",
-                        def.label
-                    ),
-                    self.context.file_path.clone(),
-                    range_from_node_range(&def.range),
-                ));
+        let mut violations = Vec::new();
+        // markdownlint walks its unused definitions and then its duplicates, so every "Unused" comes
+        // before every "Duplicate" whatever the document order.
+        for definition in std::mem::take(&mut self.definitions) {
+            if !ignored.contains(&definition.label) && !self.used.contains(&definition.label) {
+                violations.push(self.report("Unused", &definition));
             }
         }
-
+        for definition in std::mem::take(&mut self.duplicates) {
+            if !ignored.contains(&definition.label) {
+                violations.push(self.report("Duplicate", &definition));
+            }
+        }
         violations
     }
 }
@@ -291,7 +213,7 @@ pub const MD053: Rule = Rule {
     tags: &["links", "images"],
     description: "Link and image reference definitions should be needed",
     rule_type: RuleType::Document,
-    required_nodes: &["link", "image", "paragraph", "link_reference_definition"],
+    required_nodes: &["inline", "link_reference_definition"],
     new_linter: |context| Box::new(MD053Linter::new(context)),
 };
 
@@ -303,275 +225,150 @@ mod test {
         LintersSettingsTable, MD053LinkImageReferenceDefinitionsTable, RuleSeverity,
     };
     use crate::linter::MultiRuleLinter;
-    use crate::test_utils::test_helpers::test_config_with_rules;
+    use crate::test_utils::test_helpers::test_config_with_settings;
 
-    fn test_config() -> crate::config::QuickmarkConfig {
-        test_config_with_rules(vec![(
-            "link-image-reference-definitions",
-            RuleSeverity::Error,
-        )])
+    /// One report: markdownlint's line, the kind it names, and the label. Its `errorRange` is always
+    /// the definition's whole line, so there is no column to assert.
+    type Report = (usize, &'static str, &'static str);
+
+    /// The same report with owned strings, which is what splitting a message can hand back.
+    type Found = (usize, String, String);
+
+    fn owned(expected: &[Report]) -> Vec<Found> {
+        expected
+            .iter()
+            .map(|&(line, kind, label)| (line, kind.to_string(), label.to_string()))
+            .collect()
     }
 
-    fn test_config_with_ignored_definitions(
-        ignored_definitions: Vec<String>,
+    fn config_with(
+        table: MD053LinkImageReferenceDefinitionsTable,
     ) -> crate::config::QuickmarkConfig {
-        crate::test_utils::test_helpers::test_config_with_settings(
+        test_config_with_settings(
             vec![("link-image-reference-definitions", RuleSeverity::Error)],
             LintersSettingsTable {
-                link_image_reference_definitions: MD053LinkImageReferenceDefinitionsTable {
-                    ignored_definitions,
-                },
+                link_image_reference_definitions: table,
                 ..Default::default()
             },
         )
     }
 
-    #[test]
-    fn test_unused_definition_basic() {
-        let input = "[unused]: https://example.com
-
-Some text.
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+    fn reports_with(config: crate::config::QuickmarkConfig, source: &str) -> Vec<Found> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, source);
         let violations = linter.analyze();
+        violations
+            .iter()
+            .map(|violation| {
+                let message = violation.message();
+                let (kind, label) = message
+                    .split_once(" link or image reference definition: \"")
+                    .and_then(|(kind, rest)| rest.strip_suffix('"').map(|label| (kind, label)))
+                    .unwrap_or((message, ""));
+                (
+                    violation.location().range.start.line + 1,
+                    kind.to_string(),
+                    label.to_string(),
+                )
+            })
+            .collect()
+    }
 
-        // Should have 1 violation - unused reference definition
-        assert_eq!(1, violations.len());
-        assert!(violations[0]
-            .message()
-            .contains("Unused link or image reference definition: \"unused\""));
+    fn reports(source: &str) -> Vec<Found> {
+        reports_with(
+            config_with(MD053LinkImageReferenceDefinitionsTable::default()),
+            source,
+        )
+    }
+
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output with
+    /// MD053's defaults.
+    const CASES: &[(&str, &[Report])] = &[
+        ("[a]: /u\n\ntext\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n\n[x][a]\n", &[]),
+        ("[a]: /u\n\n[a]\n", &[]),
+        ("[a]: /u\n\n[a][]\n", &[]),
+        ("[a]: /u\n\n![x][a]\n", &[]),
+        ("[a]: /u\n[a]: /v\n\n[x][a]\n", &[(2, "Duplicate", "a")]),
+        (
+            "[a]: /u\n[a]: /v\n\ntext\n",
+            &[(1, "Unused", "a"), (2, "Duplicate", "a")],
+        ),
+        ("[a]: /u\n[b]: /v\n\n[x][a]\n", &[(2, "Unused", "b")]),
+        ("[//]: # (c)\n[a]: /u\n\ntext\n", &[(2, "Unused", "a")]),
+        ("[a]: /u\n  \"title\"\n\ntext\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n\n[x][a] and (y)\n", &[]),
+        ("[a]: /u\n\n`[x][a]`\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n\n$x[a]$\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n\n<div>[x][a]</div>\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n\n# [x][a]\n", &[]),
+        ("[a]: /u\n\n> [x][a]\n", &[]),
+        ("[a]: /u\n\n- [x][a]\n", &[]),
+        ("[a]: /u\n\n| h |\n|---|\n| [x][a] |\n", &[]),
+        ("[a]: /u\n\n[x\n y][a]\n", &[]),
+        ("[a]: /u\n\n[x][A]\n", &[]),
+        ("[  A  b ]: /u\n\n[x][a b]\n", &[]),
+        ("[t]: /u\n\n[t](http://x)\n", &[(1, "Unused", "t")]),
+        ("[a]: /u\n[b]: /v\n\n[a][b]\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n[b]: /v\n\n[b][a]\n", &[(2, "Unused", "b")]),
+        ("[a]: /u\n\n![x](http://y)\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n\n[a](http://x) [a]\n", &[]),
+        ("[a]: /u\n\n[A]\n", &[]),
+        ("[a]: /u\n\n[x][a] [a][]\n", &[]),
+        ("[a]: /u\n\n---\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n[b]: /v\n\n[a][b] [b][a]\n", &[]),
+        ("[a]: /u\n\n[outer [a] text](http://x)\n", &[]),
+        ("[a]: /u\n\n[![i][a]][b]\n", &[]),
+        ("[a]: /u\n\n[outer [a] text]\n", &[]),
+        ("[a]: /u\n\n**[a]**\n", &[]),
+        ("[a]: /u\n\n<a href='[a]'>x</a>\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n\n[x][a]\n[a]: /v\n", &[]),
+        ("[a]: /u\n\n\\[a]\n", &[(1, "Unused", "a")]),
+        ("[a]: some prose here\n\ntext\n", &[]),
+        ("[a]: /u \"t\" junk\n\ntext\n", &[]),
+        ("[a]: /u\n\n[a][b][c]\n", &[(1, "Unused", "a")]),
+        ("[^a]: /u\n\ntext\n", &[(1, "Unused", "^a")]),
+        ("[a]: /u\n\n> [x][a]\n\n[a]: /v\n", &[(5, "Duplicate", "a")]),
+        ("[a]: /u\n\n[x][a]\r\n", &[]),
+        ("[a]: <>\n\ntext\n", &[(1, "Unused", "a")]),
+        ("[a]: /u\n\n[the `x` trait][a]\n", &[]),
+    ];
+
+    #[test]
+    fn matches_markdownlint() {
+        for &(source, expected) in CASES {
+            assert_eq!(owned(expected), reports(source), "source {source:?}");
+        }
+    }
+
+    /// Three shapes markdownlint reports and quickmark does not.
+    ///
+    /// The first two are the facade's, not this rule's: comrak detaches a link reference definition
+    /// and leaves no trace of it, so the tree is rebuilt from the lines nothing else claimed, and a
+    /// definition whose line a list item already covers, or whose destination sits on the line after
+    /// its label, is not among them. The third is a missing parser extension — markdownlint turns on
+    /// micromark's GFM footnotes, so `[^a]: prose` is a footnote definition whose label is `^a`,
+    /// while here it is an ordinary paragraph. `[^a]: /u` is reported either way, because that one is
+    /// also a valid link reference definition.
+    #[test]
+    fn known_differences_from_markdownlint() {
+        let none: &[Report] = &[];
+        // markdownlint: [(1, "Unused", "a")]
+        assert_eq!(owned(none), reports("- [a]: /u\n\ntext\n"));
+        // markdownlint: [(1, "Unused", "a")]
+        assert_eq!(owned(none), reports("[a]:\n/u\n\ntext\n"));
+        // markdownlint: [(1, "Unused", "^a")]
+        assert_eq!(owned(none), reports("[^a]: prose here\n\ntext\n"));
     }
 
     #[test]
-    fn test_used_definition_basic() {
-        let input = "[label]: https://example.com
-
-[Good link][label]
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - definition is used
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_duplicate_definitions() {
-        let input = "[label]: https://example.com/1
-[label]: https://example.com/2
-
-[Good link][label]
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 1 violation - duplicate definition (second one)
-        assert_eq!(1, violations.len());
-        assert!(violations[0]
-            .message()
-            .contains("Duplicate link or image reference definition: \"label\""));
-    }
-
-    #[test]
-    fn test_unused_and_duplicate() {
-        let input = "[unused1]: https://example.com/1
-[unused2]: https://example.com/2
-[duplicate]: https://example.com/3
-[duplicate]: https://example.com/4
-
-Some text.
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 4 violations: 2 unused + 1 duplicate + 1 unused (both duplicates are unused)
-        assert_eq!(4, violations.len());
-
-        // Check violation types
-        let messages: Vec<&str> = violations.iter().map(|v| v.message()).collect();
-        let unused_count = messages.iter().filter(|m| m.contains("Unused")).count();
-        let duplicate_count = messages.iter().filter(|m| m.contains("Duplicate")).count();
-
-        assert_eq!(3, unused_count); // unused1, unused2, and both duplicate entries are unused
-        assert_eq!(1, duplicate_count); // second duplicate entry
-    }
-
-    #[test]
-    fn test_collapsed_reference_format() {
-        let input = "[label]: https://example.com
-
-[label][]
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - collapsed reference is used
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_shortcut_reference_format() {
-        let input = "[label]: https://example.com
-
-[label]
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - shortcut reference is used
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_image_references() {
-        let input = "[image]: https://example.com/image.png
-[unused-image]: https://example.com/unused.png
-
-![Alt text][image]
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 1 violation - unused image reference
-        assert_eq!(1, violations.len());
-        assert!(violations[0]
-            .message()
-            .contains("Unused link or image reference definition: \"unused-image\""));
-    }
-
-    #[test]
-    fn test_case_insensitive_matching() {
-        let input = "[Label]: https://example.com
-
-[Good link][LABEL]
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - case insensitive matching per CommonMark
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_whitespace_normalization() {
-        let input = "[  label   with   spaces  ]: https://example.com
-
-[Good link][label with spaces]
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - whitespace is normalized per CommonMark
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_ignored_definitions_default() {
-        let input = "[//]: # (This is a comment)
-[unused]: https://example.com
-
-Some text.
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 1 violation - '//' is ignored by default, but 'unused' is not
-        assert_eq!(1, violations.len());
-        assert!(violations[0]
-            .message()
-            .contains("Unused link or image reference definition: \"unused\""));
-    }
-
-    #[test]
-    fn test_custom_ignored_definitions() {
-        let input = "[custom]: https://example.com
-[another]: https://example.com
-[regular]: https://example.com
-
-[Good link][regular]
-";
-
-        let config =
-            test_config_with_ignored_definitions(vec!["custom".to_string(), "another".to_string()]);
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have no violations - custom and another are ignored, regular is used
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_mixed_scenarios_comprehensive() {
-        let input = "[used-full]: https://example.com/1
-[used-collapsed]: https://example.com/2
-[used-shortcut]: https://example.com/3
-[unused]: https://example.com/4
-[duplicate-used]: https://example.com/5
-[duplicate-used]: https://example.com/6
-[duplicate-unused]: https://example.com/7
-[duplicate-unused]: https://example.com/8
-[//]: # (Ignored comment)
-
-[Link 1][used-full]
-[used-collapsed][]
-[used-shortcut]
-[Link 2][duplicate-used]
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Expected violations:
-        // - unused: unused
-        // - duplicate-used (second): duplicate
-        // - duplicate-unused (first): unused
-        // - duplicate-unused (second): duplicate
-        assert_eq!(4, violations.len());
-
-        let messages: Vec<&str> = violations.iter().map(|v| v.message()).collect();
-        let unused_count = messages.iter().filter(|m| m.contains("Unused")).count();
-        let duplicate_count = messages.iter().filter(|m| m.contains("Duplicate")).count();
-
-        assert_eq!(2, unused_count); // unused + duplicate_unused (first)
-        assert_eq!(2, duplicate_count); // duplicate-used (second) + duplicate-unused (second)
-    }
-
-    #[test]
-    fn test_inline_links_ignored() {
-        let input = "[unused]: https://example.com
-
-[Inline link](https://example.com) and [another](https://example.com).
-";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should have 1 violation - unused definition, inline links don't count as references
-        assert_eq!(1, violations.len());
-        assert!(violations[0]
-            .message()
-            .contains("Unused link or image reference definition: \"unused\""));
+    fn ignored_definitions_replace_the_default() {
+        let source = "[//]: # (c)\n[a]: /u\n\ntext\n";
+        let config = config_with(MD053LinkImageReferenceDefinitionsTable {
+            ignored_definitions: vec!["a".to_string()],
+        });
+        // markdownlint reports only `//`: setting `ignored_definitions` drops the default `//`.
+        assert_eq!(owned(&[(1, "Unused", "//")]), reports_with(config, source));
+        assert_eq!(owned(&[(2, "Unused", "a")]), reports(source));
     }
 }
