@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::rc::Rc;
 
 use crate::ast::Node;
+use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::{
@@ -37,19 +38,37 @@ enum FirstElement {
     None,
 }
 
+/// The tag an HTML block opens with. markdownlint's `getHtmlTagInfo`, which is CommonMark's tag-name
+/// grammar: neither `!` nor `>` may start one, and it ends at a slash, a space, a `>` or the end.
+static HTML_TAG_NAME: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^<([^!>][^/\s>]*)").expect("Invalid HTML tag pattern"));
+
+/// markdownlint's `frontMatterRe`, ported character for character: three delimiter pairs, a `---`
+/// closed by `---`, a `+++` closed by `+++` or `...`, and a `{` closed by `}`.
+///
+/// Front matter is this pattern and not the parser's opinion of it, because markdownlint cuts the
+/// match out of the content before it parses and only accepts one anchored at byte zero. The parser
+/// here is narrower — it wants content between the delimiters, and knows nothing of `{` — so a
+/// document the pattern matches but the parser did not strip still has to be treated as starting
+/// after it, and the other way round.
+static FRONT_MATTER: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?m)((^---[^\S\r\n\u{2028}\u{2029}]*\r?$[\s\S]+?^---\s*)|(^\+\+\+[^\S\r\n\u{2028}\u{2029}]*\r?$[\s\S]+?^(\+\+\+|\.\.\.)\s*)|(^\{[^\S\r\n\u{2028}\u{2029}]*\r?$[\s\S]+?^\}\s*))(\r\n|\r|\n|$)"
+    )
+    .expect("Invalid front matter pattern")
+});
+
 pub(crate) struct MD041Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
     first_element: FirstElement,
-    front_matter_end_byte: Option<usize>,
+    /// Byte just past the front matter, if the document opens with any.
+    front_matter_end: Option<usize>,
     title_regex: Option<Regex>,
 }
 
 impl MD041Linter {
     pub fn new(context: Rc<Context>) -> Self {
-        let content = context.get_document_content();
-        let front_matter_end_byte = Self::calculate_front_matter_end_byte(&content);
-
         let config = &context.config.linters.settings.first_line_heading;
         let title_regex = if !config.front_matter_title.is_empty() {
             Some(
@@ -59,48 +78,25 @@ impl MD041Linter {
         } else {
             None
         };
+        let front_matter_end = {
+            let content = context.get_document_content();
+            // The match has to start at byte zero, and only a document opening with a delimiter can
+            // have one, so the rest are not scanned at all.
+            let opens = content.starts_with(['-', '+', '{']);
+            opens
+                .then(|| FRONT_MATTER.find(&content))
+                .flatten()
+                .filter(|found| found.start() == 0)
+                .map(|found| found.end())
+        };
 
         Self {
             context: context.clone(),
             violations: Vec::new(),
             first_element: FirstElement::None,
-            front_matter_end_byte,
+            front_matter_end,
             title_regex,
         }
-    }
-
-    /// Calculates the end byte of the front matter, including the final newline.
-    /// This is done by iterating through the lines of the content.
-    fn calculate_front_matter_end_byte(content: &str) -> Option<usize> {
-        if !content.starts_with("---") {
-            return None;
-        }
-
-        let mut byte_pos = 0;
-        let mut found_start = false;
-
-        let mut remaining = content;
-        while let Some(newline_pos) = remaining.find('\n') {
-            let line = &remaining[..newline_pos];
-            let line_to_check = line.trim_end_matches('\r');
-
-            if line_to_check.trim() == "---" {
-                if !found_start {
-                    found_start = true;
-                } else {
-                    return Some(byte_pos + newline_pos + 1);
-                }
-            }
-            byte_pos += newline_pos + 1;
-            remaining = &remaining[newline_pos + 1..];
-        }
-
-        // Check last line if no newline at end
-        if !remaining.is_empty() && remaining.trim() == "---" && found_start {
-            return Some(content.len());
-        }
-
-        None
     }
 
     fn extract_heading_level(&self, node: &Node) -> u8 {
@@ -131,96 +127,103 @@ impl MD041Linter {
         }
     }
 
+    /// Whether the front matter names a title, which markdownlint accepts in place of a heading.
     fn check_front_matter_has_title(&self) -> bool {
         let Some(title_regex) = &self.title_regex else {
             return false; // Front matter title checking disabled
         };
-
-        let Some(fm_end) = self.front_matter_end_byte else {
+        let Some(end) = self.front_matter_end else {
             return false; // No front matter found
         };
 
         let content = self.context.get_document_content();
-        let front_matter_content = &content[..fm_end];
-
-        front_matter_content
+        content[..end]
             .lines()
-            .skip(1) // Skip the initial "---"
-            .take_while(|line| line.trim() != "---")
+            .skip(1) // Skip the opening delimiter
             .any(|line| title_regex.is_match(line))
     }
 
+    /// The level of an HTML block that opens with an `<h1>`-`<h6>` tag, which markdownlint accepts in
+    /// place of a heading. `<head>` is not one, and neither is `</h1>`'s counterpart `<h1x>`.
+    fn html_heading_level(&self, node: &Node) -> Option<u8> {
+        let source = self.context.get_document_content();
+        let text = &source[node.start_byte()..node.end_byte()];
+        let name = HTML_TAG_NAME.captures(text)?.get(1)?.as_str();
+        // markdownlint tests the lowercased name against `/^h[1-6]$/`, and its tag info strips a
+        // closing tag's slash first, so `</h2>` counts as a level-two heading.
+        let name = name.strip_prefix('/').unwrap_or(name).to_lowercase();
+        let level = match name.as_str() {
+            "h1" => 1,
+            "h2" => 2,
+            "h3" => 3,
+            "h4" => 4,
+            "h5" => 5,
+            "h6" => 6,
+            _ => return None,
+        };
+        Some(level)
+    }
+
+    /// Whether an HTML block is nothing but a comment, which markdownlint steps over.
+    ///
+    /// The three extra conditions are HTML's, not CommonMark's: `<!-->`, `<!--->` and `<!-- x --->`
+    /// are all blocks that merely start and end like a comment.
     fn is_html_comment(&self, node: &Node) -> bool {
-        if node.kind() == "html_flow" {
-            let source = self.context.get_document_content();
-            let content = &source[node.start_byte()..node.end_byte()];
-            content.trim_start().starts_with("<!--")
-        } else {
-            false
+        if node.kind() != "html_block" {
+            return false;
         }
+        let source = self.context.get_document_content();
+        let text = source[node.start_byte()..node.end_byte()].trim_end();
+        let Some(comment) = text
+            .strip_prefix("<!--")
+            .and_then(|t| t.strip_suffix("-->"))
+        else {
+            return false;
+        };
+        !comment.starts_with('>') && !comment.starts_with("->") && !comment.ends_with('-')
     }
+}
 
-    fn is_in_front_matter(&self, node: &Node) -> bool {
-        if let Some(fm_end) = self.front_matter_end_byte {
-            node.start_byte() < fm_end
-        } else {
-            false
-        }
-    }
-
-    fn should_ignore_node(&self, node: &Node) -> bool {
-        // Ignore front matter nodes
-        if self.is_in_front_matter(node) {
-            return true;
-        }
-
-        // Ignore HTML comments
-        if self.is_html_comment(node) {
-            return true;
-        }
-
-        false
-    }
-
-    fn is_content_node(&self, node: &Node) -> bool {
-        matches!(
-            node.kind(),
-            "paragraph"
-                | "list"
-                | "list_item"
-                | "code_block"
-                | "fenced_code_block"
-                | "blockquote"
-                | "table"
-                | "thematic_break"
-                | "math_block"
-        )
-    }
+/// Whether a node is one of the document's own blocks rather than something nested in one.
+///
+/// markdownlint walks the top-level token list; the facade groups those tokens into `section` nodes,
+/// which have no counterpart there, so a top-level block is a child of `document` or of a `section`
+/// and is never a `section` itself.
+fn is_top_level(node: &Node) -> bool {
+    !matches!(node.kind(), "document" | "section")
+        && node
+            .parent()
+            .is_some_and(|parent| matches!(parent.kind(), "document" | "section"))
 }
 
 impl RuleLinter for MD041Linter {
     fn feed(&mut self, node: &Node) {
-        // Skip if we already processed the first element
-        if !matches!(self.first_element, FirstElement::None) {
+        // Only the first element matters, and only the document's own blocks are elements. Front
+        // matter is not one: markdownlint cuts it out of the content before parsing.
+        if !matches!(self.first_element, FirstElement::None) || !is_top_level(node) {
+            return;
+        }
+        if self
+            .front_matter_end
+            .is_some_and(|end| node.start_byte() < end)
+        {
+            return;
+        }
+        // A comment is not content either, so the element after it is still the first.
+        if self.is_html_comment(node) {
             return;
         }
 
-        // Skip nodes that should be ignored
-        if self.should_ignore_node(node) {
-            return;
-        }
-
-        // Check if this is a heading
-        if node.kind() == "atx_heading" || node.kind() == "setext_heading" {
-            let level = self.extract_heading_level(node);
-            self.first_element = FirstElement::Heading(level, node.range());
-            return;
-        }
-
-        // Check if this is content
-        if self.is_content_node(node) {
-            self.first_element = FirstElement::Content(node.range());
-        }
+        self.first_element = match node.kind() {
+            "atx_heading" | "setext_heading" => {
+                FirstElement::Heading(self.extract_heading_level(node), node.range())
+            }
+            "html_block" => match self.html_heading_level(node) {
+                Some(level) => FirstElement::Heading(level, node.range()),
+                None => FirstElement::Content(node.range()),
+            },
+            _ => FirstElement::Content(node.range()),
+        };
     }
 
     fn finalize(&mut self) -> Vec<RuleViolation> {
@@ -272,18 +275,8 @@ pub const MD041: Rule = Rule {
     tags: &["headings"],
     description: "First line in a file should be a top-level heading",
     rule_type: RuleType::Document,
-    required_nodes: &[
-        "atx_heading",
-        "setext_heading",
-        "paragraph",
-        "list",
-        "list_item",
-        "code_block",
-        "fenced_code_block",
-        "blockquote",
-        "table",
-        "thematic_break",
-    ],
+    // Every kind can be the document's first element, so there is nothing to enumerate.
+    required_nodes: &[],
     new_linter: |context| Box::new(MD041Linter::new(context)),
 };
 
@@ -541,5 +534,138 @@ Content";
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(violations.len(), 0);
+    }
+
+    /// The line markdownlint reports, 1-based, or nothing when the document is acceptable.
+    type Line = usize;
+
+    fn lines(source: &str) -> Vec<Line> {
+        let config = test_config(1, r"^\s*title\s*[:=]", false);
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, source);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| violation.location().range.start.line + 1)
+            .collect()
+    }
+
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output with
+    /// MD041's defaults.
+    const CASES: &[(&str, &[Line])] = &[
+        // The first element decides, whatever kind it is.
+        ("# Heading\n", &[]),
+        ("## Heading\n", &[1]),
+        ("text\n", &[1]),
+        ("[a]: /u\n\n# H\n", &[1]),
+        ("> quote\n", &[1]),
+        ("- item\n", &[1]),
+        ("```\ncode\n```\n", &[1]),
+        ("    indented\n", &[1]),
+        ("---\n", &[1]),
+        ("| a |\n|---|\n", &[1]),
+        ("$$\nmath\n$$\n", &[1]),
+        ("Setext\n======\n", &[]),
+        ("Setext\n---\n", &[1]),
+        ("   # H\n", &[]),
+        ("\n\n# H\n", &[]),
+        ("", &[]),
+        // A heading level that is not a heading at all.
+        ("#\u{fe0f}\u{20e3} H\n", &[1]),
+        // An HTML block stands in for a heading only when it opens with the expected `<h?>` tag,
+        // and a closing tag counts because markdownlint's tag info strips the slash.
+        ("<h1>x</h1>\n", &[]),
+        ("<h1>x</h1>\ntext\n", &[]),
+        ("<h1>x</h1>\n\nmore\n", &[]),
+        ("<H1>x</H1>\n", &[]),
+        ("</h1>\ntext\n", &[]),
+        ("<h2>x</h2>\n", &[1]),
+        ("<h3>x</h3>\n", &[1]),
+        ("<h7>x</h7>\n", &[1]),
+        ("<h1x>y</h1x>\n", &[1]),
+        (
+            "<head>\n  <front>matter</front>\n</head>\n# Heading\n",
+            &[1],
+        ),
+        ("<div>\n# not a heading\n</div>\n", &[1]),
+        // A comment is stepped over, but only one that HTML also calls a comment.
+        ("<!-- comment -->\n# H\n", &[]),
+        ("<!-- c -->\n<!-- d -->\n# H\n", &[]),
+        ("<!-- a --> <!-- b -->\n# H\n", &[]),
+        ("<!-- c -->\n<div>x</div>\n", &[2]),
+        ("<!-- comment -->\n\ntext\n", &[3]),
+        ("<!-- c -->", &[]),
+        ("# H\n<!-- c -->\n", &[]),
+        ("<!--> x -->\n# H\n", &[1]),
+        ("<!---> x -->\n# H\n", &[1]),
+        ("<!-- x --->\n# H\n", &[1]),
+        // All three of markdownlint's front matter delimiter pairs, either line ending, and a
+        // `title` that stands in for the heading.
+        ("---\nfm\n---\n# H\n", &[]),
+        ("---\nfm\n---", &[]),
+        ("---\nfm\n---\n\n# H\n", &[]),
+        ("---   \nfm\n---   \n# H\n", &[]),
+        ("---\nfm\n...\n# H\n", &[1]),
+        ("---\n---\n# H\n", &[]),
+        ("+++\nfm\n+++\n# H\n", &[]),
+        ("+++\nfm\n...\n# H\n", &[]),
+        ("{\nfm\n}\n# H\n", &[]),
+        ("{\nfm\n}", &[]),
+        ("---\ntitle: x\n---\n## H\n", &[]),
+        ("+++\ntitle = \"x\"\n+++\n## H\n", &[]),
+        ("{\ntitle: x\n}\n## H\n", &[]),
+        ("{\nno title\n}\n## H\n", &[4]),
+        // A leading blank line puts the delimiter somewhere other than byte zero, and a `---` that
+        // does not open the file is a setext underline or a thematic break.
+        ("\n---\nfm\n---\n# H\n", &[2]),
+        ("--- x\n---\nfoo\n---\n# H\n", &[1]),
+        ("text\n---\nfm\n---\n# H\n", &[1]),
+        ("---\r\nfm\r\n---\r\n# H\r\n", &[]),
+        ("+++\r\nfm\r\n+++\r\n# H\r\n", &[]),
+        ("\u{feff}# H\n", &[]),
+    ];
+
+    #[test]
+    fn matches_markdownlint() {
+        for &(source, expected) in CASES {
+            assert_eq!(expected, lines(source).as_slice(), "source {source:?}");
+        }
+    }
+
+    /// Three `---` lines in a row. markdownlint's pattern is lazy, so its front matter stops at the
+    /// second and the third is a thematic break it reports; the parser here reads the middle line as
+    /// the front matter's content and swallows all three.
+    #[test]
+    fn three_delimiter_lines_are_a_known_difference() {
+        // markdownlint: [3]
+        assert_eq!(Vec::<Line>::new(), lines("---\n---\n---\n# H\n"));
+    }
+
+    /// The front matter pattern markdownlint strips with, which the rule ports rather than asks the
+    /// parser about — the parser is narrower, and MD041 has to agree with markdownlint and not with
+    /// it. All three delimiter pairs, and only at byte zero.
+    #[test]
+    fn front_matter_pattern_matches_all_three_delimiters() {
+        for source in [
+            "---\nfm\n---\n",
+            "+++\nfm\n+++\n",
+            "+++\nfm\n...\n",
+            "{\nfm\n}\n",
+        ] {
+            assert!(
+                super::FRONT_MATTER
+                    .find(source)
+                    .is_some_and(|found| found.start() == 0 && found.end() == source.len()),
+                "source {source:?}"
+            );
+        }
+        for source in ["text\n---\nfm\n---\n", "--- x\n---\nfoo\n---\n"] {
+            assert!(
+                !super::FRONT_MATTER
+                    .find(source)
+                    .is_some_and(|found| found.start() == 0),
+                "source {source:?}"
+            );
+        }
     }
 }

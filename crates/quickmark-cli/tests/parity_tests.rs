@@ -12,14 +12,15 @@
 //!
 //! Known gaps are recorded in `BASELINE` as the maximum number of fixtures allowed to disagree for
 //! a rule. Shrink an entry when a rule is fixed; the test reports any rule that beat its baseline
-//! so the entry can be tightened.
+//! so the entry can be tightened. It is empty at the moment, which is the point: every fixture
+//! agrees, and adding an entry means adding a known bug.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Rules allowed to disagree, and on how many fixtures, before the suite fails. Every entry is a
 /// known quickmark bug — shrink it as the rule is fixed, and never grow it.
-const BASELINE: &[(&str, usize)] = &[("MD041", 4)];
+const BASELINE: &[(&str, usize)] = &[];
 
 fn parity_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
