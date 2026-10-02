@@ -21,6 +21,8 @@ pub mod walker;
 
 pub(crate) mod synth;
 
+use std::collections::HashMap;
+
 #[cfg(test)]
 mod snapshot;
 
@@ -226,6 +228,22 @@ pub struct FacadeTree {
     /// One entry per node, holding node indices. Every node's children occupy a contiguous slice
     /// because the builder emits in pre-order.
     pub(crate) child_index: Vec<u32>,
+    /// Destinations of the `link` nodes, keyed by node index. Only links have entries.
+    pub(crate) link_targets: HashMap<u32, LinkTarget>,
+}
+
+/// Where a `link` node points.
+///
+/// comrak decodes the destination and title while parsing and keeps the results off the source, so
+/// a rule that needs one cannot recover it from a byte range — `[\[1\]](#)` has no unescaped `#` in
+/// its span, and a reference link's destination is not in its span at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTarget {
+    /// The destination, decoded: entities resolved, backslash escapes removed, angle brackets
+    /// stripped.
+    pub url: String,
+    /// The title, decoded, or empty when the link has none.
+    pub title: String,
 }
 
 impl FacadeTree {
@@ -327,6 +345,11 @@ impl<'a> Node<'a> {
     pub fn utf8_text(self, source: &[u8]) -> Result<&str, std::str::Utf8Error> {
         let n = self.node();
         std::str::from_utf8(&source[n.start_byte as usize..n.end_byte as usize])
+    }
+
+    /// Where a `link` node points, or `None` for every other kind.
+    pub fn link_target(self) -> Option<&'a LinkTarget> {
+        self.tree.link_targets.get(&self.index)
     }
 
     pub fn parent(self) -> Option<Node<'a>> {

@@ -6,13 +6,15 @@
 //! detached into a private map, and table cells are autocompleted to the header width. Those are
 //! re-derived from raw source in `synth`.
 
+use std::collections::HashMap;
+
 use comrak::nodes::{NodeHeading, NodeList, NodeValue};
 // `comrak::Node<'a>` is `&'a AstNode<'a>` — the shared-reference form that `children()` yields.
 use comrak::Node as ComrakNode;
 use comrak::{parse_document, Arena, Options};
 
 use super::synth::{self, LineIndex};
-use super::{FacadeNode, FacadeTree, Kind};
+use super::{FacadeNode, FacadeTree, Kind, LinkTarget};
 
 /// Parses `source` into the tree quickmark's rules walk.
 pub fn parse(source: &str) -> FacadeTree {
@@ -30,6 +32,7 @@ pub fn parse(source: &str) -> FacadeTree {
         pending_paragraph_start: None,
         math: Vec::new(),
         math_emitted: Vec::new(),
+        link_targets: HashMap::new(),
     };
     builder.math = synth::math_regions(&builder.lines);
     clip_math_to_containers(&mut builder.math, &builder.lines, root);
@@ -176,6 +179,9 @@ struct Builder<'a> {
     /// [`Builder::math_at`].
     math: Vec<synth::Span>,
     math_emitted: Vec<bool>,
+    /// Destinations of the `link` nodes emitted so far, keyed by build-time index. [`Builder::flatten`]
+    /// rekeys them by position.
+    link_targets: HashMap<u32, LinkTarget>,
 }
 
 impl<'a> Builder<'a> {
@@ -971,6 +977,15 @@ impl<'a> Builder<'a> {
     }
 
     fn emit_inline_node(&mut self, parent: u32, node: ComrakNode<'a>) {
+        // Taken before `kind` because both borrow the node's value and the borrow has to end before
+        // `add` can take `&mut self`.
+        let target = match &node.data().value {
+            NodeValue::Link(link) => Some(LinkTarget {
+                url: link.url.clone(),
+                title: link.title.clone(),
+            }),
+            _ => None,
+        };
         let kind = match &node.data().value {
             NodeValue::Text(_) => Kind::Text,
             NodeValue::Code(_) => Kind::CodeSpan,
@@ -1006,6 +1021,9 @@ impl<'a> Builder<'a> {
             ),
             ((sourcepos.end.line - 1) as u32, sourcepos.end.column as u32),
         );
+        if let Some(target) = target {
+            self.link_targets.insert(index, target);
+        }
         self.emit_inline(index, node);
         self.push(parent, index);
     }
@@ -1242,7 +1260,16 @@ impl<'a> Builder<'a> {
             }
         }
 
-        FacadeTree { nodes, child_index }
+        let link_targets = std::mem::take(&mut self.link_targets)
+            .into_iter()
+            .map(|(index, target)| (position_of[index as usize], target))
+            .collect();
+
+        FacadeTree {
+            nodes,
+            child_index,
+            link_targets,
+        }
     }
 }
 

@@ -1,39 +1,20 @@
 use std::rc::Rc;
 
 use crate::ast::Node;
-use once_cell::sync::Lazy;
-use regex::Regex;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
     rules::{Context, Rule, RuleLinter, RuleType},
 };
 
-// Regular inline links: [text](url) - but NOT images ![text](url)
-static RE_INLINE_LINK: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?:^|[^!])\[([^\]]*)\]\(([^)]*)\)").unwrap());
-
 /// MD042 - No empty links
 ///
-/// This rule checks for links that have no destination or only a fragment identifier.
+/// Reports a link whose destination is empty or a bare `#`. The links come from the tree, so a
+/// label with escaped or nested brackets is a link here exactly when it is one in CommonMark —
+/// `[\[1\]](#)` and `[[a]](#)` are, and neither survives a `\[([^\]]*)\]` regex.
 pub(crate) struct MD042Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
-}
-
-impl RuleLinter for MD042Linter {
-    fn feed(&mut self, node: &Node) {
-        // Process different possible link node types
-        match node.kind() {
-            "link" => self.check_link_for_empty_destination(node),
-            "inline" => self.check_inline_for_links(node),
-            _ => {}
-        }
-    }
-
-    fn finalize(&mut self) -> Vec<RuleViolation> {
-        std::mem::take(&mut self.violations)
-    }
 }
 
 impl MD042Linter {
@@ -44,58 +25,76 @@ impl MD042Linter {
         }
     }
 
-    fn check_inline_for_links(&mut self, inline_node: &Node) {
-        let link_text = {
-            let document_content = self.context.document_content.borrow();
-            inline_node
-                .utf8_text(document_content.as_bytes())
-                .unwrap_or_default()
-                .to_string()
-        };
-        self.check_text_for_link_patterns(&link_text, inline_node);
-    }
+    /// Walks the inline subtree, which `feed` never descends into because inline kinds are filtered
+    /// out of dispatch. It descends into a link's own children too, since `[[a]()](http://x)` puts
+    /// an empty link inside a sound one.
+    fn feed_inline(&mut self, root: Node) {
+        let mut cursor = root.walk();
+        let mut depth = 0;
+        loop {
+            let node = cursor.node();
+            if node.kind() == "link" && self.is_empty_link(node) {
+                let range = node.range();
+                self.violations.push(RuleViolation::new(
+                    &MD042,
+                    MD042.description.to_string(),
+                    self.context.file_path.clone(),
+                    range_from_node_range(&range),
+                ));
+            }
 
-    fn check_text_for_link_patterns(&mut self, text: &str, node: &Node) {
-        // Check inline links: [text](url)
-        for caps in RE_INLINE_LINK.captures_iter(text) {
-            if let Some(url_match) = caps.get(2) {
-                if self.is_empty_link_destination(url_match.as_str()) {
-                    self.create_empty_link_violation(node);
+            if cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+            loop {
+                if depth == 0 {
+                    return;
                 }
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                cursor.goto_parent();
+                depth -= 1;
             }
         }
     }
 
-    fn check_link_for_empty_destination(&mut self, link_node: &Node) {
-        let link_text = {
-            let document_content = self.context.document_content.borrow();
-            link_node
-                .utf8_text(document_content.as_bytes())
-                .unwrap_or_default()
-                .to_string()
+    fn is_empty_link(&self, node: Node) -> bool {
+        let Some(target) = node.link_target() else {
+            return false;
         };
-        // Use the same regex-based checker for robustness and consistency
-        self.check_text_for_link_patterns(&link_text, link_node);
+        let url = target.url.trim();
+        if url == "#" {
+            return true;
+        }
+        if !url.is_empty() {
+            return false;
+        }
+        // An empty destination is only a violation on an inline link with no title. markdownlint
+        // reads micromark's token stream, which keeps an empty destination *string* for `[a]( "t")`
+        // and therefore reports only `#`; a reference link resolves to its definition, and
+        // `[r]: <>` is a destination micromark never produced a string for. comrak hands over the
+        // decoded url and title alone, so the two forms are told apart by the link's last source
+        // byte: `)` for `[a](…)`, `]` for `[a][r]`, `[a][]` and `[a]`.
+        if !target.title.is_empty() {
+            return false;
+        }
+        let content = self.context.document_content.borrow();
+        node.utf8_text(content.as_bytes())
+            .is_ok_and(|text| text.ends_with(')'))
+    }
+}
+
+impl RuleLinter for MD042Linter {
+    fn feed(&mut self, node: &Node) {
+        if node.kind() == "inline" {
+            self.feed_inline(*node);
+        }
     }
 
-    fn is_empty_link_destination(&self, url: &str) -> bool {
-        let trimmed = url.trim();
-        // `[text](# "title")` carries a title after the destination, and markdownlint judges only
-        // the destination. An angle-wrapped destination may itself contain spaces.
-        let destination = match trimmed.strip_prefix('<') {
-            Some(rest) => rest.split('>').next().unwrap_or(rest),
-            None => trimmed.split_whitespace().next().unwrap_or(""),
-        };
-        destination.is_empty() || destination == "#"
-    }
-
-    fn create_empty_link_violation(&mut self, node: &Node) {
-        self.violations.push(RuleViolation::new(
-            &MD042,
-            MD042.description.to_string(),
-            self.context.file_path.clone(),
-            range_from_node_range(&node.range()),
-        ));
+    fn finalize(&mut self) -> Vec<RuleViolation> {
+        std::mem::take(&mut self.violations)
     }
 }
 
@@ -105,7 +104,7 @@ pub const MD042: Rule = Rule {
     tags: &["links"],
     description: "No empty links",
     rule_type: RuleType::Token,
-    required_nodes: &["link", "inline"], // We need link nodes and inline nodes that might contain links
+    required_nodes: &["inline"],
     new_linter: |context| Box::new(MD042Linter::new(context)),
 };
 
@@ -118,205 +117,132 @@ mod test {
     use crate::test_utils::test_helpers::test_config_with_rules;
 
     fn test_config() -> crate::config::QuickmarkConfig {
-        test_config_with_rules(vec![
-            ("no-empty-links", RuleSeverity::Error),
-            ("heading-style", RuleSeverity::Off),
-            ("heading-increment", RuleSeverity::Off),
-            ("line-length", RuleSeverity::Off),
-        ])
+        test_config_with_rules(vec![("no-empty-links", RuleSeverity::Error)])
     }
 
-    #[test]
-    fn test_valid_link() {
-        let input = "[link text](https://example.com)";
+    /// `(line, column, width)` of one violation, 1-based. The width is the whole link, which is
+    /// what markdownlint's `errorRange` covers.
+    type Link = (usize, usize, usize);
 
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(0, violations.len());
+    fn links(source: &str) -> Vec<Link> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), source);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let range = &violation.location().range;
+                (
+                    range.start.line + 1,
+                    range.start.character + 1,
+                    range.end.character - range.start.character,
+                )
+            })
+            .collect()
     }
 
-    #[test]
-    fn test_empty_link_url() {
-        let input = "[empty link]()";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-        let violation = &violations[0];
-        assert_eq!("MD042", violation.rule().id);
-        assert_eq!("No empty links", violation.message());
-    }
-
-    #[test]
-    fn test_fragment_only_link() {
-        let input = "[fragment only](#)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-        let violation = &violations[0];
-        assert_eq!("MD042", violation.rule().id);
-        assert_eq!("No empty links", violation.message());
-    }
-
-    #[test]
-    fn test_valid_fragment_link() {
-        let input = "[section link](#section)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_empty_reference_link() {
-        let input = "[link text][]";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Reference links would need document-level analysis to verify if the reference exists
-        // For now, we don't flag collapsed reference links as empty
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_image_not_affected() {
-        let input = "![image alt]()";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Images should not be affected by this rule
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_multiple_links_with_one_empty() {
-        let input = "[good link](https://example.com) and [empty link]() and [another good](https://other.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should only detect the empty link
-        assert_eq!(1, violations.len());
-        let violation = &violations[0];
-        assert_eq!("MD042", violation.rule().id);
-    }
+    /// Every expectation below is markdownlint-cli2 v0.23.3 (markdownlint v0.41.1) output, run with
+    /// only `no-empty-links` enabled: its line and its `errorRange` column and length.
+    ///
+    /// Columns count UTF-8 bytes here and UTF-16 units there, so the one case with a multi-byte
+    /// character before the link is asserted separately in [`positions_count_bytes`].
+    const CASES: &[(&str, &str, &[Link])] = &[
+        ("plain", "[a](http://x)\n", &[]),
+        ("empty_dest", "[a]()\n", &[(1, 1, 5)]),
+        ("hash_dest", "[a](#)\n", &[(1, 1, 6)]),
+        ("fragment_dest", "[a](#frag)\n", &[]),
+        ("space_dest", "[a]( )\n", &[(1, 1, 6)]),
+        ("angle_empty", "[a](<>)\n", &[(1, 1, 7)]),
+        ("angle_hash", "[a](<#>)\n", &[(1, 1, 8)]),
+        ("angle_hash_space", "[a](< # >)\n", &[(1, 1, 10)]),
+        ("empty_with_title", "[a]( \"t\")\n", &[]),
+        ("hash_with_title", "[a](# \"t\")\n", &[(1, 1, 10)]),
+        ("url_with_title", "[a](http://x \"t\")\n", &[]),
+        ("hash_padded", "[a](  #  )\n", &[(1, 1, 10)]),
+        ("full_ref_url", "[a][r]\n\n[r]: http://x\n", &[]),
+        ("full_ref_hash", "[a][r]\n\n[r]: #\n", &[(1, 1, 6)]),
+        ("full_ref_empty", "[a][r]\n\n[r]: <>\n", &[]),
+        ("full_ref_undefined", "[a][nope]\n", &[]),
+        ("collapsed_ref_url", "[a][]\n\n[a]: http://x\n", &[]),
+        ("collapsed_ref_hash", "[a][]\n\n[a]: #\n", &[(1, 1, 5)]),
+        ("collapsed_ref_undefined", "[a][]\n", &[]),
+        ("shortcut_url", "[a]\n\n[a]: http://x\n", &[]),
+        ("shortcut_hash", "[a]\n\n[a]: #\n", &[(1, 1, 3)]),
+        ("shortcut_undefined", "[a]\n", &[]),
+        ("image_empty", "![a]()\n", &[]),
+        ("image_hash", "![a](#)\n", &[]),
+        ("autolink_http", "<http://x>\n", &[]),
+        ("autolink_mail", "<a@b.c>\n", &[]),
+        ("gfm_autolink", "see http://x here\n", &[]),
+        ("escaped_brackets", "[\\[1\\]](#)\n", &[(1, 1, 10)]),
+        ("nested_brackets", "[[a]](#)\n", &[(1, 1, 8)]),
+        ("in_code_span", "`[a]()`\n", &[]),
+        ("in_code_block", "```\n[a]()\n```\n", &[]),
+        ("in_heading", "# [a]()\n", &[(1, 3, 5)]),
+        ("in_table", "| x |\n|---|\n| [a]() |\n", &[(3, 3, 5)]),
+        ("in_blockquote", "> [a]()\n", &[(1, 3, 5)]),
+        (
+            "two_on_a_line",
+            "[a]() and [b](#) and [c](http://x)\n",
+            &[(1, 1, 5), (1, 11, 6)],
+        ),
+        ("two_one_empty", "[a](http://x) and [b]()\n", &[(1, 19, 5)]),
+        ("empty_label", "[]()\n", &[(1, 1, 4)]),
+        ("label_only_brackets", "[[]]()\n", &[(1, 1, 6)]),
+        ("in_link_label", "[[a]()](http://x)\n", &[(1, 2, 5)]),
+        ("ref_in_label", "[a [b]() c](http://x)\n", &[(1, 4, 5)]),
+        ("no_trailing_newline", "[a]()", &[(1, 1, 5)]),
+        ("crlf", "[a]()\r\n[b](#)\r\n", &[(1, 1, 5), (2, 1, 6)]),
+        (
+            "footnote_like",
+            "[^gh-md]: <> \"Like here on GitHub.\"\n",
+            &[],
+        ),
+        (
+            "front_matter",
+            "---\ntitle: [a]()\n---\n\n[b]()\n",
+            &[(5, 1, 5)],
+        ),
+        ("emph_around", "*[a]()*\n", &[(1, 2, 5)]),
+    ];
 
     #[test]
-    fn test_mixed_empty_links() {
-        let input = "[empty1]() and [fragment](#) and [valid](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect both empty links
-        assert_eq!(2, violations.len());
-        for violation in &violations {
-            assert_eq!("MD042", violation.rule().id);
+    fn matches_markdownlint() {
+        for &(name, source, expected) in CASES {
+            assert_eq!(expected, links(source).as_slice(), "case `{name}`");
         }
     }
 
+    /// A link after a multi-byte character. markdownlint counts UTF-16 units, so its column is
+    /// smaller than the byte-based one quickmark reports; only the count and width agree. That is
+    /// the byte-column convention every rule shares, not an MD042 difference.
     #[test]
-    fn test_sequential_links_bug_prevention() {
-        // This test is based on issue #308 - ensure that after finding an empty link,
-        // subsequent valid links are not incorrectly flagged as empty
-        let input = "[link1](https://example.com)\n[link2]()\n[link3](https://example.com)\n[link4](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should only detect link2 as empty, not link3 or link4
-        assert_eq!(1, violations.len());
-        let violation = &violations[0];
-        assert_eq!("MD042", violation.rule().id);
+    fn positions_count_bytes() {
+        assert_eq!(vec![(1, 5, 5)], links("你 [a]() 好\n"));
     }
 
+    /// `[a](<> "t")` is a violation in markdownlint and is not here. micromark emits no destination
+    /// string for an angle-wrapped empty destination, so markdownlint falls through to its
+    /// unconditional branch; comrak reports an empty url and a title, which is indistinguishable
+    /// from `[a]( "t")` — the one shape markdownlint deliberately does *not* report. Choosing the
+    /// rarer false negative over the rarer false positive.
     #[test]
-    fn test_footnote_style_empty_links() {
-        // Test case from issue #370 - footnote-style links with empty destinations
-        let input = "[^gh-md]: <> \"Like here on GitHub.\"";
+    fn an_empty_angle_destination_with_a_title_is_missed() {
+        assert_eq!(0, links("[a](<> \"t\")\n").len());
+        assert_eq!(1, links("[a](<>)\n").len());
+    }
 
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // This is a complex case - for now we may or may not detect this
-        // The original issue suggests this might be valid footnote syntax
-        // Let's see what our current implementation does
-        println!("Footnote test violations: {}", violations.len());
-        for violation in &violations {
-            println!("  {}: {}", violation.rule().id, violation.message());
+    /// A link split across lines. markdownlint throws — its range spans two lines and it validates
+    /// that against the line's length — so there is no measured value to match, and the width
+    /// quickmark reports is the end column on the *last* line, which spans nothing. Only the fact
+    /// that the link is found, on the line it opens on, is asserted. Reporting beats aborting the
+    /// rule for the whole file, which is what markdownlint does.
+    #[test]
+    fn a_link_across_lines_is_still_reported() {
+        for source in ["[a\nb]()\n", "[a\nb](#)\n"] {
+            let found = links(source);
+            assert_eq!(1, found.len(), "source {source:?}");
+            assert_eq!((1, 1), (found[0].0, found[0].1), "source {source:?}");
         }
-    }
-
-    #[test]
-    fn test_empty_link_with_title() {
-        // Test links with empty URL but with title attribute
-        let input = "[link text]( \"title\")";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // According to original markdownlint behavior, title-only URLs are NOT considered empty
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_fragment_with_content() {
-        // Test that fragments with actual content are not flagged
-        let input = "[section](#introduction)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should not be flagged as empty
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_whitespace_only_urls() {
-        // Test URLs that are only whitespace
-        let input = "[empty]( ) and [tabs](\t) and [newline](\n)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect all three whitespace-only URLs as empty
-        assert_eq!(3, violations.len());
-        for violation in &violations {
-            assert_eq!("MD042", violation.rule().id);
-        }
-    }
-
-    #[test]
-    fn test_title_after_destination_is_not_part_of_it() {
-        // markdownlint judges only the destination, so `# "title"` is still an empty link while a
-        // real URL with a title is fine
-        let input = "[a](# \"title\") and [b](http://example.com \"t\")";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-        assert_eq!("MD042", violations[0].rule().id);
     }
 }
