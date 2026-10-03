@@ -66,7 +66,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (section 2:0-5:0 7-24
       (atx_heading 2:0-3:0 7-19
         (atx_h2_marker 2:0-2:2 7-9)
-        (inline 2:4-2:11 11-18
+        (inline 2:4-2:7 11-14
           (text 2:4-2:7 11-14)
         )
       )

@@ -18,16 +18,15 @@ pub struct MD026TrailingPunctuationTable {
 
 impl Default for MD026TrailingPunctuationTable {
     fn default() -> Self {
-        Self {
-            punctuation: ".,;:!。，；：！".to_string(),
-        }
+        Self::with_default_punctuation()
     }
 }
 
 impl MD026TrailingPunctuationTable {
     pub fn with_default_punctuation() -> Self {
         Self {
-            punctuation: ".,;:!。，；：！".to_string(), // Default without '?' chars
+            // markdownlint's `allPunctuationNoQuestion`.
+            punctuation: ".,;:!。，；：！".to_string(),
         }
     }
 }
@@ -45,89 +44,96 @@ impl MD026Linter {
         }
     }
 
-    fn extract_heading_text<'a>(&self, node: &Node, source: &'a str) -> &'a str {
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let full_text = &source[start_byte..end_byte];
-
-        match node.kind() {
-            "atx_heading" => full_text
-                .trim_start_matches('#')
-                .trim()
-                .trim_end_matches('#')
-                .trim(),
-            "setext_heading" => {
-                if let Some(line) = full_text.lines().next() {
-                    line.trim()
-                } else {
-                    ""
-                }
-            }
-            _ => "",
-        }
-    }
-
-    fn check_trailing_punctuation(&mut self, node: &Node) {
-        let source = self.context.get_document_content();
-        let heading_text = self.extract_heading_text(node, &source);
-        if heading_text.is_empty() {
+    fn check(&mut self, node: Node) {
+        let Some(text) = heading_text(node) else {
+            return;
+        };
+        let punctuation = self
+            .context
+            .config
+            .linters
+            .settings
+            .trailing_punctuation
+            .punctuation
+            .clone();
+        // An empty set makes markdownlint's character class match nothing at all.
+        if punctuation.is_empty() {
             return;
         }
 
-        let config = &self.context.config.linters.settings.trailing_punctuation;
-
-        // Handle configuration: if punctuation is empty, the rule is effectively disabled
-        let punctuation_chars = if config.punctuation.is_empty() {
-            return; // Empty punctuation = rule disabled, allow all
-        } else {
-            &config.punctuation
+        // An `inline` at end of file keeps its trailing whitespace, which micromark's heading text
+        // never carries, so the text is trimmed again here.
+        let from = text.start_byte();
+        let heading = {
+            let source = self.context.document_content.borrow();
+            source[from..text.end_byte()]
+                .trim_end_matches([' ', '\t'])
+                .to_string()
         };
+        let Some(run) = trailing_punctuation(&heading, &punctuation) else {
+            return;
+        };
+        // An HTML entity and a GitHub emoji code both end in punctuation that belongs to them.
+        if is_html_entity(&heading) || is_gemoji_code(&heading) {
+            return;
+        }
+        let end = self.context.point_at(from + heading.len());
 
-        // Check if the heading ends with any of the specified punctuation characters
-        if let Some(trailing_char) = heading_text.chars().last() {
-            if punctuation_chars.contains(trailing_char) {
-                // Check if this is an HTML entity (ends with ;)
-                if trailing_char == ';' && is_html_entity(heading_text) {
-                    return; // Skip HTML entities
-                }
+        self.violations.push(RuleViolation::new(
+            &MD026,
+            format!("Punctuation: '{}'", &heading[run..]),
+            self.context.file_path.clone(),
+            range_from_node_range(&crate::ast::NodeRange {
+                start_byte: 0,
+                end_byte: 0,
+                start_point: crate::ast::Point {
+                    row: end.row,
+                    column: end.column - (heading.len() - run),
+                },
+                end_point: end,
+            }),
+        ));
+    }
+}
 
-                // Check if this is a gemoji code (ends with :)
-                if trailing_char == ':' && is_gemoji_code(heading_text) {
-                    return; // Skip gemoji codes
-                }
+/// The node holding a heading's text — micromark's `atxHeadingText` and `setextHeadingText`, which
+/// the facade synthesizes as the `inline` under the heading, or under a setext heading's paragraph.
+/// It stops before a closing `#` run and before trailing whitespace, spans every line of a setext
+/// heading, and never runs over the container prefixes that follow the heading's own line — all of
+/// which reading the heading's byte range would get wrong.
+fn heading_text(node: Node) -> Option<Node> {
+    (0..node.child_count()).find_map(|index| {
+        let child = node.child(index)?;
+        match child.kind() {
+            "inline" => Some(child),
+            "paragraph" => heading_text(child),
+            _ => None,
+        }
+    })
+}
 
-                // Create a violation
-                let range = crate::ast::NodeRange {
-                    start_byte: 0, // Not used by range_from_node_range
-                    end_byte: 0,   // Not used by range_from_node_range
-                    start_point: crate::ast::Point {
-                        row: node.start_position().row,
-                        column: 0,
-                    },
-                    end_point: crate::ast::Point {
-                        row: node.end_position().row,
-                        column: node.end_position().column,
-                    },
-                };
-
-                self.violations.push(RuleViolation::new(
-                    &MD026,
-                    format!("Punctuation: '{trailing_char}'"),
-                    self.context.file_path.clone(),
-                    range_from_node_range(&range),
-                ));
-            }
+/// Where markdownlint's `\s*[<punctuation>]+$` starts in `text`, or `None` when it does not match.
+/// The run includes the whitespace before it, which is why `# Heading .` reports `' .'`.
+fn trailing_punctuation(text: &str, punctuation: &str) -> Option<usize> {
+    let mut start = text.len();
+    let mut found = false;
+    for (index, ch) in text.char_indices().rev() {
+        if punctuation.contains(ch) {
+            start = index;
+            found = true;
+        } else if found && ch.is_whitespace() {
+            start = index;
+        } else {
+            break;
         }
     }
+    found.then_some(start)
 }
 
 impl RuleLinter for MD026Linter {
     fn feed(&mut self, node: &Node) {
-        match node.kind() {
-            "atx_heading" | "setext_heading" => self.check_trailing_punctuation(node),
-            _ => {
-                // Ignore other nodes
-            }
+        if matches!(node.kind(), "atx_heading" | "setext_heading") {
+            self.check(*node);
         }
     }
 
@@ -136,19 +142,23 @@ impl RuleLinter for MD026Linter {
     }
 }
 
-// Helper function to detect HTML entities
+/// markdownlint's `endOfLineHtmlEntityRe`. The named forms are a closed list, so `&a1;` and `&X41;`
+/// are punctuation-terminated text rather than entities.
 fn is_html_entity(text: &str) -> bool {
-    static HTML_ENTITY_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"&(?:[a-zA-Z\d]+|#\d+|#x[0-9a-fA-F]+);$").unwrap());
-    HTML_ENTITY_RE.is_match(text.trim())
+    static HTML_ENTITY_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"&(?:#\d+|#[xX][\da-fA-F]+|[a-zA-Z]{2,31}|blk\d{2}|emsp1[34]|frac\d{2}|sup\d|there4);$")
+            .expect("Invalid HTML entity regex")
+    });
+    HTML_ENTITY_RE.is_match(text)
 }
 
-// Helper function to detect GitHub emoji codes (gemoji)
+/// markdownlint's `endOfLineGemojiCodeRe`.
 fn is_gemoji_code(text: &str) -> bool {
     static GEMOJI_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r":(?:[abmovx]|[-+]1|100|1234|(?:1st|2nd|3rd)_place_medal|8ball|clock\d{1,4}|e-mail|non-potable_water|o2|t-rex|u5272|u5408|u55b6|u6307|u6708|u6709|u6e80|u7121|u7533|u7981|u7a7a|[a-z]{2,15}2?|[a-z]{1,14}(?:_[a-z\d]{1,16})+):$").unwrap()
+        Regex::new(r":(?:[abmovx]|[-+]1|100|1234|(?:1st|2nd|3rd)_place_medal|8ball|clock\d{1,4}|e-mail|non-potable_water|o2|t-rex|u5272|u5408|u55b6|u6307|u6708|u6709|u6e80|u7121|u7533|u7981|u7a7a|[a-z]{2,15}2?|[a-z]{1,14}(?:_[a-z\d]{1,16})+):$")
+            .expect("Invalid gemoji regex")
     });
-    GEMOJI_RE.is_match(text.trim())
+    GEMOJI_RE.is_match(text)
 }
 
 pub const MD026: Rule = Rule {
@@ -169,7 +179,7 @@ mod test {
     use crate::linter::MultiRuleLinter;
     use crate::test_utils::test_helpers::test_config_with_settings;
 
-    fn test_config(punctuation: &str) -> crate::config::QuickmarkConfig {
+    fn config(punctuation: &str) -> crate::config::QuickmarkConfig {
         test_config_with_settings(
             vec![("no-trailing-punctuation", RuleSeverity::Error)],
             LintersSettingsTable {
@@ -181,243 +191,207 @@ mod test {
         )
     }
 
-    fn test_default_config() -> crate::config::QuickmarkConfig {
-        test_config(".,;:!。，；：！")
+    /// The 1-based line MD026 reports on and the punctuation run it names.
+    fn reports(punctuation: &str, source: &str) -> Vec<(usize, String)> {
+        let mut linter = MultiRuleLinter::new_for_document(
+            PathBuf::from("test.md"),
+            config(punctuation),
+            source,
+        );
+        linter
+            .analyze()
+            .iter()
+            .filter(|violation| violation.rule().id == "MD026")
+            .map(|violation| {
+                let run = violation
+                    .message()
+                    .split_once("Punctuation: '")
+                    .map(|(_, rest)| rest.trim_end_matches('\'').to_string())
+                    .unwrap_or_default();
+                (violation.location().range.start.line + 1, run)
+            })
+            .collect()
+    }
+
+    fn with_default(source: &str) -> Vec<(usize, String)> {
+        reports(".,;:!。，；：！", source)
+    }
+
+    /// A case's name, its document, and the line and punctuation run markdownlint reports.
+    type Case = (&'static str, &'static str, &'static [(usize, &'static str)]);
+
+    /// Every expectation measured against markdownlint-cli2 v0.23.3.
+    #[test]
+    fn matches_markdownlint() {
+        let cases: &[Case] = &[
+            ("period", "# Heading.\n", &[(1, ".")]),
+            ("exclamation", "# Heading!\n", &[(1, "!")]),
+            ("two exclamations", "# Heading!!\n", &[(1, "!!")]),
+            ("two semicolons", "# Heading;;\n", &[(1, ";;")]),
+            ("period then semicolon", "# Heading.;\n", &[(1, ".;")]),
+            // The run is markdownlint's `\s*[...]+$`, whitespace included.
+            (
+                "space then comma and period",
+                "# Heading ,.\n",
+                &[(1, " ,.")],
+            ),
+            ("two spaces then period", "# Heading  .\n", &[(1, "  .")]),
+            ("space then period", "# Heading .\n", &[(1, " .")]),
+            ("space then full stop", "# Heading 。\n", &[(1, " 。")]),
+            ("question mark is not in the set", "# Heading?\n", &[]),
+            ("ends in a question mark", "# Heading!?\n", &[]),
+            ("punctuation mid-text", "# Heading...more\n", &[]),
+            ("punctuation inside a word", "# a.b.\n", &[(1, ".")]),
+            ("four hashes", "#### Heading.\n", &[(1, ".")]),
+            ("punctuation alone", "# .\n", &[(1, ".")]),
+            ("trailing spaces after it", "# Heading.  \n", &[(1, ".")]),
+            ("a tab after it", "# Heading.\t\n", &[(1, ".")]),
+            // An `inline` at end of file keeps trailing whitespace, which heading text never has.
+            ("no final newline", "##  Heading! ", &[(1, "!")]),
+            ("a closing hash run", "# Heading #\n", &[]),
+            (
+                "punctuation before a closing run",
+                "# Heading. #\n",
+                &[(1, ".")],
+            ),
+            ("empty heading", "#\n", &[]),
+            ("heading of only spaces", "## \n", &[]),
+            ("full-width semicolon", "# Heading；\n", &[(1, "；")]),
+            ("two full-width stops", "# 。。\n", &[(1, "。。")]),
+            ("cjk text", "# 标题！\n", &[(1, "！")]),
+            ("full-width then half-width", "# a！b？\n", &[]),
+            ("html entity", "# &amp;\n", &[]),
+            ("uppercase entity name", "# &AMP;\n", &[]),
+            ("numeric entity", "# &#33;\n", &[]),
+            ("a named form from the list", "# &there4;\n", &[]),
+            ("another named form", "# &emsp13;\n", &[]),
+            // The named forms are a closed list, so these are text ending in a semicolon.
+            ("digits in an entity name", "# &a1;\n", &[(1, ";")]),
+            ("a hex entity without the hash", "# &X41;\n", &[(1, ";")]),
+            ("a bare ampersand", "# &\n", &[]),
+            ("gemoji code", "# :smile:\n", &[]),
+            ("gemoji with digits", "# :+1:\n", &[]),
+            ("gemoji with a clock", "# :clock1030:\n", &[]),
+            (
+                "a long snake-case code",
+                "# :not_a_gemoji_code_here_though:\n",
+                &[],
+            ),
+            ("setext with punctuation", "Setext!\n=======\n", &[(1, "!")]),
+            (
+                "setext with a dash underline",
+                "Setext.\n---\n",
+                &[(1, ".")],
+            ),
+            ("setext without punctuation", "Setext\n======\n", &[]),
+            (
+                "setext with an indented underline",
+                "Setext\n  ======\n",
+                &[],
+            ),
+            // The text of a setext heading is every line of it, not just the first.
+            ("multi-line setext", "a\nb.\n===\n", &[(2, ".")]),
+            ("after a paragraph", "text\n\n# Heading.\n", &[(3, ".")]),
+            ("in a list item", "- # Heading.\n", &[(1, ".")]),
+            (
+                "in a list item's continuation",
+                "- item\n\n  # Heading.\n",
+                &[(3, ".")],
+            ),
+            (
+                "setext in a list item",
+                "- item\n\n  Setext.\n  -------\n",
+                &[(3, ".")],
+            ),
+            // The shape the vault comparison turned up: reading the heading's own byte range runs
+            // on over the `>` prefixes that follow it, so the text ends in `>` and nothing matches.
+            (
+                "in a block quote that continues",
+                "> # Heading.\n>\n> more\n",
+                &[(1, ".")],
+            ),
+            (
+                "in a block quote",
+                "> # Important Discovery!\n",
+                &[(1, "!")],
+            ),
+            (
+                "in a block quote after text",
+                "text\n\n> # Discovery!\n",
+                &[(3, "!")],
+            ),
+            ("in a table cell", "| a |\n| - |\n| # H. |\n", &[]),
+        ];
+
+        let failures: Vec<String> = cases
+            .iter()
+            .filter(|&&(name, source, expected)| {
+                let actual = with_default(source);
+                let expected: Vec<(usize, String)> = expected
+                    .iter()
+                    .map(|&(line, run)| (line, run.to_string()))
+                    .collect();
+                if actual == expected {
+                    return false;
+                }
+                println!("{name}: expected {expected:?}, got {actual:?}");
+                true
+            })
+            .map(|&(name, _, _)| name.to_string())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {} cases disagree with markdownlint: {failures:?}",
+            failures.len(),
+            cases.len()
+        );
+    }
+
+    /// Measured against markdownlint with `"punctuation": ".,;:"`.
+    #[test]
+    fn a_configured_set_replaces_the_default() {
+        assert_eq!(
+            with_config(".,;:", "# This heading has exclamation!"),
+            vec![]
+        );
+        assert_eq!(
+            with_config(".,;:", "# This heading has period."),
+            vec![(1, ".".to_string())]
+        );
+        assert_eq!(with_config(".,;:", "# This has a comma, and bang!"), vec![]);
+        // An empty set leaves markdownlint's character class matching nothing.
+        assert_eq!(
+            with_config("", "# Heading.\n## Heading!\n### Heading,"),
+            vec![]
+        );
+    }
+
+    fn with_config(punctuation: &str, source: &str) -> Vec<(usize, String)> {
+        reports(punctuation, source)
     }
 
     #[test]
-    fn test_atx_heading_with_period() {
-        let config = test_default_config();
-        let input = "# This is a heading.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: '.'"));
-    }
-
-    #[test]
-    fn test_atx_heading_with_exclamation() {
-        let config = test_default_config();
-        let input = "# This is a heading!";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: '!'"));
-    }
-
-    #[test]
-    fn test_atx_heading_with_comma() {
-        let config = test_default_config();
-        let input = "## This is a heading,";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: ','"));
-    }
-
-    #[test]
-    fn test_atx_heading_with_semicolon() {
-        let config = test_default_config();
-        let input = "### This is a heading;";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: ';'"));
-    }
-
-    #[test]
-    fn test_atx_heading_with_colon() {
-        let config = test_default_config();
-        let input = "#### This is a heading:";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: ':'"));
-    }
-
-    #[test]
-    fn test_atx_heading_with_question_mark_allowed() {
-        let config = test_default_config();
-        let input = "# This is a heading?";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0); // '?' is not in default punctuation
-    }
-
-    #[test]
-    fn test_atx_heading_without_punctuation() {
-        let config = test_default_config();
-        let input = "# This is a heading";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_setext_heading_with_period() {
-        let config = test_default_config();
-        let input = "# Document\n\nThis is a heading.\n==================\n\nContent here";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: '.'"));
-    }
-
-    #[test]
-    fn test_setext_heading_with_exclamation() {
-        let config = test_default_config();
-        let input = "# Document\n\nThis is a heading!\n------------------\n\nContent here";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: '!'"));
-    }
-
-    #[test]
-    fn test_setext_heading_without_punctuation() {
-        let config = test_default_config();
-        let input = "# Document\n\nThis is a heading\n=================\n\nContent here";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_full_width_punctuation() {
-        let config = test_default_config();
-        let input = "# Heading with full-width period。";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: '。'"));
-    }
-
-    #[test]
-    fn test_full_width_comma() {
-        let config = test_default_config();
-        let input = "# Heading with full-width comma，";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: '，'"));
-    }
-
-    #[test]
-    fn test_custom_punctuation() {
-        let config = test_config(".,;:");
-        let input = "# This heading has exclamation!";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0); // '!' not in custom punctuation
-    }
-
-    #[test]
-    fn test_custom_punctuation_with_violation() {
-        let config = test_config(".,;:");
-        let input = "# This heading has period.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: '.'"));
-    }
-
-    #[test]
-    fn test_empty_punctuation_allows_all() {
-        let config = test_config("");
-        let input =
-            "# This heading has period.\n## This heading has exclamation!\n### This has comma,";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0); // Empty punctuation = allow all
-    }
-
-    #[test]
-    fn test_html_entity_ignored() {
-        let config = test_default_config();
-        let input = "# Copyright &copy;\n## Registered &reg;";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0); // HTML entities should be ignored
-    }
-
-    #[test]
-    fn test_numeric_html_entity_ignored() {
-        let config = test_default_config();
-        let input = "# Copyright &#169;\n## Registered &#174;";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0); // Numeric HTML entities should be ignored
-    }
-
-    #[test]
-    fn test_hex_html_entity_ignored() {
-        let config = test_default_config();
-        let input = "# Copyright &#x000A9;\n## Registered &#xAE;";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0); // Hex HTML entities should be ignored
-    }
-
-    #[test]
-    fn test_mixed_valid_and_invalid() {
-        let config = test_default_config();
-        let input =
-            "# Good heading\n## Bad heading.\n### Another good heading\n#### Another bad heading!";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 2);
-        assert!(violations[0].message().contains("Punctuation: '.'"));
-        assert!(violations[1].message().contains("Punctuation: '!'"));
-    }
-
-    #[test]
-    fn test_atx_closed_style_heading() {
-        let config = test_default_config();
-        let input = "# This is a heading. #";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: '.'"));
-    }
-
-    #[test]
-    fn test_multiple_trailing_punctuation() {
-        let config = test_default_config();
-        let input = "# This is a heading...";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Punctuation: '.'"));
-    }
-
-    #[test]
-    fn test_empty_heading() {
-        let config = test_default_config();
-        let input = "#\n==";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0); // Empty headings should not trigger violations
+    fn a_report_covers_the_punctuation() {
+        let mut linter = MultiRuleLinter::new_for_document(
+            PathBuf::from("test.md"),
+            config(".,;:!。，；：！"),
+            "> # Heading.\n>\n> more\n",
+        );
+        let range = linter
+            .analyze()
+            .iter()
+            .find(|violation| violation.rule().id == "MD026")
+            .map(|violation| {
+                let range = &violation.location().range;
+                (
+                    range.start.line,
+                    range.start.character,
+                    range.end.line,
+                    range.end.character,
+                )
+            })
+            .expect("one violation");
+        // markdownlint reports `[endColumn - length, length]` on the text's last line.
+        assert_eq!(range, (0, 11, 0, 12));
     }
 }

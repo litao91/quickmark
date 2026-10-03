@@ -391,16 +391,41 @@ pub fn atx_parts(lines: &LineIndex<'_>, row: u32, start_col: u32) -> AtxParts {
     let after = text.get(hashes_end as usize..).unwrap_or("");
     let skip = (after.len() - after.trim_start_matches([' ', '\t']).len()) as u32;
     let content_start = hashes_end + skip;
-    let content_end = lines.inline_end_col(row as usize);
+    let content_end = chop_closing_hashes(bytes, lines.inline_end_col(row as usize) as usize);
 
     AtxParts {
         marker: Marker {
             kind: atx_marker_kind((hashes_end - hashes_start).clamp(1, 6) as u8),
             span: Span::new((row, start_col), (row, hashes_end)),
         },
-        inline: (content_start < content_end)
-            .then_some(Span::new((row, content_start), (row, content_end))),
+        inline: (content_start < content_end as u32)
+            .then_some(Span::new((row, content_start), (row, content_end as u32))),
     }
+}
+
+/// The column a closed ATX heading's text ends at, mirroring comrak's
+/// `strings::chop_trailing_hashes`: a trailing `#` run preceded by a space or a tab is a closing
+/// sequence, and it and the whitespace before it are not part of the heading. `# H#` ends in `H#`
+/// because the run is not preceded by whitespace, and a run reaching the start of the line is the
+/// whole heading rather than a closing one.
+fn chop_closing_hashes(bytes: &[u8], content_end: usize) -> usize {
+    if content_end == 0 {
+        return 0;
+    }
+    let mut at = content_end - 1;
+    while bytes[at] == b'#' {
+        if at == 0 {
+            return content_end;
+        }
+        at -= 1;
+    }
+    if at == content_end - 1 || !matches!(bytes[at], b' ' | b'\t') {
+        return content_end;
+    }
+    (0..at)
+        .rev()
+        .find(|&index| !matches!(bytes[index], b' ' | b'\t'))
+        .map_or(0, |index| index + 1)
 }
 
 fn atx_marker_kind(level: u8) -> Kind {
