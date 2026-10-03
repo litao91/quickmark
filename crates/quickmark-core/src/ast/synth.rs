@@ -283,6 +283,52 @@ pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
     regions
 }
 
+/// The `$…$` spans micromark's math extension forms over `source[from..to]`, as absolute byte ranges.
+///
+/// micromark pairs bare unescaped `$` delimiters left to right and asks nothing of the whitespace
+/// around them, which is looser than comrak's `math_dollars`: comrak follows pandoc, needing the
+/// opening `$` followed by a non-space and the closing one preceded by a non-space. So `$ a $` is
+/// math for markdownlint and ordinary text for comrak, and a URL inside it is not a bare URL.
+///
+/// `claimed` holds the ranges already accounted for — code spans, and the math comrak did find —
+/// because a `$` inside one is literal and delimits nothing. An odd trailing delimiter pairs with
+/// nothing and produces no span.
+pub fn inline_math_spans(
+    source: &str,
+    from: usize,
+    to: usize,
+    claimed: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let to = to.min(bytes.len());
+    if from >= to {
+        return Vec::new();
+    }
+    let delimiters: Vec<usize> = (from..to)
+        .filter(|&at| bytes[at] == b'$')
+        .filter(|&at| !escaped_dollar(bytes, at))
+        .filter(|&at| !claimed.iter().any(|&(start, end)| start <= at && at < end))
+        .collect();
+    delimiters
+        .chunks(2)
+        .filter_map(|pair| match pair {
+            [open, close] => Some((*open, close + 1)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the `$` at `at` is preceded by an odd number of backslashes, which makes it literal.
+fn escaped_dollar(bytes: &[u8], at: usize) -> bool {
+    let mut backslashes = 0;
+    let mut index = at;
+    while index > 0 && bytes[index - 1] == b'\\' {
+        backslashes += 1;
+        index -= 1;
+    }
+    backslashes % 2 == 1
+}
+
 /// The column a line's `$` run starts at and how long it is — or `None` when the line does not open
 /// with a run of at least two `$` once [`content_column`] has skipped the container prefixes.
 ///
@@ -902,7 +948,7 @@ fn container_prefix_width(lines: &LineIndex<'_>, row: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_definition_line, math_regions, LineIndex};
+    use super::{inline_math_spans, is_definition_line, math_regions, LineIndex};
 
     /// `$$…$$` region detection, one case per rule measured against markdownlint-cli2 v0.23.3 with a
     /// heading payload: a swallowed heading means the region covers it, a reported one means it does
@@ -1018,5 +1064,29 @@ mod tests {
                 "should not be a definition: {line:?}"
             );
         }
+    }
+
+    /// micromark pairs bare `$` delimiters whatever sits around them, where comrak's `math_dollars`
+    /// follows pandoc and needs a non-space inside each marker. Each shape below was measured against
+    /// markdownlint-cli2 v0.23.3 by whether it reports a bare URL the span would swallow.
+    #[test]
+    fn inline_math_pairs_whatever_surrounds_the_dollars() {
+        let spans = |source: &str| inline_math_spans(source, 0, source.len(), &[]);
+        // Spaces either side of both markers, which comrak refuses to pair.
+        assert_eq!(vec![(0, 5)], spans("$ a $"));
+        assert_eq!(vec![(0, 5), (8, 13)], spans("$ a $ b $ c $"));
+        // An escaped `$` is literal, so what is left is one unpaired delimiter.
+        assert!(spans("\\$ a $").is_empty());
+        // An odd count leaves the last one pairing with nothing.
+        assert!(spans("$ a").is_empty());
+        assert_eq!(1, spans("$ a $ b $").len());
+
+        // A `$` inside a code span, or inside math comrak already found, delimits nothing.
+        assert_eq!(
+            vec![(5, 10)],
+            inline_math_spans("`x$` $ a $", 0, 10, &[(0, 4)])
+        );
+        // Nothing outside the range asked about is considered.
+        assert!(inline_math_spans("$ a $", 0, 1, &[]).is_empty());
     }
 }

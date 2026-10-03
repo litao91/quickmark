@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::ast::Node;
+use crate::ast::{synth, Node};
 use linkify::{LinkFinder, LinkKind};
 
 use crate::{
@@ -74,6 +74,11 @@ impl MD034Linter {
         // The walk pops siblings in reverse, and tag pairing reads left to right.
         tags.sort_unstable_by_key(|tag| tag.start_byte());
         opaque.extend(html_tag_pairs(&tags, &source));
+        // micromark pairs bare `$` delimiters whatever the whitespace around them, so it forms math
+        // spans comrak's stricter `math_dollars` leaves as text, and a URL inside one is not bare. The
+        // spans comrak did find are already opaque, so their `$` cannot be taken for a delimiter.
+        let math = synth::inline_math_spans(&source, root.start_byte(), root.end_byte(), &opaque);
+        opaque.extend(math);
 
         let mut found = Vec::new();
         for (start, end) in text {
@@ -420,6 +425,15 @@ mod test {
             &[(1, 5, 13), (2, 5, 13)],
         ),
         ("see https://x.org/a  \nmore\n", &[(1, 5, 15)]),
+        // micromark's math text closes on a `$` preceded by whitespace, where comrak's stricter
+        // `math_dollars` refuses one, so `inline_math_spans` supplies the spans comrak missed and
+        // both URLs below are inside math rather than bare.
+        ("latest=$(curl https://x.com);\\\ncd $y\n", &[]),
+        ("a $b and https://x.com $c d\n", &[]),
+        ("$ https://x.com $\n", &[]),
+        ("$a$ https://x.com $b$\n", &[(1, 5, 13)]),
+        ("\\$ https://x.com $\n", &[(1, 4, 13)]),
+        ("$ https://x.com\n", &[(1, 3, 13)]),
     ];
 
     #[test]
@@ -437,9 +451,6 @@ mod test {
     ///   date (`2025-05-15https://x.com/a`) both work.
     /// - `oss://user:pass@host/path` holds an email micromark autolinks at the `:` and linkify
     ///   swallows into the surrounding `oss://` URL, which is not a GFM scheme and so is dropped.
-    /// - `$` delimits inline math by different rules in comrak and micromark, so a URL that one
-    ///   parser puts inside a math span the other leaves outside. comrak refuses a closing `$`
-    ///   preceded by a space and micromark accepts it.
     /// - GFM lets an autolink path run over `[` and over `\`, so `https://x.com[a]` is one
     ///   15-column URL to markdownlint and `https://x.org/a;\` a 17-column one; linkify stops at
     ///   the bracket and at the backslash. Same start, so only the underline is shorter.
@@ -456,15 +467,6 @@ mod test {
         assert_eq!(vec![(1, 1, 13)], urls("https://x.com[a]\n"));
         // markdownlint: [(1, 5, 17)]
         assert_eq!(vec![(1, 5, 15)], urls("see https://x.org/a;\\\nmore\n"));
-        // micromark's math text closes on a `$` preceded by whitespace, where comrak refuses one,
-        // so the URL below is inside a math span for markdownlint and bare text here.
-        // markdownlint: []
-        assert_eq!(
-            vec![(1, 15, 13)],
-            urls("latest=$(curl https://x.com);\\\ncd $y\n")
-        );
-        // markdownlint: []
-        assert_eq!(vec![(1, 10, 13)], urls("a $b and https://x.com $c d\n"));
     }
 
     #[test]
