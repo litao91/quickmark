@@ -341,15 +341,18 @@ mod test {
         }
     }
 
-    /// Three shapes markdownlint reports and quickmark does not.
+    /// Shapes markdownlint reports and quickmark does not.
     ///
     /// The first two are the facade's, not this rule's: comrak detaches a link reference definition
     /// and leaves no trace of it, so the tree is rebuilt from the lines nothing else claimed, and a
     /// definition whose line a list item already covers, or whose destination sits on the line after
-    /// its label, is not among them. The third is a missing parser extension — markdownlint turns on
-    /// micromark's GFM footnotes, so `[^a]: prose` is a footnote definition whose label is `^a`,
-    /// while here it is an ordinary paragraph. `[^a]: /u` is reported either way, because that one is
-    /// also a valid link reference definition.
+    /// its label, is not among them. The last two are a missing parser extension — markdownlint turns
+    /// on micromark's GFM footnotes, so `[^a]: prose` is a footnote definition whose label is `^a`,
+    /// while here it is an ordinary paragraph that two of them make a duplicate of nothing.
+    /// `[^a]: /u` is reported either way, because that one is also a valid link reference
+    /// definition. Turning on comrak's `footnotes` is not the fix: measured over the vault it moves
+    /// divergence from 9 to 14, because the facade emits nothing for the definition and reference
+    /// nodes it then produces.
     #[test]
     fn known_differences_from_markdownlint() {
         let none: &[Report] = &[];
@@ -359,6 +362,11 @@ mod test {
         assert_eq!(owned(none), reports("[a]:\n/u\n\ntext\n"));
         // markdownlint: [(1, "Unused", "^a")]
         assert_eq!(owned(none), reports("[^a]: prose here\n\ntext\n"));
+        // markdownlint: [(5, "Unused", "^v"), (9, "Duplicate", "^v")]
+        assert_eq!(
+            owned(none),
+            reports("[v][a]\n\n[a]: /url\n\n[^v]: first note\n\ntext\n\n[^v]: second note\n")
+        );
     }
 
     #[test]

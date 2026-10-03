@@ -456,6 +456,15 @@ mod test {
         assert_eq!(vec![(1, 1, 13)], urls("https://x.com[a]\n"));
         // markdownlint: [(1, 5, 17)]
         assert_eq!(vec![(1, 5, 15)], urls("see https://x.org/a;\\\nmore\n"));
+        // micromark's math text closes on a `$` preceded by whitespace, where comrak refuses one,
+        // so the URL below is inside a math span for markdownlint and bare text here.
+        // markdownlint: []
+        assert_eq!(
+            vec![(1, 15, 13)],
+            urls("latest=$(curl https://x.com);\\\ncd $y\n")
+        );
+        // markdownlint: []
+        assert_eq!(vec![(1, 10, 13)], urls("a $b and https://x.com $c d\n"));
     }
 
     #[test]
