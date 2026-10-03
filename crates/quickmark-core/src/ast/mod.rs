@@ -372,6 +372,16 @@ impl<'a> Node<'a> {
         })
     }
 
+    /// The node that follows this one under the same parent, if there is one.
+    pub fn next_sibling(self) -> Option<Node<'a>> {
+        let siblings = self.tree.children_of(self.parent()?.index);
+        let position = siblings.iter().position(|&sibling| sibling == self.index)?;
+        siblings.get(position + 1).map(|&index| Node {
+            tree: self.tree,
+            index,
+        })
+    }
+
     pub fn child(self, index: usize) -> Option<Node<'a>> {
         self.tree
             .children_of(self.index)

@@ -29,7 +29,7 @@ impl MD028Linter {
     /// `>` inside a fenced code block from looking like a quote, which is why this rule needs no
     /// list of code block lines to exclude.
     fn check(&mut self, node: Node) {
-        let Some(next) = next_sibling(node) else {
+        let Some(next) = node.next_sibling() else {
             return;
         };
         if next.kind() != "block_quote" {
@@ -64,17 +64,6 @@ impl MD028Linter {
             ));
         }
     }
-}
-
-/// The node after `node` under the same parent.
-fn next_sibling<'a>(node: Node<'a>) -> Option<Node<'a>> {
-    let parent = node.parent()?;
-    let position = (0..parent.child_count()).find(|&index| {
-        parent
-            .child(index)
-            .is_some_and(|child| child.id() == node.id())
-    })?;
-    parent.child(position + 1)
 }
 
 /// The row a block's last content is on: a block's end swallows its trailing newline, which puts

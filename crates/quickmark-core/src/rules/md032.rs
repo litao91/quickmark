@@ -1,4 +1,4 @@
-use crate::ast::Node;
+use crate::ast::{Node, NodeRange, Point};
 use std::rc::Rc;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
@@ -24,147 +24,124 @@ impl MD032Linter {
         }
     }
 
-    /// Check if a line is blank, handling out-of-bounds safely and considering blockquote context.
-    /// Out-of-bounds lines are considered blank to avoid false violations at document boundaries.
-    /// Lines containing only blockquote markers (e.g., "> " or ">") are considered blank.
-    #[inline]
-    fn is_line_blank_cached(&self, line_number: usize, lines: &[String]) -> bool {
-        if line_number < lines.len() {
-            let line = &lines[line_number];
-            let trimmed = line.trim();
-
-            // Regular blank line
-            if trimmed.is_empty() {
-                return true;
-            }
-
-            // Check if this is a blockquote marker line (just >, >>, etc.)
-            if trimmed == ">" || trimmed.chars().all(|c| c == '>') {
-                return true;
-            }
-
-            // Check if this is a blockquote with only spaces ("> ", ">> ", etc.)
-            if trimmed.starts_with('>') && trimmed.trim_start_matches('>').trim().is_empty() {
-                return true;
-            }
-
-            false
-        } else {
-            true // Consider out-of-bounds lines as blank
-        }
-    }
-
-    /// Check if a node is within another list structure by traversing up the AST.
-    /// This helps identify top-level lists vs nested lists.
-    /// Lists within blockquotes are still considered "top-level" for MD032 purposes.
-    #[inline]
-    fn is_top_level_list(&self, node: &Node) -> bool {
-        let mut current = node.parent();
-        while let Some(parent) = current {
-            match parent.kind() {
-                "list" => return false, // Found parent list, so this is nested
-                // Stop searching when we hit document-level containers
-                "document" | "block_quote" => return true,
-                _ => current = parent.parent(),
-            }
-        }
-        true // No parent list found, this is top-level
-    }
-
-    /// Whether a line opens a block that interrupts a paragraph — thematic break, ATX heading or
-    /// code fence — at the first column of its container. Such a line can be neither list item
-    /// content (which has to be indented) nor a lazy continuation, so when tree-sitter folds it
-    /// into the range of the list above it, that trailing line does not belong to the list.
-    fn is_interrupting_block_start(line: &str) -> bool {
-        let after_quote = line.trim_start_matches('>');
-        let content = after_quote.strip_prefix(' ').unwrap_or(after_quote);
-        if content.is_empty() || content.starts_with([' ', '\t']) {
-            return false;
-        }
-
-        if content.starts_with('#') || content.starts_with("```") || content.starts_with("~~~") {
+    /// markdownlint's `isBlankLine`. A row the document does not have is blank, which is what keeps
+    /// a list at either end of the file from reporting. Block quote markers and HTML comments are
+    /// blank too: `>` alone separates two quotes without being content, and a comment is invisible.
+    fn is_blank(row: usize, lines: &[String]) -> bool {
+        let Some(line) = lines.get(row) else {
+            return true;
+        };
+        if line.trim().is_empty() {
             return true;
         }
-
-        content.len() >= 3
-            && (content.chars().all(|c| c == '-')
-                || content.chars().all(|c| c == '*')
-                || content.chars().all(|c| c == '_'))
+        without_comments(line).replace('>', "").trim().is_empty()
     }
 
-    /// Find the last line of the list that carries content, skipping trailing blank lines.
-    fn find_visual_end_line(&self, node: &Node) -> usize {
-        let start_line = node.start_position().row;
-        // tree-sitter end positions are exclusive, so a list that ends at the start of a line does
-        // not include that line. Without this the backward scan walks past the list and latches
-        // onto the first line of whatever block follows it.
-        let end = node.end_position();
-        let last_line = if end.column == 0 {
-            end.row.saturating_sub(1)
-        } else {
-            end.row
-        }
-        .max(start_line);
-
-        let lines = self.context.lines.borrow();
-
-        for line_idx in (start_line..=last_line).rev() {
-            let Some(line) = lines.get(line_idx) else {
-                continue;
-            };
-            if !self.is_line_blank_cached(line_idx, &lines)
-                && !Self::is_interrupting_block_start(line)
-            {
-                return line_idx;
+    /// Whether a list is one markdownlint looks at. It descends into every token except lists and
+    /// HTML flows, so a list inside a block quote is checked and a list inside a list is not — the
+    /// outer list already accounts for the blank lines around the whole of it. An `html_block` is a
+    /// leaf here, so the HTML-flow half of that needs no code.
+    fn is_top_level(node: Node) -> bool {
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            if parent.kind() == "list" {
+                return false;
             }
+            current = parent.parent();
         }
-
-        // Fallback to node's start line if no content found
-        start_line
+        true
     }
 
-    fn check_list(&mut self, node: &Node) {
-        // Only check top-level lists
-        if !self.is_top_level_list(node) {
+    /// The row after the last one the list can claim.
+    ///
+    /// A list's range runs on over trailing blank rows to wherever the next block starts, so that
+    /// row belongs to the next block rather than to the list. With no next block the range runs to
+    /// the parent's end instead, which is one past the parent's last row — unless the document has
+    /// no final newline, in which case it names that last row itself.
+    fn claimed_end_row(&self, node: Node, lines: &[String]) -> usize {
+        if let Some(next) = node.next_sibling() {
+            return next.start_position().row;
+        }
+        let end = node.end_position();
+        let last_row = lines.len().saturating_sub(1);
+        if end.row > last_row || self.context.document_content.borrow().ends_with('\n') {
+            end.row
+        } else {
+            end.row + 1
+        }
+    }
+
+    /// The list's last row that carries content, skipping the trailing blank rows its range covers.
+    fn last_content_row(&self, node: Node, lines: &[String]) -> usize {
+        let first = node.start_position().row;
+        let upper = self.claimed_end_row(node, lines).saturating_sub(1);
+        (first..=upper.max(first))
+            .rev()
+            .find(|&row| !Self::is_blank(row, lines))
+            .unwrap_or(first)
+    }
+
+    fn check(&mut self, node: Node) {
+        if !Self::is_top_level(node) {
             return;
         }
 
-        let start_line = node.start_position().row;
-        let end_line = self.find_visual_end_line(node);
+        // Both rows are settled before anything is reported: reporting needs `&mut self`, and the
+        // line table is borrowed off `self`.
+        let (before, after) = {
+            let lines = self.context.lines.borrow();
+            let first = node.start_position().row;
+            let last = self.last_content_row(node, &lines);
+            // markdownlint reads the row above the list and the row below its last content row —
+            // not below the range's end, which trailing blank rows push further on.
+            let before = (first > 0 && !Self::is_blank(first - 1, &lines)).then_some(first);
+            // A missing blank below is reported on the list's own last line, not on the line that
+            // should have been blank.
+            let after = (!Self::is_blank(last + 1, &lines)).then_some(last);
+            (before, after)
+        };
 
-        // Single borrow for the entire function to avoid multiple RefCell runtime checks
-        let lines = self.context.lines.borrow();
-        let total_lines = lines.len();
-
-        // Check blank line above (only if not at document start)
-        if start_line > 0 {
-            let line_above = start_line - 1;
-            if !self.is_line_blank_cached(line_above, &lines) {
-                self.violations.push(RuleViolation::new(
-                    &MD032,
-                    MISSING_BLANK_BEFORE.to_string(),
-                    self.context.file_path.clone(),
-                    range_from_node_range(&node.range()),
-                ));
-            }
+        if let Some(row) = before {
+            self.report(MISSING_BLANK_BEFORE, row);
         }
+        if let Some(row) = after {
+            self.report(MISSING_BLANK_AFTER, row);
+        }
+    }
 
-        // Check blank line below (following original markdownlint logic)
-        // The original checks lines[lastLineNumber] where lastLineNumber is the line after the list
-        let line_after_list_idx = end_line + 1;
-        if line_after_list_idx < total_lines {
-            let is_blank = self.is_line_blank_cached(line_after_list_idx, &lines);
+    fn report(&mut self, message: &str, row: usize) {
+        let width = self.context.lines.borrow().get(row).map_or(0, String::len);
+        self.violations.push(RuleViolation::new(
+            &MD032,
+            message.to_string(),
+            self.context.file_path.clone(),
+            range_from_node_range(&NodeRange {
+                start_byte: 0,
+                end_byte: 0,
+                start_point: Point { row, column: 0 },
+                end_point: Point { row, column: width },
+            }),
+        ));
+    }
+}
 
-            // If the line immediately after the list is not blank, report a violation
-            // This matches the original markdownlint behavior exactly
-            if !is_blank {
-                self.violations.push(RuleViolation::new(
-                    &MD032,
-                    MISSING_BLANK_AFTER.to_string(),
-                    self.context.file_path.clone(),
-                    range_from_node_range(&node.range()),
-                ));
-            }
+/// The line with every complete HTML comment cut out, mirroring markdownlint's `removeComments`. An
+/// unterminated `<!--` swallows the rest of the line and an unmatched `-->` the part before it,
+/// both of which leave whatever is outside.
+fn without_comments(line: &str) -> String {
+    let mut out = String::from(line);
+    loop {
+        let start = out.find("<!--");
+        let end = out.find("-->");
+        if let Some(end) = end.filter(|&end| start.is_none_or(|start| end < start)) {
+            out.drain(..end + 3);
+        } else if let (Some(start), Some(end)) = (start, end) {
+            out.replace_range(start..end + 3, "");
+        } else if let Some(start) = start {
+            out.truncate(start);
+            return out;
+        } else {
+            return out;
         }
     }
 }
@@ -172,7 +149,7 @@ impl MD032Linter {
 impl RuleLinter for MD032Linter {
     fn feed(&mut self, node: &Node) {
         if node.kind() == "list" {
-            self.check_list(node);
+            self.check(*node);
         }
     }
 
@@ -186,376 +163,205 @@ pub const MD032: Rule = Rule {
     alias: "blanks-around-lists",
     tags: &["blank_lines", "bullet", "ol", "ul"],
     description: "Lists should be surrounded by blank lines",
-    rule_type: RuleType::Hybrid,
+    rule_type: RuleType::Token,
     required_nodes: &["list"],
     new_linter: |context| Box::new(MD032Linter::new(context)),
 };
 
 #[cfg(test)]
 mod test {
-    use std::path::PathBuf;
-
     use crate::config::RuleSeverity;
     use crate::linter::MultiRuleLinter;
-    use crate::test_utils::test_helpers::test_config_with_settings;
+    use crate::test_utils::test_helpers::test_config_with_rules;
+    use std::path::PathBuf;
 
-    fn test_config_default() -> crate::config::QuickmarkConfig {
-        test_config_with_settings(
-            vec![
-                ("blanks-around-lists", RuleSeverity::Error),
-                ("heading-style", RuleSeverity::Off),
-                ("heading-increment", RuleSeverity::Off),
-            ],
-            Default::default(),
-        )
+    fn test_config() -> crate::config::QuickmarkConfig {
+        test_config_with_rules(vec![("blanks-around-lists", RuleSeverity::Error)])
+    }
+
+    /// A case's name, its document, and the reports markdownlint makes on it.
+    type Case = (&'static str, &'static str, &'static [(usize, &'static str)]);
+
+    /// The 1-based lines MD032 reports on, each tagged with the check that fired.
+    fn reports(source: &str) -> Vec<(usize, &'static str)> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), source);
+        linter
+            .analyze()
+            .iter()
+            .filter(|violation| violation.rule().id == "MD032")
+            .map(|violation| {
+                let missing = if violation.message().ends_with("before]") {
+                    "before"
+                } else {
+                    "after"
+                };
+                (violation.location().range.start.line + 1, missing)
+            })
+            .collect()
+    }
+
+    /// Every expectation measured against markdownlint-cli2 v0.23.3. It names the list's own first
+    /// line for a missing blank above, and the list's own last content line — not the line that
+    /// should have been blank — for a missing one below.
+    #[test]
+    fn matches_markdownlint() {
+        let cases: &[Case] = &[
+            ("surrounded", "text\n\n- a\n- b\n\ntext\n", &[]),
+            ("nothing above", "text\n- a\n- b\n\ntext\n", &[(2, "before")]),
+            // `text` continues the last item's paragraph lazily, so the list reaches the end.
+            ("lazy continuation below", "text\n\n- a\n- b\ntext\n", &[]),
+            ("neither blank", "text\n- a\n- b\ntext\n", &[(2, "before")]),
+            ("at the document start", "- a\n- b\n\ntext\n", &[]),
+            ("at the document end", "text\n\n- a\n- b\n", &[]),
+            ("the whole document", "- a\n- b\n", &[]),
+            ("no final newline", "- a\n- b", &[]),
+            ("no final newline, text above", "text\n- a\n- b", &[(2, "before")]),
+            ("thematic break below", "- a\n- b\n---\n", &[(2, "after")]),
+            ("heading below", "- a\n- b\n# H\n", &[(2, "after")]),
+            ("fence below", "- a\n- b\n```\ncode\n```\n", &[(2, "after")]),
+            ("blank then thematic break", "- a\n- b\n\n---\n", &[]),
+            ("blank then heading", "- a\n- b\n\n# H\n", &[]),
+            ("thematic break above", "---\n- a\n- b\n", &[(2, "before")]),
+            ("heading above", "# H\n- a\n- b\n", &[(2, "before")]),
+            ("fence above", "```\ncode\n```\n- a\n- b\n", &[(4, "before")]),
+            ("quoted, blank `>` around", "> text\n>\n> - a\n> - b\n>\n> text\n", &[]),
+            ("quoted, nothing around", "> text\n> - a\n> - b\n> text\n", &[(2, "before")]),
+            ("quoted, blank `>` above", "> text\n>\n> - a\n> - b\n", &[]),
+            ("quoted, blank `>` below", "> - a\n> - b\n>\n> text\n", &[]),
+            ("doubly quoted", ">> - a\n>> - b\n", &[]),
+            ("nested items", "- a\n  - nested\n  - nested\n- b\n\ntext\n", &[]),
+            ("loose", "text\n\n- a\n\n- b\n\ntext\n", &[]),
+            ("loose, lazy below", "text\n\n- a\n\n- b\ntext\n", &[]),
+            ("loose, thematic break below", "- a\n\n- b\n---\n", &[(3, "after")]),
+            ("ordered", "text\n\n1. a\n2. b\n\ntext\n", &[]),
+            ("ordered, neither blank", "text\n1. a\n2. b\n---\n", &[(2, "before"), (3, "after")]),
+            // `+ a` and `- b` are two lists, so each reports against the other.
+            ("mixed markers", "text\n\n+ a\n- b\n\ntext\n", &[(3, "after"), (4, "before")]),
+            ("comment below", "- a\n- b\n<!-- c -->\ntext\n", &[]),
+            ("comment above", "text\n<!-- c -->\n- a\n- b\n", &[]),
+            ("comment below then blank", "- a\n- b\n<!-- c -->\n\ntext\n", &[]),
+            ("quote below", "- a\n- b\n\n> quote\n", &[]),
+            ("quote below, no blank", "- a\n- b\n> quote\n", &[(2, "after")]),
+            ("quote above", "> quote\n- a\n- b\n", &[(2, "before")]),
+            ("table below", "- a\n- b\n\n| x |\n| - |\n", &[]),
+            ("table below, no blank", "- a\n- b\n| x |\n| - |\n", &[]),
+            ("indented code below", "- a\n- b\n\n    indented\n", &[]),
+            ("item ending in indented code", "- a\n\n      code\n\n- b\n\ntext\n", &[]),
+            ("item ending in a closed fence", "- a\n\n  ```\n  code\n  ```\n\ntext\n", &[]),
+            // The closing fence is the list's last content line, so the report lands there.
+            (
+                "item ending in a fence, text below",
+                "- a\n\n  ```\n  code\n  ```\ntext\n",
+                &[(5, "after")],
+            ),
+            ("two lists, blank between", "- a\n- b\n\n- c\n- d\n", &[]),
+            ("one long list", "- a\n- b\n- c\n- d\n", &[]),
+            ("two-line paragraph above", "para one\npara two\n- a\n- b\n", &[(3, "before")]),
+            ("two-line lazy continuation", "- a\n- b\npara one\npara two\n", &[]),
+            ("two-line paragraph below", "- a\n- b\n\npara one\npara two\n", &[]),
+            ("setext underline below", "- a\n- b\n=====\n", &[]),
+            ("setext heading below", "- a\n- b\n\nSetext\n======\n", &[]),
+            ("loose item, blank below", "- item\n\n  more\n\ntext\n", &[]),
+            ("loose item, lazy below", "- item\n\n  more\ntext\n", &[]),
+            ("several blanks below", "- a\n- b\n\n\n\ntext\n", &[]),
+            ("several blanks above", "text\n\n\n\n- a\n- b\n", &[]),
+            ("indented list", "   - a\n   - b\n\ntext\n", &[]),
+            ("indented list, text above", "text\n   - a\n   - b\n", &[(2, "before")]),
+            ("html block below", "- a\n- b\n<div>\nx\n</div>\n", &[(2, "after")]),
+            // An unclosed type-6 HTML block runs to the end of the document and swallows the list,
+            // so there is no list to report on at all.
+            ("html block above", "<div>\nx\n</div>\n- a\n- b\n", &[]),
+            ("crlf", "- a\r\n- b\r\n\r\ntext\r\n", &[]),
+            ("empty comment below", "- a\n- b\n\n<!-- -->\n", &[]),
+            ("bare `>` below a plain list", "- a\n- b\n>\n> text\n", &[]),
+            ("empty item below", "- a\n- b\n\n-\n", &[]),
+            ("lazy continuation in an ordered list", "1. List item\n   More item 1\n2. List item\nMore item 2\n\ntail\n", &[]),
+            ("nested list then a quote", "- a\n  - nested\n\n> quote\n\ntail\n", &[]),
+            // The two shapes the vault comparison turned up: a quoted list whose range ran on into
+            // the paragraph after the closing `>`.
+            (
+                "quoted ordered list with continuations",
+                "> **Two corrections.** worth\n> recording because.\n>\n> 1. *\"Whichever replica completes\n>    other five.\"* **Wrong.** columns\n>    and more\n> 2. second item\n>\n> What survives below\n",
+                &[],
+            ),
+            (
+                "quoted list after a quoted fence",
+                "> ```\n> code\n> ```\n>\n> A `Foo` will need to:\n>\n> - store some integer\n> - Enough space\n>\n> => though Empty\n",
+                &[],
+            ),
+            ("two comment lines below", "- a\n- b\n\n<!-- one -->\n<!-- two -->\ntext\n", &[]),
+            ("unterminated comment below", "- a\n- b\n<!-- unterminated\ntext\n", &[]),
+            ("unmatched close below", "- a\n- b\n--> rest\n", &[]),
+            ("unmatched close above", "text -->\n- a\n- b\n", &[]),
+            ("math block below", "- a\n- b\n\n$$\nx\n$$\n", &[]),
+            ("quoted thematic break below", "> - a\n> - b\n> ---\n", &[(2, "after")]),
+            ("whitespace-only line between items", "- a\n- b\n   \n- c\n", &[]),
+            ("two lists, nothing between", "+ a\n- b\n", &[(1, "after"), (2, "before")]),
+            ("tab-only line below", "- a\n- b\n\t\ntext\n", &[]),
+            ("quoted list inside a quote below", "- a\n- b\n\n> x\n>\n> - c\n> - d\n", &[]),
+            ("loose list, lazy below", "text\n\n- a\n- b\n\n- c\n- d\ntext\n", &[]),
+            ("loose list to the end", "- a\n\n- b\n\n- c\n", &[]),
+            (
+                "html block between two lists",
+                "- a\n- b\n<div>\nx\n</div>\n\n- c\n- d\n",
+                &[(2, "after")],
+            ),
+            ("blank first line", "   \n- a\n- b\n", &[]),
+            ("trailing blanks only", "- a\n- b\n\n\n", &[]),
+        ];
+
+        let failures: Vec<String> = cases
+            .iter()
+            .filter(|&&(name, source, expected)| {
+                let actual = reports(source);
+                let expected: Vec<(usize, &str)> = expected.to_vec();
+                if actual == expected {
+                    return false;
+                }
+                println!("{name}: expected {expected:?}, got {actual:?}");
+                true
+            })
+            .map(|&(name, _, _)| name.to_string())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {} cases disagree with markdownlint: {failures:?}",
+            failures.len(),
+            cases.len()
+        );
+    }
+
+    /// `$$` on the line after a list opens a math *flow* in micromark, which interrupts the list. In
+    /// comrak it is a lazy continuation of the last item's paragraph, so the list absorbs it and has
+    /// nothing after it to be blank about. markdownlint reports line 2 here. Closing the gap means
+    /// splitting a comrak paragraph at a `$$` line — see `ast::synth::math_regions`.
+    #[test]
+    fn a_math_flow_interrupting_a_list_is_a_known_difference() {
+        assert_eq!(reports("- a\n- b\n$$\nx\n$$\n"), vec![]);
     }
 
     #[test]
-    fn test_no_violation_proper_blanks() {
-        let config = test_config_default();
-
-        let input = "Some text
-
-* List item
-* List item
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_violation_missing_blank_above() {
-        let config = test_config_default();
-
-        let input = "Some text
-* List item
-* List item
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("blank line before"));
-    }
-
-    #[test]
-    fn test_violation_missing_blank_below() {
-        let config = test_config_default();
-
-        // Use a thematic break instead of paragraph text to avoid lazy continuation
-        let input = "Some text
-
-* List item
-* List item
----";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("blank line after"));
-    }
-
-    #[test]
-    fn test_violation_missing_both_blanks() {
-        let config = test_config_default();
-
-        // Use a thematic break to avoid lazy continuation
-        let input = "Some text
-* List item
-* List item
----";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(2, violations.len());
-        assert!(violations[0].message().contains("blank line"));
-        assert!(violations[1].message().contains("blank line"));
-    }
-
-    #[test]
-    fn test_no_violation_at_document_start() {
-        let config = test_config_default();
-
-        let input = "* List item
-* List item
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_no_violation_at_document_end() {
-        let config = test_config_default();
-
-        let input = "Some text
-
-* List item
-* List item";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_ordered_list_violations() {
-        let config = test_config_default();
-
-        let input = "Some text
-1. List item
-2. List item
----";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(2, violations.len()); // Both missing blank above and below
-    }
-
-    #[test]
-    fn test_mixed_list_markers() {
-        let config = test_config_default();
-
-        let input = "Some text
-+ List item
-- List item
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Original markdownlint detects 3 violations:
-        // + List item (missing blank before and after), - List item (missing blank before)
-        assert_eq!(3, violations.len());
-    }
-
-    #[test]
-    fn test_nested_lists_no_violation() {
-        let config = test_config_default();
-
-        let input = "Some text
-
-* List item
-  * Nested item
-  * Nested item
-* List item
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Should not report violations for nested lists, only top-level
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_lists_in_blockquotes() {
-        let config = test_config_default();
-
-        let input = "> Some text
->
-> * List item
-> * List item
->
-> More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Should handle blockquote context properly
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_lists_in_blockquotes_violation() {
-        let config = test_config_default();
-
-        let input = "> Some text
-> * List item
-> * List item
-> More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Should detect violations even in blockquotes (only missing blank before due to lazy continuation)
-        assert_eq!(1, violations.len());
-    }
-
-    #[test]
-    fn test_list_with_horizontal_rule_before() {
-        let config = test_config_default();
-
-        let input = "Some text
-
----
-* List item
-* List item
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // HR immediately before list should trigger violation
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("blank line before"));
-    }
-
-    #[test]
-    fn test_list_with_horizontal_rule_after() {
-        let config = test_config_default();
-
-        let input = "Some text
-
-* List item
-* List item
----
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // HR immediately after list should trigger violation
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("blank line after"));
-    }
-
-    #[test]
-    fn test_list_with_code_block_before() {
-        let config = test_config_default();
-
-        let input = "Some text
-
-```
-code
-```
-* List item
-* List item
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Code block immediately before list should trigger violation
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("blank line before"));
-    }
-
-    #[test]
-    fn test_list_with_code_block_after() {
-        let config = test_config_default();
-
-        let input = "Some text
-
-* List item
-* List item
-```
-code
-```
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Code block immediately after list should trigger violation
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("blank line after"));
-    }
-
-    #[test]
-    fn test_lazy_continuation_line() {
-        let config = test_config_default();
-
-        let input = "Some text
-
-1. List item
-   More item 1
-2. List item
-More item 2
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // "More item 2" is a lazy continuation line, should not trigger violation
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_list_at_document_boundaries_complete() {
-        let config = test_config_default();
-
-        let input = "* List item
-* List item";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // List spans entire document - no violations expected
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_no_violation_before_multiline_paragraph() {
-        let config = test_config_default();
-
-        let input = "- a
-- b
-
-para one
-para two
-
-tail";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_no_violation_before_multiline_blockquote() {
-        let config = test_config_default();
-
-        let input = "- a
-- b
-
-> quote one
-> quote two
-
-tail";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_no_violation_nested_list_before_blockquote() {
-        let config = test_config_default();
-
-        let input = "- a
-  - nested
-
-> quote
-
-tail";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_no_violation_item_ending_with_indented_code_fence() {
-        let config = test_config_default();
-
-        let input = "- item
-
-  ```
-  code
-  ```
-
-More text";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // The indented closing fence is the list's real last line, not a following block
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_no_violation_multiple_blank_lines_after_list() {
-        let config = test_config_default();
-
-        let input = "- a
-- b
-
-
-para one
-para two";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(0, violations.len());
+    fn a_report_covers_its_whole_line() {
+        let mut linter = MultiRuleLinter::new_for_document(
+            PathBuf::from("test.md"),
+            test_config(),
+            "> text\n> - a\n> - b\n",
+        );
+        let range = linter
+            .analyze()
+            .iter()
+            .find(|violation| violation.rule().id == "MD032")
+            .map(|violation| {
+                let range = &violation.location().range;
+                (
+                    range.start.line,
+                    range.start.character,
+                    range.end.line,
+                    range.end.character,
+                )
+            })
+            .expect("one violation");
+        assert_eq!(range, (1, 0, 1, 5));
     }
 }
