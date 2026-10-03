@@ -151,7 +151,10 @@ impl MD044Linter {
     fn violation(&self, expected: &str, actual: &str, row: usize, column: usize) -> RuleViolation {
         RuleViolation::new(
             &MD044,
-            format!("Expected: {expected}; Actual: {actual}"),
+            format!(
+                "{} [Expected: {expected}; Actual: {actual}]",
+                MD044.description
+            ),
             self.context.file_path.clone(),
             range_from_node_range(&crate::ast::NodeRange {
                 start_byte: 0,
@@ -436,13 +439,18 @@ mod test {
             .analyze()
             .iter()
             .map(|violation| {
-                let message = violation.message();
-                let (expected, actual) = message.split_once("; Actual: ").unwrap_or((message, ""));
+                // "Proper names should have the correct capitalization [Expected: a; Actual: b]"
+                let detail = violation
+                    .message()
+                    .split_once("[Expected: ")
+                    .and_then(|(_, rest)| rest.strip_suffix(']'))
+                    .unwrap_or_default();
+                let (expected, actual) = detail.split_once("; Actual: ").unwrap_or((detail, ""));
                 let range = &violation.location().range;
                 (
                     range.start.line + 1,
                     range.start.character + 1,
-                    expected.trim_start_matches("Expected: ").to_string(),
+                    expected.to_string(),
                     actual.to_string(),
                 )
             })
