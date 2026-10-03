@@ -77,6 +77,11 @@ pub enum Kind {
     /// The anonymous `|` between and around table cells. The only unnamed kind.
     Pipe,
     LinkReferenceDefinition,
+    /// A `[^name]: …` definition. Its body is ordinary blocks, so it is a container, and its name is
+    /// not in the tree — MD053 reads it back out of the source.
+    FootnoteDefinition,
+    /// A `[^name]` call. An inline leaf; the name is in the source, not the tree.
+    FootnoteReference,
     /// A comrak node with no tree-sitter-md counterpart. Unreachable while the extension flags in
     /// [`build::comrak_options`] stay off; it exists so flipping one fails loudly instead of
     /// silently dropping content.
@@ -131,6 +136,8 @@ pub const KIND_NAMES: &[&str] = &[
     "pipe_table_delimiter_cell",
     "|",
     "link_reference_definition",
+    "footnote_definition",
+    "footnote_reference",
     "UNKNOWN",
 ];
 
@@ -171,6 +178,7 @@ impl Kind {
                 | Kind::Image
                 | Kind::HtmlInline
                 | Kind::Math
+                | Kind::FootnoteReference
         )
     }
 }

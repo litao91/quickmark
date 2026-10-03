@@ -33,6 +33,7 @@ pub fn parse(source: &str) -> FacadeTree {
         math: Vec::new(),
         math_emitted: Vec::new(),
         link_targets: HashMap::new(),
+        in_footnote_definition: false,
         closed_headings: HashSet::new(),
     };
     builder.math = synth::math_regions(&builder.lines);
@@ -80,7 +81,7 @@ fn clip_math_to_containers(math: &mut [synth::Span], lines: &LineIndex<'_>, root
 /// The comrak configuration quickmark parses with. Everything not set here stays at its default,
 /// which for extensions means off.
 ///
-/// Three of these are load-bearing rather than stylistic:
+/// Each of these is load-bearing rather than stylistic:
 ///
 /// - `sourcepos_chars` off, because rules treat columns as UTF-8 byte offsets.
 /// - `front_matter_delimiter`, because without it `---\ntitle: x\n---` parses as a thematic break
@@ -89,6 +90,10 @@ fn clip_math_to_containers(math: &mut [synth::Span], lines: &LineIndex<'_>, root
 /// - `tasklist` on, because it moves the item's paragraph start past `[x] `, which is where
 ///   tree-sitter-md put it. The task marker node itself is deliberately not reproduced — no rule
 ///   reads it.
+/// - `footnotes` on, because markdownlint parses with micromark's GFM footnote extension, so `[^a]`
+///   is a call and `[^a]: …` a definition rather than a shortcut reference and a paragraph. comrak
+///   drops every definition nothing refers to, and [`synth::is_footnote_definition_line`] puts those
+///   back as `link_reference_definition` nodes so MD053 can still report them unused.
 pub fn comrak_options() -> Options<'static> {
     let mut options = Options::default();
     options.extension.table = true;
@@ -98,6 +103,7 @@ pub fn comrak_options() -> Options<'static> {
     // and its contents are never emphasis, HTML or a link. Without this, comrak leaves the `$` as
     // text and every inline rule sees through it.
     options.extension.math_dollars = true;
+    options.extension.footnotes = true;
     options.parse.sourcepos_chars = false;
     options.parse.smart = false;
     options.parse.ignore_setext = false;
@@ -183,6 +189,11 @@ struct Builder<'a> {
     /// Destinations of the `link` nodes emitted so far, keyed by build-time index. [`Builder::flatten`]
     /// rekeys them by position.
     link_targets: HashMap<u32, LinkTarget>,
+    /// Set while a footnote definition's children are being emitted. comrak has already consumed the
+    /// `[^name]:` marker, so a paragraph inside one is content, not a definition it detached — and
+    /// [`Builder::emit_paragraph`] would otherwise read the marker back off the line and hand MD053 a
+    /// second definition of the same label.
+    in_footnote_definition: bool,
     /// Build-time indices of the closed `atx_heading` nodes, rekeyed by [`Builder::flatten`].
     closed_headings: HashSet<u32>,
 }
@@ -645,6 +656,18 @@ impl<'a> Builder<'a> {
                 let index = self.emit_leaf(Kind::HtmlBlock, node, nesting);
                 out.push(index);
             }
+            // A footnote definition's body is ordinary blocks and the inline rules have to see it —
+            // markdownlint reports a bare URL inside one — so this is a container, not a leaf. It is
+            // covered so the link-reference-definition synthesis does not claim the same lines and
+            // hand MD053 a second definition of the same label.
+            NodeValue::FootnoteDefinition(_) => {
+                let saved = self.in_footnote_definition;
+                self.in_footnote_definition = true;
+                let index = self.emit_container(Kind::FootnoteDefinition, node, nesting);
+                self.in_footnote_definition = saved;
+                self.cover(index);
+                out.push(index);
+            }
             NodeValue::Paragraph => {
                 let forced = self.pending_paragraph_start.take();
                 let (start, end) = (
@@ -937,7 +960,11 @@ impl<'a> Builder<'a> {
         };
 
         let mut row = start.0;
-        while row <= last_row && synth::is_link_reference_definition(&self.lines, row as usize) {
+        let split_definitions = !self.in_footnote_definition;
+        while split_definitions
+            && row <= last_row
+            && synth::is_link_reference_definition(&self.lines, row as usize)
+        {
             let definition_end = self.lines.block_end_row(row);
             let definition = self.add(Kind::LinkReferenceDefinition, (row, 0), definition_end);
             self.cover(definition);
@@ -1001,6 +1028,9 @@ impl<'a> Builder<'a> {
             NodeValue::HtmlInline(_) => Kind::HtmlInline,
             // comrak's math is inline-only and carries its contents as a literal, so this is a leaf.
             NodeValue::Math(_) => Kind::Math,
+            // A footnote call. MD053 needs it to know a definition is used. markdownlint's MD051 and
+            // MD052 do not treat it as a link, so nothing else reads it.
+            NodeValue::FootnoteReference(_) => Kind::FootnoteReference,
             // A line break carries no structure a rule can use, and the `text` nodes either side of
             // it already cover the bytes. `Raw` and `EscapedTag` are comrak's text-like leftovers.
             NodeValue::SoftBreak

@@ -700,18 +700,23 @@ pub fn is_link_reference_definition(lines: &LineIndex<'_>, row: usize) -> bool {
     is_definition_line(&content[prefix..])
 }
 
-/// One line of a link reference definition: up to three spaces of indent, a label, a colon, a
-/// destination, and then either the end of the line or a title and the end of the line.
+/// One line of a definition: either a link reference definition — up to three spaces of indent, a
+/// label, a colon, a destination, and then either the end of the line or a title and the end of the
+/// line — or a GFM footnote definition, whose `[^name]:` is followed by arbitrary markdown.
 ///
-/// That last rule is why this is a parser and not a `[label]:` pattern. Prose where only a title may
-/// go makes the whole thing an ordinary paragraph, so `[^version]: It's generally good practice ...`
-/// is not a definition — and inventing one adds a spurious unused-definition report for every
-/// footnote in the document.
+/// The destination-and-title rule is why this is a parser and not a `[label]:` pattern: prose where
+/// only a title may go makes the whole thing an ordinary paragraph. A footnote definition has no such
+/// constraint, and comrak drops every definition nothing refers to, so without the `[^name]:` branch
+/// an unused footnote would reach no rule at all — MD053 could not report it and MD013 would measure
+/// it instead of exempting it.
 fn is_definition_line(text: &str) -> bool {
     let bytes = text.as_bytes();
     let indent = bytes.iter().take_while(|&&byte| byte == b' ').count();
     if indent > 3 || bytes.get(indent) != Some(&b'[') {
         return false;
+    }
+    if is_footnote_definition_line(bytes, indent) {
+        return true;
     }
 
     let mut at = indent + 1;
@@ -745,6 +750,25 @@ fn is_definition_line(text: &str) -> bool {
     };
     // An unterminated title continues on the following lines, which `reference_definitions` absorbs.
     !closed || skip_space_tab(bytes, after_title) >= bytes.len()
+}
+
+/// `[^name]:` starting at `indent`, where GFM lets the name be anything but whitespace and `]`.
+fn is_footnote_definition_line(bytes: &[u8], indent: usize) -> bool {
+    let Some(b'^') = bytes.get(indent + 1) else {
+        return false;
+    };
+    let name_start = indent + 2;
+    let mut at = name_start;
+    while let Some(&byte) = bytes.get(at) {
+        if byte == b']' {
+            break;
+        }
+        if byte.is_ascii_whitespace() {
+            return false;
+        }
+        at += 1;
+    }
+    at > name_start && bytes.get(at) == Some(&b']') && bytes.get(at + 1) == Some(&b':')
 }
 
 fn skip_space_tab(bytes: &[u8], mut at: usize) -> usize {
@@ -954,19 +978,25 @@ mod tests {
             // An unterminated title continues on the following lines, which `reference_definitions`
             // absorbs into the same node.
             "[a]: /u \"title",
+            // A footnote definition takes arbitrary markdown where a link definition may only have a
+            // destination and a title.
+            "[^a]: prose here",
+            "[^version]: It's generally good practice for Rust posts",
+            "   [^a]: note",
+            "[^a]:",
         ] {
             assert!(is_definition_line(line), "should be a definition: {line:?}");
         }
     }
 
-    /// Prose where only a title may go makes the line an ordinary paragraph. Getting this wrong
-    /// invents a definition, which costs a spurious MD052/MD053 report for every footnote in a
-    /// document — the `[^version]: It's generally good practice ...` shape is common in posts
-    /// migrated from Jekyll.
+    /// Prose where only a title may go makes a *link* reference definition an ordinary paragraph, so
+    /// `[a]: /url ok` is not one. Getting this wrong invents a definition and costs a spurious
+    /// MD052/MD053 report. A footnote definition is the exception: `[^a]:` takes arbitrary markdown,
+    /// and comrak drops the ones nothing refers to, so this is the only way an unused footnote reaches
+    /// MD053 at all.
     #[test]
     fn trailing_content_is_not_a_definition() {
         for line in [
-            "[^version]: It's generally good practice for Rust posts",
             "[a]: /url \"title\" ok",
             "[a]: /url ok",
             "[a]:",
@@ -975,8 +1005,13 @@ mod tests {
             "[a] /u",
             "a: /u",
             "[a]: /u(",
+            // A footnote name is not empty and holds no whitespace, and without the colon this is
+            // just text. `[^ a]: x` and `[^]: x` are left out: both are ordinary link reference
+            // definitions, whose labels may hold spaces and a bare `^`.
+            "[^a] x",
             // Four spaces of indentation is an indented code block, not a definition.
             "    [a]: /u",
+            "    [^a]: x",
         ] {
             assert!(
                 !is_definition_line(line),

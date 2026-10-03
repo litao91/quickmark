@@ -382,7 +382,11 @@ impl RuleLinter for MD013Linter {
             // markdownlint strips front matter from the content before it parses, so no rule ever
             // sees those lines and reported line numbers are shifted back afterwards.
             "minus_metadata" | "plus_metadata" => Self::cover(&mut self.front_matter_lines, node),
-            "link_reference_definition" => Self::cover(&mut self.definition_lines, node),
+            // markdownlint's `definitionLineIndices` covers both `definition` and
+            // `gfmFootnoteDefinition` tokens, over every line each one spans.
+            "link_reference_definition" | "footnote_definition" => {
+                Self::cover(&mut self.definition_lines, node)
+            }
             "inline" => self.collect_inline(node),
             _ => {}
         }
@@ -409,6 +413,7 @@ pub const MD013: Rule = Rule {
         "minus_metadata",
         "plus_metadata",
         "link_reference_definition",
+        "footnote_definition",
         "inline",
     ],
     new_linter: |context| Box::new(MD013Linter::new(context)),

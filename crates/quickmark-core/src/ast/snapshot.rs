@@ -296,6 +296,29 @@ const CASES: &[(&str, &str, &str)] = &[
 "#,
     ),
     (
+        "footnotes",
+        "text[^a]\n\n[^a]: note\n\n[^b]: unused\n",
+        r#"(document 0:0-5:0 0-35
+  (section 0:0-5:0 0-35
+    (paragraph 0:0-1:0 0-9
+      (inline 0:0-0:8 0-8
+        (text 0:0-0:4 0-4)
+        (footnote_reference 0:4-0:8 4-8)
+      )
+    )
+    (footnote_definition 2:0-3:0 10-21
+      (paragraph 2:0-3:0 10-21
+        (inline 2:0-2:10 10-20
+          (text 2:6-2:10 16-20)
+        )
+      )
+    )
+    (link_reference_definition 4:0-5:0 22-35)
+  )
+)
+"#,
+    ),
+    (
         "block quote",
         "> quoted\n> more\n>\n> - a list\n",
         r#"(document 0:0-4:0 0-29

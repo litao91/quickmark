@@ -97,8 +97,9 @@ impl MD053Linter {
     /// The labels one inline subtree refers to.
     ///
     /// Only what the parser resolved counts, and a resolved reference is a `link` or `image` node
-    /// whose own text still holds the label. Syntax that resolved to nothing names no definition, so
-    /// it has nothing to keep from being reported unused.
+    /// whose own text still holds the label — or a footnote call, whose text is the `[^name]` that
+    /// names its definition. Syntax that resolved to nothing names no definition, so it has nothing to
+    /// keep from being reported unused.
     fn collect_uses(&mut self, root: Node) {
         let mut found = Vec::new();
         {
@@ -107,7 +108,7 @@ impl MD053Linter {
             let mut depth = 0;
             loop {
                 let node = cursor.node();
-                if matches!(node.kind(), "link" | "image") {
+                if matches!(node.kind(), "link" | "image" | "footnote_reference") {
                     if let Ok(text) = node.utf8_text(source.as_bytes()) {
                         // An inline link ends in `)` and an autolink in `>`; only reference syntax
                         // names a label, and it ends in the `]` that closed it.
@@ -171,7 +172,9 @@ impl MD053Linter {
 impl RuleLinter for MD053Linter {
     fn feed(&mut self, node: &Node) {
         match node.kind() {
-            "link_reference_definition" => self.add_definition(*node),
+            // markdownlint keys footnote definitions and link definitions in one map, labelling a
+            // footnote with the `^` its call carries, so `[^a]` and a definition of `^a` agree.
+            "link_reference_definition" | "footnote_definition" => self.add_definition(*node),
             "inline" => self.collect_uses(*node),
             _ => {}
         }
@@ -213,7 +216,7 @@ pub const MD053: Rule = Rule {
     tags: &["links", "images"],
     description: "Link and image reference definitions should be needed",
     rule_type: RuleType::Document,
-    required_nodes: &["inline", "link_reference_definition"],
+    required_nodes: &["inline", "link_reference_definition", "footnote_definition"],
     new_linter: |context| Box::new(MD053Linter::new(context)),
 };
 
@@ -336,6 +339,20 @@ mod test {
         ("[a]: /u\n\n[x][a]\r\n", &[]),
         ("[a]: <>\n\ntext\n", &[(1, "Unused", "a")]),
         ("[a]: /u\n\n[the `x` trait][a]\n", &[]),
+        // A footnote definition is one of these, labelled with the `^` its call carries, and comrak
+        // drops the ones nothing refers to — the synthesis recovers those from the raw lines.
+        ("[^a]: prose here\n\ntext\n", &[(1, "Unused", "^a")]),
+        ("text[^a]\n\n[^a]: note\n", &[]),
+        (
+            "text[^a]\n\n[^a]: note\n\n[^b]: an unused one\n",
+            &[(5, "Unused", "^b")],
+        ),
+        // comrak keeps the first definition of a footnote name and drops every later one, but the
+        // dropped line is uncovered, so the synthesis hands it back as a duplicate.
+        (
+            "[v][a]\n\n[a]: /url\n\n[^v]: first note\n\ntext\n\n[^v]: second note\n",
+            &[(5, "Unused", "^v"), (9, "Duplicate", "^v")],
+        ),
     ];
 
     #[test]
@@ -347,16 +364,10 @@ mod test {
 
     /// Shapes markdownlint reports and quickmark does not.
     ///
-    /// The first two are the facade's, not this rule's: comrak detaches a link reference definition
-    /// and leaves no trace of it, so the tree is rebuilt from the lines nothing else claimed, and a
-    /// definition whose line a list item already covers, or whose destination sits on the line after
-    /// its label, is not among them. The last two are a missing parser extension — markdownlint turns
-    /// on micromark's GFM footnotes, so `[^a]: prose` is a footnote definition whose label is `^a`,
-    /// while here it is an ordinary paragraph that two of them make a duplicate of nothing.
-    /// `[^a]: /u` is reported either way, because that one is also a valid link reference
-    /// definition. Turning on comrak's `footnotes` is not the fix: measured over the vault it moves
-    /// divergence from 9 to 14, because the facade emits nothing for the definition and reference
-    /// nodes it then produces.
+    /// Both are the facade's, not this rule's: comrak detaches a link reference definition and leaves
+    /// no trace of it, so the tree is rebuilt from the lines nothing else claimed, and a definition
+    /// whose line a list item already covers, or whose destination sits on the line after its label,
+    /// is not among them.
     #[test]
     fn known_differences_from_markdownlint() {
         let none: &[Report] = &[];
@@ -364,13 +375,6 @@ mod test {
         assert_eq!(owned(none), reports("- [a]: /u\n\ntext\n"));
         // markdownlint: [(1, "Unused", "a")]
         assert_eq!(owned(none), reports("[a]:\n/u\n\ntext\n"));
-        // markdownlint: [(1, "Unused", "^a")]
-        assert_eq!(owned(none), reports("[^a]: prose here\n\ntext\n"));
-        // markdownlint: [(5, "Unused", "^v"), (9, "Duplicate", "^v")]
-        assert_eq!(
-            owned(none),
-            reports("[v][a]\n\n[a]: /url\n\n[^v]: first note\n\ntext\n\n[^v]: second note\n")
-        );
     }
 
     #[test]
