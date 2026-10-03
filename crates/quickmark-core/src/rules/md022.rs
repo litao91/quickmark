@@ -8,10 +8,9 @@ use super::{ellipsify, is_blank_line, Rule, RuleType};
 
 // MD022-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD022HeadingsBlanksTable {
-    #[serde(default)]
     pub lines_above: Vec<i32>,
-    #[serde(default)]
     pub lines_below: Vec<i32>,
 }
 

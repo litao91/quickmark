@@ -11,8 +11,8 @@ use super::{Rule, RuleType};
 
 // MD026-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD026TrailingPunctuationTable {
-    #[serde(default)]
     pub punctuation: String,
 }
 

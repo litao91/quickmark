@@ -10,10 +10,9 @@ use crate::{
 
 // MD025-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD025SingleH1Table {
-    #[serde(default)]
     pub level: u8,
-    #[serde(default)]
     pub front_matter_title: String,
 }
 

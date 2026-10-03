@@ -10,8 +10,8 @@ use crate::{
 
 // MD012-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD012MultipleBlankLinesTable {
-    #[serde(default)]
     pub maximum: usize,
 }
 

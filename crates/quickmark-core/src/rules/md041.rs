@@ -12,12 +12,10 @@ use crate::{
 
 // MD041-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD041FirstLineHeadingTable {
-    #[serde(default)]
     pub allow_preamble: bool,
-    #[serde(default)]
     pub front_matter_title: String,
-    #[serde(default)]
     pub level: u8,
 }
 

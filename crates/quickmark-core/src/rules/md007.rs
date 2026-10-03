@@ -10,12 +10,10 @@ use crate::{
 
 // MD007-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD007UlIndentTable {
-    #[serde(default)]
     pub indent: usize,
-    #[serde(default)]
     pub start_indent: usize,
-    #[serde(default)]
     pub start_indented: bool,
 }
 

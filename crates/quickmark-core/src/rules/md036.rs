@@ -64,8 +64,8 @@ fn is_meaningful(node: Node, source: &str) -> bool {
 
 // MD036-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD036EmphasisAsHeadingTable {
-    #[serde(default)]
     pub punctuation: String,
 }
 

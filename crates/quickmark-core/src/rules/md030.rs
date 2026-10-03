@@ -10,14 +10,11 @@ use crate::{
 
 // MD030-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD030ListMarkerSpaceTable {
-    #[serde(default)]
     pub ul_single: usize,
-    #[serde(default)]
     pub ol_single: usize,
-    #[serde(default)]
     pub ul_multi: usize,
-    #[serde(default)]
     pub ol_multi: usize,
 }
 

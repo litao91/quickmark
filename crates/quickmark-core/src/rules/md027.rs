@@ -11,8 +11,8 @@ use crate::{
 
 // MD027-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD027BlockquoteSpacesTable {
-    #[serde(default)]
     pub list_items: bool,
 }
 

@@ -10,8 +10,8 @@ use crate::{
 
 // MD035-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD035HrStyleTable {
-    #[serde(default)]
     pub style: String,
 }
 

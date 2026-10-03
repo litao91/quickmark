@@ -11,22 +11,15 @@ use crate::{
 
 // MD013-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD013LineLengthTable {
-    #[serde(default)]
     pub line_length: usize,
-    #[serde(default)]
-    pub code_block_line_length: usize,
-    #[serde(default)]
-    pub heading_line_length: usize,
-    #[serde(default)]
+    pub code_block_line_length: Option<usize>,
+    pub heading_line_length: Option<usize>,
     pub code_blocks: bool,
-    #[serde(default)]
     pub headings: bool,
-    #[serde(default)]
     pub tables: bool,
-    #[serde(default)]
     pub strict: bool,
-    #[serde(default)]
     pub stern: bool,
 }
 
@@ -34,8 +27,8 @@ impl Default for MD013LineLengthTable {
     fn default() -> Self {
         Self {
             line_length: 80,
-            code_block_line_length: 80,
-            heading_line_length: 80,
+            code_block_line_length: None,
+            heading_line_length: None,
             code_blocks: true,
             headings: true,
             tables: true,
@@ -43,6 +36,35 @@ impl Default for MD013LineLengthTable {
             stern: false,
         }
     }
+}
+
+impl MD013LineLengthTable {
+    /// The three limits markdownlint measures against, as `(plain, code block, heading)`.
+    ///
+    /// It reads each configured limit as `config.X || fallback`, so a limit that was not set does not
+    /// stand on its own: `line_length` falls back to its documented 80, and the other two fall back to
+    /// `line_length`. That last step is why setting only `line_length` shortens headings and code
+    /// blocks too.
+    pub fn limits(&self) -> (usize, usize, usize) {
+        let plain = or_fallback(self.line_length, 80);
+        (
+            plain,
+            or_fallback_opt(self.code_block_line_length, plain),
+            or_fallback_opt(self.heading_line_length, plain),
+        )
+    }
+}
+
+fn or_fallback(limit: usize, fallback: usize) -> usize {
+    if limit == 0 {
+        fallback
+    } else {
+        limit
+    }
+}
+
+fn or_fallback_opt(limit: Option<usize>, fallback: usize) -> usize {
+    limit.map_or(fallback, |limit| or_fallback(limit, fallback))
 }
 
 /// MD013 Line Length Rule Linter
@@ -87,6 +109,7 @@ impl MD013Linter {
     /// Runs once every node has been fed, so it lives in `finalize` rather than in `feed`.
     fn analyze_all_lines(&mut self) {
         let settings = &self.context.config.linters.settings.line_length;
+        let (plain_limit, code_limit, heading_limit) = settings.limits();
         let lines = self.context.lines.borrow();
 
         for (line_index, line) in lines.iter().enumerate() {
@@ -104,11 +127,11 @@ impl MD013Linter {
             // markdownlint's precedence: a code line is measured against the code limit even when it
             // is also something else, then headings, then everything else at the plain limit.
             let limit = if in_code {
-                settings.code_block_line_length
+                code_limit
             } else if is_heading {
-                settings.heading_line_length
+                heading_limit
             } else {
-                settings.line_length
+                plain_limit
             };
 
             if self.should_violate_line(line, limit) {
@@ -564,6 +587,28 @@ mod test {
         assert!(violations[0].message().contains("Expected: 50"));
     }
 
+    /// markdownlint reads each limit as `config.X || fallback`, so a config that sets only
+    /// `line_length` shortens headings and code blocks as well. Measured against markdownlint-cli2
+    /// v0.23.3, which reports both lines below with `Expected: 20`.
+    #[test]
+    fn an_unset_heading_or_code_limit_follows_line_length() {
+        assert_eq!((80, 80, 80), MD013LineLengthTable::default().limits());
+        let table = MD013LineLengthTable {
+            line_length: 20,
+            ..MD013LineLengthTable::default()
+        };
+        assert_eq!((20, 20, 20), table.limits());
+
+        let input = "# heading text that is quite long indeed\n\n```\ncode text that is quite long indeed\n```\n";
+        let config = test_config_with_line_length(table);
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let violations = linter.analyze();
+        assert_eq!(2, violations.len());
+        assert!(violations
+            .iter()
+            .all(|violation| violation.message().contains("Expected: 20")));
+    }
+
     #[test]
     fn test_headings_disabled() {
         let line_length_config = MD013LineLengthTable {
@@ -592,8 +637,8 @@ mod test {
         fn lines(input: &str, headings: bool) -> Vec<usize> {
             let config = test_config_with_line_length(MD013LineLengthTable {
                 line_length: 20,
-                heading_line_length: 20,
-                code_block_line_length: 20,
+                heading_line_length: Some(20),
+                code_block_line_length: Some(20),
                 headings,
                 ..MD013LineLengthTable::default()
             });
@@ -630,8 +675,8 @@ mod test {
         fn lines(input: &str, tables: bool) -> Vec<usize> {
             let config = test_config_with_line_length(MD013LineLengthTable {
                 line_length: 20,
-                heading_line_length: 20,
-                code_block_line_length: 20,
+                heading_line_length: Some(20),
+                code_block_line_length: Some(20),
                 tables,
                 ..MD013LineLengthTable::default()
             });
@@ -655,8 +700,8 @@ mod test {
         fn lines(input: &str, code_blocks: bool) -> Vec<usize> {
             let config = test_config_with_line_length(MD013LineLengthTable {
                 line_length: 20,
-                heading_line_length: 20,
-                code_block_line_length: 20,
+                heading_line_length: Some(20),
+                code_block_line_length: Some(20),
                 code_blocks,
                 ..MD013LineLengthTable::default()
             });

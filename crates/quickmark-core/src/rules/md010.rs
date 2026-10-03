@@ -10,12 +10,10 @@ use crate::{
 
 // MD010-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD010HardTabsTable {
-    #[serde(default)]
     pub code_blocks: bool,
-    #[serde(default)]
     pub ignore_code_languages: Vec<String>,
-    #[serde(default)]
     /// markdownlint uses this to size the text its fix inserts. Nothing here emits fixes, so it
     /// changes nothing — but it stays in the schema, because a config written for markdownlint sets
     /// it.

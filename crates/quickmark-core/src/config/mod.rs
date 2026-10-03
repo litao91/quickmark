@@ -437,6 +437,73 @@ mod test {
 
     use super::{normalize_severities, QuickmarkConfig};
 
+    /// A key the user left out must yield the documented default, not the type's.
+    ///
+    /// serde fills each absent field from its own `#[serde(default...)]` and never from the struct's
+    /// `Default` impl, so a bare `#[serde(default)]` on a `bool` gives `false` even where
+    /// markdownlint's default is `true`. That is invisible until someone configures one key of a
+    /// table: `[linters.settings.line-length]` with only `line_length` set would silently switch off
+    /// `code_blocks`, `headings` and `tables` as well.
+    #[test]
+    fn an_absent_setting_yields_its_documented_default() {
+        macro_rules! assert_empty_parses_as_default {
+            ($($table:ty),* $(,)?) => {
+                let mut failures = Vec::new();
+                $(
+                    let parsed: $table = toml::from_str("").expect(stringify!($table));
+                    if parsed != <$table>::default() {
+                        failures.push(format!(
+                            "{}: absent keys parse as {parsed:?}, documented default is {:?}",
+                            stringify!($table),
+                            <$table>::default()
+                        ));
+                    }
+                )*
+                assert!(
+                    failures.is_empty(),
+                    "{} settings tables disagree with their own Default:\n{}",
+                    failures.len(),
+                    failures.join("\n")
+                );
+            };
+        }
+        assert_empty_parses_as_default!(
+            MD003HeadingStyleTable,
+            MD004UlStyleTable,
+            MD007UlIndentTable,
+            MD009TrailingSpacesTable,
+            MD010HardTabsTable,
+            MD012MultipleBlankLinesTable,
+            MD013LineLengthTable,
+            MD022HeadingsBlanksTable,
+            MD024MultipleHeadingsTable,
+            MD025SingleH1Table,
+            MD026TrailingPunctuationTable,
+            MD027BlockquoteSpacesTable,
+            MD029OlPrefixTable,
+            MD030ListMarkerSpaceTable,
+            MD031FencedCodeBlanksTable,
+            MD033InlineHtmlTable,
+            MD035HrStyleTable,
+            MD036EmphasisAsHeadingTable,
+            MD040FencedCodeLanguageTable,
+            MD041FirstLineHeadingTable,
+            MD043RequiredHeadingsTable,
+            MD044ProperNamesTable,
+            MD046CodeBlockStyleTable,
+            MD048CodeFenceStyleTable,
+            MD049EmphasisStyleTable,
+            MD050StrongStyleTable,
+            MD051LinkFragmentsTable,
+            MD052ReferenceLinksImagesTable,
+            MD053LinkImageReferenceDefinitionsTable,
+            MD054LinkImageStyleTable,
+            MD055TablePipeStyleTable,
+            MD059DescriptiveLinkTextTable,
+            MD060TableColumnStyleTable,
+        );
+    }
+
     #[test]
     pub fn test_normalize_severities() {
         let mut severity: HashMap<String, RuleSeverity> = vec![
@@ -793,10 +860,13 @@ mod test {
         // Verify line-length settings
         assert_eq!(120, parsed.linters.settings.line_length.line_length);
         assert_eq!(
-            100,
+            Some(100),
             parsed.linters.settings.line_length.code_block_line_length
         );
-        assert_eq!(90, parsed.linters.settings.line_length.heading_line_length);
+        assert_eq!(
+            Some(90),
+            parsed.linters.settings.line_length.heading_line_length
+        );
         assert!(!parsed.linters.settings.line_length.code_blocks);
         assert!(!parsed.linters.settings.line_length.headings);
         assert!(!parsed.linters.settings.line_length.tables);
@@ -1051,13 +1121,22 @@ mod test {
         );
         assert!(!parsed.linters.settings.trailing_spaces.strict);
 
-        // Verify line-length defaults
+        // Verify line-length defaults. An unset code or heading limit is `None` so that `limits()`
+        // can make it follow `line_length`, which is what markdownlint's `||` does.
         assert_eq!(80, parsed.linters.settings.line_length.line_length);
-        assert_eq!(
-            80,
-            parsed.linters.settings.line_length.code_block_line_length
-        );
-        assert_eq!(80, parsed.linters.settings.line_length.heading_line_length);
+        assert_eq!((80, 80, 80), parsed.linters.settings.line_length.limits());
+        assert!(parsed
+            .linters
+            .settings
+            .line_length
+            .code_block_line_length
+            .is_none());
+        assert!(parsed
+            .linters
+            .settings
+            .line_length
+            .heading_line_length
+            .is_none());
         assert!(parsed.linters.settings.line_length.code_blocks);
         assert!(parsed.linters.settings.line_length.headings);
         assert!(parsed.linters.settings.line_length.tables);

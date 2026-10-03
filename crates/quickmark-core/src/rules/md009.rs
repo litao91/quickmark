@@ -11,12 +11,10 @@ use crate::{
 
 // MD009-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD009TrailingSpacesTable {
-    #[serde(default)]
     pub br_spaces: usize,
-    #[serde(default)]
     pub list_item_empty_lines: bool,
-    #[serde(default)]
     pub strict: bool,
 }
 

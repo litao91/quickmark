@@ -8,8 +8,8 @@ use super::{ellipsify, is_blank_line, Rule, RuleType};
 
 // MD031-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
+#[serde(default)]
 pub struct MD031FencedCodeBlanksTable {
-    #[serde(default)]
     pub list_items: bool,
 }
 
