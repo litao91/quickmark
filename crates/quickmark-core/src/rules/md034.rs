@@ -119,7 +119,7 @@ impl MD034Linter {
 /// Whether `url` starts with one of the schemes GFM's autolink-literal extension recognises. Those,
 /// plus email addresses, are the only things micromark turns into a `literalAutolink` token, so
 /// `ftp://`, `file://`, `git://` and `oss://` are literal text and MD034 must leave them alone.
-fn is_gfm_autolink(url: &str) -> bool {
+pub(crate) fn is_gfm_autolink(url: &str) -> bool {
     ["http://", "https://", "www."].iter().any(|scheme| {
         url.get(..scheme.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(scheme))

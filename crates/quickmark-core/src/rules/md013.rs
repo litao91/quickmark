@@ -3,10 +3,11 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::ast::Node;
+use linkify::{LinkFinder, LinkKind};
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    rules::{md034::is_gfm_autolink, Context, Rule, RuleLinter, RuleType},
 };
 
 // MD013-specific configuration types
@@ -78,16 +79,33 @@ pub(crate) struct MD013Linter {
     heading_lines: HashSet<usize>,
     code_lines: HashSet<usize>,
     table_lines: HashSet<usize>,
+    front_matter_lines: HashSet<usize>,
+    /// Rows a `link` or `image` covers.
+    link_lines: HashSet<usize>,
+    /// Rows a paragraph's own text covers.
+    paragraph_text_lines: HashSet<usize>,
+    definition_lines: HashSet<usize>,
+    finder: LinkFinder,
 }
 
 impl MD013Linter {
     pub fn new(context: Rc<Context>) -> Self {
+        // GFM autolinks a scheme-less `www.example.com`, which linkify only looks for when told to.
+        // Everything else it would find that way is literal text, so `is_gfm_autolink` filters it
+        // back out.
+        let mut finder = LinkFinder::new();
+        finder.url_must_have_scheme(false);
         Self {
             context,
             violations: Vec::new(),
             heading_lines: HashSet::new(),
             code_lines: HashSet::new(),
             table_lines: HashSet::new(),
+            front_matter_lines: HashSet::new(),
+            link_lines: HashSet::new(),
+            paragraph_text_lines: HashSet::new(),
+            definition_lines: HashSet::new(),
+            finder,
         }
     }
 
@@ -106,6 +124,74 @@ impl MD013Linter {
         lines.extend(start..=last);
     }
 
+    /// markdownlint builds two line sets out of micromark's tokens: the lines a link or image covers,
+    /// and the lines a *paragraph's* own text covers. A line in the first but not the second is
+    /// nothing but links, and the default and stern modes spare it because there is no prose to wrap.
+    ///
+    /// Two wrinkles. A setext heading's text sits under a paragraph this facade synthesizes, but
+    /// micromark's setext heading is not a paragraph token, so its text does not count. And comrak
+    /// leaves a bare URL as ordinary text where micromark's autolink-literal extension makes it a
+    /// link, so those spans are found here and taken back out of the paragraph's text.
+    fn collect_inline(&mut self, inline: &Node) {
+        let counts_as_paragraph = inline.parent().is_some_and(|parent| {
+            parent.kind() == "paragraph"
+                && parent
+                    .parent()
+                    .is_none_or(|grandparent| grandparent.kind() != "setext_heading")
+        });
+        let context = Rc::clone(&self.context);
+        let source = context.document_content.borrow();
+
+        // markdownlint reads a paragraph's `data` tokens through
+        // `getDescendantsByType(paragraph, ["data"])`, which descends exactly one level. Only the
+        // inline's own text children count, so text nested in an emphasis does not — and that is what
+        // makes a paragraph holding nothing but a link come out as "link only".
+        for index in 0..inline.child_count() {
+            let Some(child) = inline.child(index) else {
+                continue;
+            };
+            if child.kind() != "text" {
+                continue;
+            }
+            let text = &source[child.start_byte()..child.end_byte()];
+            let autolinks = self.autolinks(text);
+            if counts_as_paragraph && has_text_outside(text, &autolinks) {
+                Self::cover(&mut self.paragraph_text_lines, &child);
+            }
+        }
+
+        // Links and images count wherever they sit, and micromark runs its autolink-literal extension
+        // over any text that is not inside a link or image label.
+        let mut stack = vec![*inline];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "link" | "image" => Self::cover(&mut self.link_lines, &node),
+                "text" => {
+                    let text = &source[node.start_byte()..node.end_byte()];
+                    if !self.autolinks(text).is_empty() {
+                        Self::cover(&mut self.link_lines, &node);
+                    }
+                }
+                _ => {
+                    for index in 0..node.child_count() {
+                        if let Some(child) = node.child(index) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The GFM autolink literals in `text`, as sorted non-overlapping byte spans.
+    fn autolinks(&self, text: &str) -> Vec<(usize, usize)> {
+        self.finder
+            .links(text)
+            .filter(|link| *link.kind() == LinkKind::Email || is_gfm_autolink(link.as_str()))
+            .map(|link| (link.start(), link.end()))
+            .collect()
+    }
+
     /// Runs once every node has been fed, so it lives in `finalize` rather than in `feed`.
     fn analyze_all_lines(&mut self) {
         let settings = &self.context.config.linters.settings.line_length;
@@ -113,6 +199,9 @@ impl MD013Linter {
         let lines = self.context.lines.borrow();
 
         for (line_index, line) in lines.iter().enumerate() {
+            if self.front_matter_lines.contains(&line_index) {
+                continue;
+            }
             let in_code = self.code_lines.contains(&line_index);
             let is_heading = self.heading_lines.contains(&line_index);
             let in_table = self.table_lines.contains(&line_index);
@@ -134,34 +223,24 @@ impl MD013Linter {
                 plain_limit
             };
 
-            if self.should_violate_line(line, limit) {
+            if self.should_violate_line(line_index, line, limit) {
                 let violation = self.create_violation_for_line(line, line_index, limit);
                 self.violations.push(violation);
             }
         }
     }
 
-    fn is_link_reference_definition(&self, line: &str) -> bool {
-        line.trim_start().starts_with('[') && line.contains("]:") && line.contains("http")
+    /// Whether a line's content is nothing but links, which markdownlint spares outside strict mode
+    /// because there is no prose in it to wrap.
+    fn is_link_only(&self, line_index: usize) -> bool {
+        self.link_lines.contains(&line_index) && !self.paragraph_text_lines.contains(&line_index)
     }
 
-    fn is_standalone_link_or_image(&self, line: &str) -> bool {
-        let trimmed = line.trim();
-        // Check for standalone link: [text](url)
-        if trimmed.starts_with('[') && trimmed.contains("](") && trimmed.ends_with(')') {
-            return true;
-        }
-        // Check for standalone image: ![alt](url)
-        if trimmed.starts_with("![") && trimmed.contains("](") && trimmed.ends_with(')') {
-            return true;
-        }
-        false
-    }
-
-    fn should_violate_line(&self, line: &str, limit: usize) -> bool {
+    fn should_violate_line(&self, line_index: usize, line: &str, limit: usize) -> bool {
         let settings = &self.context.config.linters.settings.line_length;
 
-        if self.is_link_reference_definition(line) {
+        // A link reference definition is exempt in every mode.
+        if self.definition_lines.contains(&line_index) {
             return false;
         }
 
@@ -172,7 +251,7 @@ impl MD013Linter {
             return length > limit;
         }
 
-        if self.is_standalone_link_or_image(line) {
+        if self.is_link_only(line_index) {
             return false;
         }
 
@@ -268,6 +347,20 @@ fn not_wrappable(line: &str) -> bool {
     }
 }
 
+/// Whether anything in `text` sits outside `spans`. micromark emits a `data` token for whatever falls
+/// between two autolink literals, however short — a single space is enough — so a line holding two
+/// URLs is not "nothing but links" and gets measured like any other.
+fn has_text_outside(text: &str, spans: &[(usize, usize)]) -> bool {
+    let mut cursor = 0;
+    for &(from, to) in spans {
+        if from > cursor {
+            return true;
+        }
+        cursor = to;
+    }
+    cursor < text.len()
+}
+
 /// The byte offset of a UTF-16 code-unit index, clamped to the line.
 fn byte_at_unit(line: &str, units: usize) -> usize {
     let mut seen = 0;
@@ -286,6 +379,11 @@ impl RuleLinter for MD013Linter {
             "atx_heading" | "setext_heading" => Self::cover(&mut self.heading_lines, node),
             "fenced_code_block" | "indented_code_block" => Self::cover(&mut self.code_lines, node),
             "pipe_table" => Self::cover(&mut self.table_lines, node),
+            // markdownlint strips front matter from the content before it parses, so no rule ever
+            // sees those lines and reported line numbers are shifted back afterwards.
+            "minus_metadata" | "plus_metadata" => Self::cover(&mut self.front_matter_lines, node),
+            "link_reference_definition" => Self::cover(&mut self.definition_lines, node),
+            "inline" => self.collect_inline(node),
             _ => {}
         }
     }
@@ -308,6 +406,10 @@ pub const MD013: Rule = Rule {
         "fenced_code_block",
         "indented_code_block",
         "pipe_table",
+        "minus_metadata",
+        "plus_metadata",
+        "link_reference_definition",
+        "inline",
     ],
     new_linter: |context| Box::new(MD013Linter::new(context)),
 };
@@ -710,6 +812,77 @@ mod test {
         // Twenty UTF-16 units of `日本語 ` is five groups of ten bytes.
         let cjk = "日本語 ".repeat(8) + "\n";
         assert_eq!(50, column(&cjk));
+    }
+
+    /// markdownlint spares a line whose only content is links, because there is no prose in it to
+    /// wrap. It reads a paragraph's `data` tokens through `getDescendantsByType(paragraph, ["data"])`,
+    /// which descends exactly one level, so a link's own label is not prose but a space between two
+    /// links is — and a bare URL counts as a link, because micromark's autolink-literal extension
+    /// makes it one where comrak leaves it as text. Every expectation is a markdownlint-cli2 v0.23.3
+    /// measurement at the default limit of 80.
+    #[test]
+    fn a_line_of_nothing_but_links_is_spared() {
+        fn reports(input: &str) -> Vec<usize> {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .map(|violation| violation.location().range.start.line + 1)
+                .collect()
+        }
+
+        let url =
+            "https://code.byted.org/inf/kafka/merge_requests/68/diffs/with/a/really/long/tail";
+        let label = "Support SASL/PLAIN authentication mechanism for Kafka broker (!68) · GitLab";
+
+        // Folding alone would not spare any of these: the last run is a pipe or a closing
+        // parenthesis, so the line still measures over the limit.
+        assert!(reports(&format!("| a | {url} |\n| - | - |\n")).is_empty());
+        assert!(reports(&format!("- item\n  - [{label}]({url})\n")).is_empty());
+        // Table cells are not paragraphs, so the spaces between two URLs are not prose either.
+        assert!(reports(&format!("| a | {url} | {url} |\n| - | - | - |\n")).is_empty());
+
+        // The same row with the URL spelled as prose, and nothing spares it.
+        assert_eq!(
+            vec![1],
+            reports(&format!("| a | {} |\n| - | - |\n", url.replace('/', " ")))
+        );
+        // In a paragraph the space between two URLs is the paragraph's own text.
+        assert_eq!(vec![1], reports(&format!("{url} {url}\n")));
+    }
+
+    /// markdownlint strips front matter from the content before it parses, so no rule measures those
+    /// lines. Only a matched `---` or `+++` pair counts: markdownlint-cli2 does not accept `...` as a
+    /// closing delimiter. Every expectation is a markdownlint-cli2 v0.23.3 measurement.
+    #[test]
+    fn front_matter_lines_are_not_measured() {
+        fn reported(input: &str) -> Vec<usize> {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .map(|violation| violation.location().range.start.line + 1)
+                .collect()
+        }
+
+        let long = "x ".repeat(60);
+        let body = format!("# t\n\n{long}\n");
+        for delimiters in ["---", "+++"] {
+            let input = format!("{delimiters}\ndescription: {long}\n{delimiters}\n\n{body}");
+            assert_eq!(vec![7], reported(&input), "{delimiters}");
+        }
+        // Neither `...` nor running out of document closes front matter, so in both cases the long
+        // `description:` line is measured like any other.
+        assert_eq!(
+            vec![2, 7],
+            reported(&format!("---\ndescription: {long}\n...\n\n{body}"))
+        );
+        assert_eq!(
+            vec![2, 6],
+            reported(&format!("---\ndescription: {long}\n\n{body}"))
+        );
     }
     /// Outside strict and stern mode markdownlint compares the line with its last run of
     /// non-whitespace folded to a single character, and it measures every length in UTF-16 code
