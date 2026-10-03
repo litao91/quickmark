@@ -174,7 +174,7 @@ pub const MD050: Rule = Rule {
     id: "MD050",
     alias: "strong-style",
     tags: &["emphasis"],
-    description: "Strong style should be consistent",
+    description: "Strong style",
     rule_type: RuleType::Token,
     required_nodes: &["inline"],
     new_linter: |context| Box::new(MD050Linter::new(context)),

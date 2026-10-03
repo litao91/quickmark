@@ -6,7 +6,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    rules::{ellipsify, Context, Rule, RuleLinter, RuleType},
 };
 
 // MD027-specific configuration types
@@ -201,9 +201,21 @@ impl MD027Linter {
 
     fn push(&mut self, row: usize, column: usize, width: usize) {
         let start_byte = self.context.line_start_byte(row) + column;
+        // markdownlint quotes the whole line, untrimmed.
+        let line = self
+            .context
+            .lines
+            .borrow()
+            .get(row)
+            .cloned()
+            .unwrap_or_default();
         let violation = RuleViolation::new(
             &MD027,
-            "Multiple spaces after blockquote symbol".to_string(),
+            format!(
+                "{} [Context: \"{}\"]",
+                MD027.description,
+                ellipsify(&line, false, false)
+            ),
             self.context.file_path.clone(),
             range_from_node_range(&crate::ast::NodeRange {
                 start_byte,

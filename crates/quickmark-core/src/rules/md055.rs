@@ -52,6 +52,25 @@ pub(crate) struct MD055Linter {
     first_table_style: Option<(bool, bool)>, // (has_leading, has_trailing)
 }
 
+/// markdownlint's name for a leading/trailing pipe pair.
+fn style_name(style: (bool, bool)) -> &'static str {
+    match style {
+        (true, true) => "leading_and_trailing",
+        (true, false) => "leading_only",
+        (false, true) => "trailing_only",
+        (false, false) => "no_leading_or_trailing",
+    }
+}
+
+fn detail(expected: (bool, bool), actual: (bool, bool), what: &str) -> String {
+    format!(
+        "{} [Expected: {}; Actual: {}; {what}]",
+        MD055.description,
+        style_name(expected),
+        style_name(actual)
+    )
+}
+
 struct ViolationInfo {
     message: String,
     column_offset: usize,
@@ -160,31 +179,42 @@ impl MD055Linter {
 
         // Check leading pipe
         if expected_leading != actual_leading {
-            let message = if expected_leading {
-                "Missing leading pipe"
-            } else {
-                "Unexpected leading pipe"
-            };
             infos.push(ViolationInfo {
-                message: message.to_string(),
+                message: detail(
+                    expected,
+                    (actual_leading, actual_trailing),
+                    if expected_leading {
+                        "Missing leading pipe"
+                    } else {
+                        "Unexpected leading pipe"
+                    },
+                ),
                 column_offset: leading_whitespace_len,
             });
         }
 
         // Check trailing pipe
         if expected_trailing != actual_trailing {
-            let message = if expected_trailing {
-                "Missing trailing pipe"
-            } else {
-                "Unexpected trailing pipe"
-            };
-            let pos = if actual_trailing {
-                leading_whitespace_len + trimmed_text.len().saturating_sub(1)
-            } else {
-                leading_whitespace_len + trimmed_text.len()
-            };
+            // markdownlint's column is `lastCell.endColumn - 1`, and the last cell always runs to
+            // the end of the row — trailing whitespace included, which the row node's own text is
+            // not — so this is the last column of the line the row is on.
+            let pos = {
+                let lines = self.context.lines.borrow();
+                lines
+                    .get(row_node.start_position().row)
+                    .map_or(row_text.len(), String::len)
+            }
+            .saturating_sub(1);
             infos.push(ViolationInfo {
-                message: message.to_string(),
+                message: detail(
+                    expected,
+                    (actual_leading, actual_trailing),
+                    if expected_trailing {
+                        "Missing trailing pipe"
+                    } else {
+                        "Unexpected trailing pipe"
+                    },
+                ),
                 column_offset: pos,
             });
         }

@@ -4,7 +4,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{is_blank_line, Rule, RuleType},
+    rules::{ellipsify, is_blank_line, Rule, RuleType},
 };
 
 /// MD058 - Tables should be surrounded by blank lines
@@ -44,18 +44,39 @@ impl MD058Linter {
         if start_line > 0 && !is_blank_line(&lines[start_line - 1]) {
             self.violations.push(RuleViolation::new(
                 &MD058,
-                format!("{} [Above]", MD058.description),
+                format!(
+                    "{} [Context: \"{}\"]",
+                    MD058.description,
+                    ellipsify(lines[start_line].trim(), false, false)
+                ),
                 self.context.file_path.clone(),
                 range_from_node_range(&table_node.range()),
             ));
         }
 
         if actual_end_line + 1 < lines.len() && !is_blank_line(&lines[actual_end_line + 1]) {
+            // A missing blank below is reported on the table's own last line, not its first.
+            let width = lines[actual_end_line].len();
             self.violations.push(RuleViolation::new(
                 &MD058,
-                format!("{} [Below]", MD058.description),
+                format!(
+                    "{} [Context: \"{}\"]",
+                    MD058.description,
+                    ellipsify(lines[actual_end_line].trim(), false, false)
+                ),
                 self.context.file_path.clone(),
-                range_from_node_range(&table_node.range()),
+                range_from_node_range(&crate::ast::NodeRange {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_point: crate::ast::Point {
+                        row: actual_end_line,
+                        column: 0,
+                    },
+                    end_point: crate::ast::Point {
+                        row: actual_end_line,
+                        column: width,
+                    },
+                }),
             ));
         }
     }
@@ -96,6 +117,30 @@ mod test {
         test_config_with_rules(vec![("blanks-around-tables", RuleSeverity::Error)])
     }
 
+    /// The line and the context each report carries. markdownlint's message no longer says which side
+    /// of the table is missing its blank line — the reported line does, since a missing blank above is
+    /// reported on the table's first line and a missing blank below on its last.
+    fn reports(input: &str) -> Vec<(usize, String)> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+        linter
+            .analyze()
+            .iter()
+            .filter(|violation| violation.rule().id == "MD058")
+            .map(|violation| {
+                let message = violation.message();
+                let context = message
+                    .split_once("[Context: \"")
+                    .and_then(|(_, rest)| rest.split_once("\"]"))
+                    .map_or("", |(context, _)| context);
+                (
+                    violation.location().range.start.line + 1,
+                    context.to_string(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn test_table_with_proper_blank_lines() {
         let input = r#"Some text
@@ -119,11 +164,10 @@ More text"#;
 | Cell 1   | Cell 2   |
 
 More text"#;
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("[Above]"));
+        assert_eq!(
+            vec![(2, "| Header 1 | Header 2 |".to_string())],
+            reports(input)
+        );
     }
 
     #[test]
@@ -134,11 +178,10 @@ More text"#;
 | -------- | -------- |
 | Cell 1   | Cell 2   |
 # Heading"#;
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("[Below]"));
+        assert_eq!(
+            vec![(5, "| Cell 1   | Cell 2   |".to_string())],
+            reports(input)
+        );
     }
 
     /// GFM absorbs a pipe-less line following a table as a one-cell row, so plain text under a table
@@ -164,12 +207,13 @@ More text"#;
 | -------- | -------- |
 | Cell 1   | Cell 2   |
 # Heading"#;
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(2, violations.len());
-        assert!(violations[0].message().contains("[Above]"));
-        assert!(violations[1].message().contains("[Below]"));
+        assert_eq!(
+            vec![
+                (2, "| Header 1 | Header 2 |".to_string()),
+                (4, "| Cell 1   | Cell 2   |".to_string())
+            ],
+            reports(input)
+        );
     }
 
     #[test]
@@ -247,11 +291,10 @@ Text between tables
 | ------- | ------ |
 | Cell    | Value  |
 Final text"#;
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("[Above]"));
+        assert_eq!(
+            vec![(2, "| Table 1 | Header |".to_string())],
+            reports(input)
+        );
     }
 
     /// Headings do end a table, so these really are two tables and all four sides are checked.
@@ -267,14 +310,15 @@ Final text"#;
 | Cell    | Value  |
 # End
 "#;
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(4, violations.len());
-        assert!(violations[0].message().contains("[Above]"));
-        assert!(violations[1].message().contains("[Below]"));
-        assert!(violations[2].message().contains("[Above]"));
-        assert!(violations[3].message().contains("[Below]"));
+        assert_eq!(
+            vec![
+                (2, "| Table 1 | Header |".to_string()),
+                (4, "| Cell    | Value  |".to_string()),
+                (6, "| Table 2 | Header |".to_string()),
+                (8, "| Cell    | Value  |".to_string())
+            ],
+            reports(input)
+        );
     }
 
     #[test]
@@ -300,29 +344,15 @@ Final text"#;
     /// Every expectation is a markdownlint-cli2 v0.23.3 measurement.
     #[test]
     fn quote_markers_and_comments_count_as_blank() {
-        fn sides(input: &str) -> Vec<&'static str> {
-            let mut linter =
-                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
-            linter
-                .analyze()
-                .iter()
-                .filter(|violation| violation.rule().id == "MD058")
-                .map(|violation| {
-                    if violation.message().contains("[Above]") {
-                        "Above"
-                    } else {
-                        "Below"
-                    }
-                })
-                .collect()
-        }
-
-        assert!(sides("<!-- c -->\n| a |\n| - |\n| b |\n").is_empty());
-        assert!(sides("| a |\n| - |\n| b |\n<!-- c -->\n").is_empty());
-        assert_eq!(vec!["Above"], sides("text\n| a |\n| - |\n"));
+        assert!(reports("<!-- c -->\n| a |\n| - |\n| b |\n").is_empty());
+        assert!(reports("| a |\n| - |\n| b |\n<!-- c -->\n").is_empty());
+        assert_eq!(
+            vec![(2, "| a |".to_string())],
+            reports("text\n| a |\n| - |\n")
+        );
         // A line with no pipe is absorbed as a one-cell row, so there is nothing below the table.
-        assert!(sides("| a |\n| - |\n| b |\ntext\n").is_empty());
-        assert!(sides(">\n> | a |\n> | - |\n> | b |\n").is_empty());
-        assert!(sides("| a |\n| - |\n| b |\n>\n").is_empty());
+        assert!(reports("| a |\n| - |\n| b |\ntext\n").is_empty());
+        assert!(reports(">\n> | a |\n> | - |\n> | b |\n").is_empty());
+        assert!(reports("| a |\n| - |\n| b |\n>\n").is_empty());
     }
 }

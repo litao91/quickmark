@@ -37,7 +37,17 @@ impl Default for MD048CodeFenceStyleTable {
     }
 }
 
-const VIOLATION_MESSAGE: &str = "Code fence style";
+impl CodeFenceStyle {
+    /// The style's name in a message, which is markdownlint's `fencedCodeBlockStyleFor`.
+    /// `Consistent` never reaches one: it resolves to whichever style came first.
+    fn name(&self) -> &'static str {
+        match self {
+            CodeFenceStyle::Consistent => "consistent",
+            CodeFenceStyle::Backtick => "backtick",
+            CodeFenceStyle::Tilde => "tilde",
+        }
+    }
+}
 
 pub(crate) struct MD048Linter {
     context: Rc<Context>,
@@ -122,7 +132,12 @@ impl MD048Linter {
 
                 self.violations.push(RuleViolation::new(
                     &MD048,
-                    VIOLATION_MESSAGE.to_string(),
+                    format!(
+                        "{} [Expected: {}; Actual: {}]",
+                        MD048.description,
+                        expected_style.name(),
+                        fence_marker.name()
+                    ),
                     self.context.file_path.clone(),
                     range,
                 ));

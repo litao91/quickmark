@@ -206,7 +206,7 @@ impl MD013Linter {
         RuleViolation::new(
             &MD013,
             format!(
-                "{} [Expected: <= {}; Actual: {}]",
+                "{} [Expected: {}; Actual: {}]",
                 MD013.description,
                 limit,
                 line.len()
@@ -248,7 +248,7 @@ pub const MD013: Rule = Rule {
     id: "MD013",
     alias: "line-length",
     tags: &["line_length"],
-    description: "Line length should not exceed the configured limit",
+    description: "Line length",
     rule_type: RuleType::Line,
     required_nodes: &[
         "atx_heading",
@@ -303,7 +303,7 @@ mod test {
 
         let violation = &violations[0];
         assert_eq!("MD013", violation.rule().id);
-        assert!(violation.message().contains("Expected: <= 80"));
+        assert!(violation.message().contains("Expected: 80"));
         assert!(violation
             .message()
             .contains(&format!("Actual: {}", input.len())));
@@ -561,7 +561,7 @@ mod test {
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("Expected: <= 50"));
+        assert!(violations[0].message().contains("Expected: 50"));
     }
 
     #[test]
@@ -886,6 +886,6 @@ Another short line.";
         // Should find exactly 1 violation for the long line
         assert_eq!(1, violations.len(), "Should find one line length violation");
         assert_eq!("MD013", violations[0].rule().id);
-        assert!(violations[0].message().contains("Expected: <= 80"));
+        assert!(violations[0].message().contains("Expected: 80"));
     }
 }

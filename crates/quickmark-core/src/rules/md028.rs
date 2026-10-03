@@ -93,7 +93,7 @@ pub const MD028: Rule = Rule {
     id: "MD028",
     alias: "no-blanks-blockquote",
     tags: &["blockquote", "whitespace"],
-    description: "Blank lines inside blockquotes",
+    description: "Blank line inside blockquote",
     rule_type: RuleType::Token,
     required_nodes: &["block_quote"],
     new_linter: |context| Box::new(MD028Linter::new(context)),

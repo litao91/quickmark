@@ -503,7 +503,7 @@ If no `default` is specified, rules without explicit configuration use `"err"` (
 - **[MD010](docs/rules/md010.md)** *no-hard-tabs* - Hard tabs should not be used
 - **[MD011](docs/rules/md011.md)** *no-reversed-links* - Reversed link syntax
 - **[MD012](docs/rules/md012.md)** *no-multiple-blanks* - Multiple consecutive blank lines
-- **[MD013](docs/rules/md013.md)** *line-length* - Line length limits with configurable exceptions
+- **[MD013](docs/rules/md013.md)** *line-length* - Line length
 - **[MD014](docs/rules/md014.md)** *commands-show-output* - Dollar signs before shell commands
 - **[MD018](docs/rules/md018.md)** *no-missing-space-atx* - Space after hash in ATX headings
 - **[MD019](docs/rules/md019.md)** *no-multiple-space-atx* - Multiple spaces after hash in ATX headings
@@ -515,7 +515,7 @@ If no `default` is specified, rules without explicit configuration use `"err"` (
 - **[MD025](docs/rules/md025.md)** *single-h1* - Multiple top-level headings
 - **[MD026](docs/rules/md026.md)** *no-trailing-punctuation* - Trailing punctuation in headings
 - **[MD027](docs/rules/md027.md)** *no-multiple-space-blockquote* - Multiple spaces after blockquote symbol
-- **[MD028](docs/rules/md028.md)** *no-blanks-blockquote* - Blank lines inside blockquotes
+- **[MD028](docs/rules/md028.md)** *no-blanks-blockquote* - Blank line inside blockquote
 - **[MD029](docs/rules/md029.md)** *ol-prefix* - Ordered list item prefix consistency
 - **[MD030](docs/rules/md030.md)** *list-marker-space* - Spaces after list markers
 - **[MD031](docs/rules/md031.md)** *blanks-around-fences* - Fenced code blocks surrounded by blank lines
@@ -537,7 +537,7 @@ If no `default` is specified, rules without explicit configuration use `"err"` (
 - **[MD047](docs/rules/md047.md)** *single-trailing-newline* - Files should end with a single newline
 - **[MD048](docs/rules/md048.md)** *code-fence-style* - Code fence style consistency
 - **[MD049](docs/rules/md049.md)** *emphasis-style* - Emphasis style consistency
-- **[MD050](docs/rules/md050.md)** *strong-style* - Strong style consistency
+- **[MD050](docs/rules/md050.md)** *strong-style* - Strong style
 - **[MD051](docs/rules/md051.md)** *link-fragments* - Link fragments should be valid
 - **[MD052](docs/rules/md052.md)** *reference-links-images* - Reference links should be defined
 - **[MD053](docs/rules/md053.md)** *link-image-reference-definitions* - Reference definitions should be needed

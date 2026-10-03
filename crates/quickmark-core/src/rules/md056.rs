@@ -49,14 +49,16 @@ impl MD056Linter {
             let (message, column_offset) = if actual_column_count < expected_column_count {
                 (
                     format!(
-                        "Too few cells, row will be missing data (expected {expected_column_count}, got {actual_column_count})"
+                        "{} [Expected: {expected_column_count}; Actual: {actual_column_count}; Too few cells, row will be missing data]",
+                        MD056.description
                     ),
                     self.get_row_end_position(&row),
                 )
             } else {
                 (
                     format!(
-                        "Too many cells, extra data will be missing (expected {expected_column_count}, got {actual_column_count})"
+                        "{} [Expected: {expected_column_count}; Actual: {actual_column_count}; Too many cells, extra data will be missing]",
+                        MD056.description
                     ),
                     self.get_extra_cells_position(&row, expected_column_count),
                 )
