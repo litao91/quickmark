@@ -407,6 +407,30 @@ fn main() {
         assert_eq!(0, violations.len()); // Fenced code blocks should be excluded
     }
 
+    /// The line after a code block is ordinary text, so its trailing spaces count. Every expectation
+    /// is a markdownlint-cli2 v0.23.3 measurement.
+    #[test]
+    fn trailing_spaces_after_a_code_block_count() {
+        for (input, line) in [
+            ("```\ncode\n```\ntext    \n", 4),
+            ("~~~\ncode\n~~~\ntext    \n", 4),
+            ("para\n\n    code\ntext    \n", 4),
+            ("para\n\n    code\n   \ntext\n", 4),
+            ("para\n\n    code\n\n   \ntext\n", 5),
+            ("<div>\n</div>\ntext    \n", 3),
+        ] {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            let violations = linter.analyze();
+            assert_eq!(1, violations.len(), "{input:?}");
+            assert_eq!(
+                line,
+                violations[0].location().range.start.line + 1,
+                "{input:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_list_item_empty_lines() {
         let config = test_config_with_trailing_spaces(MD009TrailingSpacesTable {

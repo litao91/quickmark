@@ -110,6 +110,9 @@ pub struct Context {
 /// Lightweight node information for caching
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
+    /// The first and last row the node covers, both 0-based and both inclusive. A block swallows its
+    /// trailing newline, so its end position names the *next* row — which the block does not cover,
+    /// and which a rule masking code-block lines must therefore not mask.
     pub line_start: usize,
     pub line_end: usize,
     pub kind: &'static str,
@@ -195,9 +198,14 @@ impl Context {
             if node.is_inline() {
                 continue;
             }
+            let end = node.end_position();
             cache.entry(node.kind()).or_default().push(NodeInfo {
                 line_start: node.start_position().row,
-                line_end: node.end_position().row,
+                line_end: if end.column == 0 && end.row > 0 {
+                    end.row - 1
+                } else {
+                    end.row
+                },
                 kind: node.kind(),
             });
         }
@@ -476,5 +484,33 @@ Second heading
             cache.contains_key("inline"),
             "the `inline` node itself is a block-level child of the paragraph and must stay cached"
         );
+    }
+
+    /// `line_end` is the last row a block covers, not the row after it. A block swallows its trailing
+    /// newline, so its end position names the *following* row — and MD009, MD010 and MD012 all mask
+    /// code-block lines by this value, so caching the end position verbatim exempted the first line
+    /// after every block from all three rules.
+    #[test]
+    fn node_cache_line_end_is_the_blocks_last_row() {
+        let source = "para\n\n    code\n\n```\nfenced\n```\n";
+        let tree = crate::ast::build::parse(source);
+        let context = Context::new(
+            PathBuf::from("test.md"),
+            QuickmarkConfig::default(),
+            source,
+            &tree,
+        );
+        let cache = context.node_cache.borrow();
+        let rows = |kind: &str| -> Vec<(usize, usize)> {
+            cache
+                .get(kind)
+                .into_iter()
+                .flatten()
+                .map(|node| (node.line_start, node.line_end))
+                .collect()
+        };
+        assert_eq!(vec![(2, 2)], rows("indented_code_block"));
+        assert_eq!(vec![(4, 6)], rows("fenced_code_block"));
+        assert_eq!(vec![(0, 0)], rows("paragraph"));
     }
 }

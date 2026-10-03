@@ -297,7 +297,7 @@ impl<'a> Builder<'a> {
         }
 
         self.clamp_list_ends(&top_level);
-        self.fix_indented_code_ends(&top_level);
+        self.fix_indented_code_ends();
         self.extend_block_ends();
         self.attach_link_reference_definitions(&mut top_level);
         for child in self.group_sections(&top_level, content_start, document_end) {
@@ -355,15 +355,14 @@ impl<'a> Builder<'a> {
     /// trailing spaces on each line of a block it was told is one line long.
     ///
     /// The block covers every following row that is blank or indented four past the container's
-    /// content column, and then runs on over the trailing blank rows to wherever the next block
-    /// starts — or to its parent's end when it is the last child. `extend_block_ends` supplies the
-    /// column afterwards.
-    fn fix_indented_code_ends(&mut self, top_level: &[u32]) {
+    /// content column, and ends at the last of those rows that has content in it. `extend_block_ends`
+    /// supplies the column afterwards.
+    fn fix_indented_code_ends(&mut self) {
         let parents = self.parent_map();
         let count = self.nodes.len();
         let fixed: Vec<(usize, (u32, u32))> = (0..count)
             .filter(|&index| self.nodes[index].kind == Kind::IndentedCodeBlock)
-            .map(|index| (index, self.indented_code_end(&parents, top_level, index)))
+            .map(|index| (index, self.indented_code_end(&parents, index)))
             .collect();
         for (index, end) in fixed {
             let node = &mut self.nodes[index];
@@ -371,22 +370,18 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn indented_code_end(&self, parents: &[u32], top_level: &[u32], index: usize) -> (u32, u32) {
+    fn indented_code_end(&self, parents: &[u32], index: usize) -> (u32, u32) {
         let start_row = self.nodes[index].start_row;
         // Four past the container's content column, not the first row's own indentation: a later row
         // only has to reach the minimum, so a block may open at five spaces and continue at four.
         let prefix = continuation_prefix(&self.nodes, parents, &self.lines, index, start_row);
         let indent = prefix + 4;
 
-        // Trailing blank rows belong to the block's range too, so it runs on to whatever follows.
         let parent = parents[index];
-        let (siblings, parent_end) = if parent == u32::MAX {
-            (top_level, self.document_end())
+        let parent_end = if parent == u32::MAX {
+            self.document_end()
         } else {
-            (
-                self.nodes[parent as usize].children.as_slice(),
-                self.nodes[parent as usize].end(),
-            )
+            self.nodes[parent as usize].end()
         };
 
         // The scan stops at the container's last row. A blank row looks the same from inside a block
@@ -399,11 +394,13 @@ impl<'a> Builder<'a> {
         };
         let limit = (self.lines.line_count() as u32).min(last_parent_row + 1);
 
+        // A blank row keeps the scan going but does not extend the block. An interior blank is still
+        // code; a trailing one is not, and markdownlint's `codeIndented` token — which is what
+        // MD009, MD010 and MD012 mask against — stops at the last row that has content in it.
         let mut last_code = start_row;
         let mut row = start_row + 1;
         while row < limit {
             match self.content_indent(parents, index, row) {
-                // Blank once container prefixes are stripped, so still inside the block.
                 None => row += 1,
                 Some(column) if column >= indent => {
                     last_code = row;
@@ -413,19 +410,11 @@ impl<'a> Builder<'a> {
             }
         }
 
-        let natural = if self.lines.ends_with_line_terminator() {
+        if self.lines.ends_with_line_terminator() {
             (last_code + 1, 0)
         } else {
             (last_code, self.lines.content_len(last_code as usize))
-        };
-
-        let followed = siblings
-            .iter()
-            .position(|&sibling| sibling as usize == index)
-            .and_then(|position| siblings.get(position + 1))
-            .map(|&next| self.nodes[next as usize].start())
-            .unwrap_or(parent_end);
-        natural.max(followed)
+        }
     }
 
     /// The column `row`'s first non-space byte sits at, counting only what follows the container

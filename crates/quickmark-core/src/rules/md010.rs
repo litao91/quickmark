@@ -312,6 +312,31 @@ mod test {
         assert_eq!(0, violations.len()); // Should not check code blocks when disabled
     }
 
+    /// The line after a code block is ordinary text, so its tabs count even with `code_blocks` off.
+    /// Every expectation is a markdownlint-cli2 v0.23.3 measurement.
+    #[test]
+    fn a_tab_after_a_code_block_counts() {
+        for input in [
+            "```\ncode\n```\ntext\tmore\n",
+            "para\n\n    code\ntext\tmore\n",
+        ] {
+            let config = test_config_with_hard_tabs(MD010HardTabsTable {
+                code_blocks: false,
+                ignore_code_languages: Vec::new(),
+                spaces_per_tab: 1,
+            });
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+            let violations = linter.analyze();
+            assert_eq!(1, violations.len(), "{input:?}");
+            assert_eq!(
+                4,
+                violations[0].location().range.start.line + 1,
+                "{input:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_ignore_specific_languages() {
         let config = test_config_with_hard_tabs(MD010HardTabsTable {

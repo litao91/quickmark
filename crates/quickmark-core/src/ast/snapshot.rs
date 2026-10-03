@@ -265,10 +265,30 @@ const CASES: &[(&str, &str, &str)] = &[
         (text 0:0-0:4 0-4)
       )
     )
-    (indented_code_block 2:0-5:0 6-25)
+    (indented_code_block 2:0-4:0 6-24)
     (paragraph 5:0-6:0 25-30
       (inline 5:0-5:4 25-29
         (text 5:0-5:4 25-29)
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        "indented code keeps an interior blank and drops a trailing one",
+        "para\n\n    code\n\n    more\n\n\ntext\n",
+        r#"(document 0:0-8:0 0-32
+  (section 0:0-8:0 0-32
+    (paragraph 0:0-1:0 0-5
+      (inline 0:0-0:4 0-4
+        (text 0:0-0:4 0-4)
+      )
+    )
+    (indented_code_block 2:0-5:0 6-25)
+    (paragraph 7:0-8:0 27-32
+      (inline 7:0-7:4 27-31
+        (text 7:0-7:4 27-31)
       )
     )
   )

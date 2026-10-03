@@ -82,43 +82,11 @@ impl MD012Linter {
     /// This is performant as it uses the pre-parsed node cache and a contiguous
     /// memory block (`Vec<bool>`) for marking lines, leading to better cache
     /// performance than a `HashSet`. It uses 0-based indexing consistently.
-    ///
-    /// Note: a block's range includes its trailing newline, so `line_end` is the row *after* the
-    /// closing fence. That row is outside the block and must not be masked, or a blank line
-    /// following a fence would be exempt from this rule.
     fn populate_code_block_mask(&self, mask: &mut [bool]) {
         let node_cache = self.context.node_cache.borrow();
-        let lines = self.context.lines.borrow();
-
-        // Handle indented code blocks
-        if let Some(indented_blocks) = node_cache.get("indented_code_block") {
-            for node_info in indented_blocks {
+        for kind in ["indented_code_block", "fenced_code_block"] {
+            for node_info in node_cache.get(kind).into_iter().flatten() {
                 for line_num in node_info.line_start..=node_info.line_end {
-                    if let Some(is_in_block) = mask.get_mut(line_num) {
-                        *is_in_block = true;
-                    }
-                }
-            }
-        }
-
-        // Handle fenced code blocks, dropping the row after the closing fence
-        if let Some(fenced_blocks) = node_cache.get("fenced_code_block") {
-            for node_info in fenced_blocks {
-                let mut end_line = node_info.line_end;
-
-                // `line_end` is the row after the closing fence. When that row is blank it is not
-                // part of the block, so it stays subject to this rule.
-                if let Some(last_line) = lines.get(end_line) {
-                    if last_line.trim().is_empty() {
-                        if let Some(prev_line) = lines.get(end_line.saturating_sub(1)) {
-                            if prev_line.trim().starts_with("```") {
-                                end_line = end_line.saturating_sub(1);
-                            }
-                        }
-                    }
-                }
-
-                for line_num in node_info.line_start..=end_line {
                     if let Some(is_in_block) = mask.get_mut(line_num) {
                         *is_in_block = true;
                     }
@@ -423,6 +391,38 @@ More normal text"#;
         let violations = linter.analyze();
         // Should violate for multiple blank lines outside code blocks
         assert_eq!(2, violations.len());
+    }
+
+    /// The rows after a code block are ordinary text, so this rule counts them. Masking them was a
+    /// workaround for `line_end` naming the row *after* a block rather than its last one. Every
+    /// expectation is a markdownlint-cli2 v0.23.3 measurement.
+    #[test]
+    fn blank_lines_after_a_code_block_count() {
+        fn reported(input: &str) -> Vec<usize> {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .map(|violation| violation.location().range.start.line + 1)
+                .collect()
+        }
+
+        for input in [
+            "```\ncode\n```\n\n\n\ntext\n",
+            "~~~\ncode\n~~~\n\n\n\ntext\n",
+            "para\n\n    code\n\n\n\ntext\n",
+        ] {
+            assert_eq!(vec![5, 6], reported(input), "{input:?}");
+        }
+        // A block that resumes after an interior blank runs to its last content row, so the two
+        // blanks that follow it are one pair rather than the three an unresumed block would leave.
+        assert_eq!(
+            vec![7],
+            reported("para\n\n    code\n\n    more\n\n\ntext\n")
+        );
+        // An interior blank is still code, so a block that resumes leaves nothing to report.
+        assert!(reported("para\n\n    code\n\n    more\n\ntext\n").is_empty());
     }
 
     #[test]
