@@ -483,4 +483,15 @@ mod test {
         assert_eq!(2, md049_messages("_x_\n\n$a$ plain *y*\n").len());
         assert_eq!(2, md049_messages("_x_\n\n`$a*$` code span *y*\n").len());
     }
+
+    /// comrak caches where it last saw a backtick run of each length
+    /// (`parser/inlines.rs:scan_to_closing_backtick`), and a *successful* scan overwrites the entry
+    /// with the closer it found. Once an earlier unclosed run has set `scanned_for_backticks`, that
+    /// stale entry makes every later opener of the same length look unclosed too, so `` `*b*` `` is
+    /// left as text and its asterisks become delimiters. micromark rescans and keeps it a code
+    /// span; markdownlint reports nothing here.
+    #[test]
+    fn code_spans_after_an_unclosed_run_are_a_known_difference() {
+        assert_eq!(2, md049_messages("_x_\n\ny `` z `*a*` w `*b*` v\n").len());
+    }
 }
