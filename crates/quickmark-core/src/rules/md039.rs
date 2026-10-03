@@ -172,7 +172,7 @@ impl RuleLinter for MD039Linter {
 
 pub const MD039: Rule = Rule {
     id: "MD039",
-    alias: "no-space-in-links",
+    aliases: &["no-space-in-links"],
     tags: &["whitespace", "links"],
     description: "Spaces inside link text",
     rule_type: RuleType::Token,

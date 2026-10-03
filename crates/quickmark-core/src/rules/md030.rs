@@ -176,7 +176,7 @@ fn spacing_after_marker(after_marker: &str) -> Option<usize> {
 
 pub const MD030: Rule = Rule {
     id: "MD030",
-    alias: "list-marker-space",
+    aliases: &["list-marker-space"],
     tags: &["ol", "ul", "whitespace"],
     description: "Spaces after list markers",
     rule_type: RuleType::Token,

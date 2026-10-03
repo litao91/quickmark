@@ -176,7 +176,7 @@ impl RuleLinter for MD024Linter {
 
 pub const MD024: Rule = Rule {
     id: "MD024",
-    alias: "no-duplicate-heading",
+    aliases: &["no-duplicate-heading"],
     tags: &["headings"],
     description: "Multiple headings with the same content",
     rule_type: RuleType::Document,

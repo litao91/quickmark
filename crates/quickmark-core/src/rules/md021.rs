@@ -133,7 +133,7 @@ impl RuleLinter for MD021Linter {
 
 pub const MD021: Rule = Rule {
     id: "MD021",
-    alias: "no-multiple-space-closed-atx",
+    aliases: &["no-multiple-space-closed-atx"],
     tags: &["headings", "atx_closed", "spaces"],
     description: "Multiple spaces inside hashes on closed atx style heading",
     rule_type: RuleType::Token,

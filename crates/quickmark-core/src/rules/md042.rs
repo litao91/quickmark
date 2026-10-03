@@ -112,7 +112,7 @@ impl RuleLinter for MD042Linter {
 
 pub const MD042: Rule = Rule {
     id: "MD042",
-    alias: "no-empty-links",
+    aliases: &["no-empty-links"],
     tags: &["links"],
     description: "No empty links",
     rule_type: RuleType::Token,

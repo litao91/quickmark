@@ -159,7 +159,7 @@ impl RuleLinter for MD048Linter {
 
 pub const MD048: Rule = Rule {
     id: "MD048",
-    alias: "code-fence-style",
+    aliases: &["code-fence-style"],
     tags: &["code"],
     description: "Code fence style",
     rule_type: RuleType::Document,

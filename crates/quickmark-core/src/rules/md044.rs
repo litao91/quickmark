@@ -373,7 +373,7 @@ impl RuleLinter for MD044Linter {
 
 pub const MD044: Rule = Rule {
     id: "MD044",
-    alias: "proper-names",
+    aliases: &["proper-names"],
     tags: &["spelling"],
     description: "Proper names should have the correct capitalization",
     rule_type: RuleType::Document,

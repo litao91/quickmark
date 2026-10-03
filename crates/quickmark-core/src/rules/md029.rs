@@ -172,7 +172,7 @@ impl RuleLinter for MD029Linter {
 
 pub const MD029: Rule = Rule {
     id: "MD029",
-    alias: "ol-prefix",
+    aliases: &["ol-prefix"],
     tags: &["ol"],
     description: "Ordered list item prefix",
     rule_type: RuleType::Token,

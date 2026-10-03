@@ -186,7 +186,7 @@ impl MD045Linter {
 
 pub const MD045: Rule = Rule {
     id: "MD045",
-    alias: "no-alt-text",
+    aliases: &["no-alt-text"],
     tags: &["accessibility", "images"],
     description: "Images should have alternate text (alt text)",
     rule_type: RuleType::Token,

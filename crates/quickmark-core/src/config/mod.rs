@@ -81,10 +81,10 @@ pub struct LintersSettingsTable {
     #[serde(rename = "blanks-around-headings")]
     #[serde(default)]
     pub headings_blanks: MD022HeadingsBlanksTable,
-    #[serde(rename = "single-h1")]
+    #[serde(rename = "single-h1", alias = "single-title")]
     #[serde(default)]
     pub single_h1: MD025SingleH1Table,
-    #[serde(rename = "first-line-heading")]
+    #[serde(rename = "first-line-heading", alias = "first-line-h1")]
     #[serde(default)]
     pub first_line_heading: MD041FirstLineHeadingTable,
     #[serde(rename = "no-trailing-punctuation")]
@@ -170,19 +170,26 @@ pub struct QuickmarkConfig {
 }
 
 pub fn normalize_severities(severities: &mut HashMap<String, RuleSeverity>) {
-    let rule_aliases: HashSet<&str> = ALL_RULES.iter().map(|r| r.alias).collect();
+    // A rule answers to every name markdownlint gives it, and a config may spell any of them.
+    let known: HashSet<&str> = ALL_RULES
+        .iter()
+        .flat_map(|rule| rule.aliases.iter().copied())
+        .collect();
 
     // Extract default severity if present, then remove it from the map
     let default_severity = severities.remove("default").unwrap_or(RuleSeverity::Error);
 
     // Remove invalid rules (keep only recognized rule aliases)
-    severities.retain(|key, _| rule_aliases.contains(key.as_str()));
+    severities.retain(|key, _| known.contains(key.as_str()));
 
-    // Apply default severity to all rules that don't have explicit configuration
-    for &rule in &rule_aliases {
-        severities
-            .entry(rule.to_string())
-            .or_insert(default_severity.clone());
+    // Every rule ends up with one entry, under the name the rest of quickmark looks up, carrying
+    // whichever of its names the config spelled — or the default, if it spelled none.
+    for rule in ALL_RULES {
+        let severity = rule
+            .severity_in(severities)
+            .cloned()
+            .unwrap_or_else(|| default_severity.clone());
+        severities.insert(rule.alias().to_string(), severity);
     }
 }
 
@@ -413,9 +420,11 @@ pub fn discover_config_with_workspace_or_default(
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use tempfile::TempDir;
+
+    use crate::rules::ALL_RULES;
 
     use crate::config::{
         config_from_env_path_or_default, discover_config_or_default,
@@ -526,6 +535,64 @@ mod test {
             *severity.get("no-reversed-links").unwrap()
         );
         assert_eq!(None, severity.get("some-bullshit"));
+    }
+
+    /// markdownlint gives MD025 and MD041 two names each and a config may spell either, so both have
+    /// to reach the same rule. Measured against markdownlint-cli2 v0.23.3, which prints
+    /// `MD025/single-title/single-h1` and accepts `single-title` as a severity and a settings key.
+    #[test]
+    fn a_rules_second_alias_configures_it() {
+        for (spelled, canonical) in [
+            ("single-h1", "single-title"),
+            ("single-title", "single-title"),
+            ("first-line-h1", "first-line-heading"),
+        ] {
+            let mut severity: HashMap<String, RuleSeverity> = vec![
+                ("default".to_string(), RuleSeverity::Error),
+                (spelled.to_string(), RuleSeverity::Off),
+            ]
+            .into_iter()
+            .collect();
+            normalize_severities(&mut severity);
+            assert_eq!(
+                Some(&RuleSeverity::Off),
+                severity.get(canonical),
+                "config spelled {spelled}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_prints_every_name_it_answers_to() {
+        let names: HashMap<&str, String> = ALL_RULES
+            .iter()
+            .map(|rule| (rule.id, rule.qualified_name()))
+            .collect();
+        assert_eq!("MD025/single-title/single-h1", names["MD025"]);
+        assert_eq!("MD041/first-line-heading/first-line-h1", names["MD041"]);
+        assert_eq!("MD013/line-length", names["MD013"]);
+
+        let with_two: HashSet<&str> = ALL_RULES
+            .iter()
+            .filter(|rule| rule.aliases.len() > 1)
+            .map(|rule| rule.id)
+            .collect();
+        assert_eq!(
+            HashSet::from(["MD025", "MD041"]),
+            with_two,
+            "markdownlint gives every other rule exactly one name"
+        );
+    }
+
+    #[test]
+    fn a_rules_second_alias_selects_its_settings() {
+        let parsed: LintersSettingsTable =
+            toml::from_str("[single-title]\nlevel = 2\n").expect("single-title");
+        assert_eq!(2, parsed.single_h1.level);
+
+        let parsed: LintersSettingsTable =
+            toml::from_str("[first-line-h1]\nlevel = 2\n").expect("first-line-h1");
+        assert_eq!(2, parsed.first_line_heading.level);
     }
 
     #[test]

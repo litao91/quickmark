@@ -264,7 +264,7 @@ impl MD004Linter {
 
 pub const MD004: Rule = Rule {
     id: "MD004",
-    alias: "ul-style",
+    aliases: &["ul-style"],
     tags: &["bullet", "ul"],
     description: "Unordered list style",
     rule_type: RuleType::Token,

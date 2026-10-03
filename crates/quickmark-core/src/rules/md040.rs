@@ -167,7 +167,7 @@ impl RuleLinter for MD040Linter {
 
 pub const MD040: Rule = Rule {
     id: "MD040",
-    alias: "fenced-code-language",
+    aliases: &["fenced-code-language"],
     tags: &["code", "language"],
     description: "Fenced code blocks should have a language specified",
     rule_type: RuleType::Document,

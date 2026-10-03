@@ -219,7 +219,7 @@ impl RuleLinter for MD009Linter {
 
 pub const MD009: Rule = Rule {
     id: "MD009",
-    alias: "no-trailing-spaces",
+    aliases: &["no-trailing-spaces"],
     tags: &["whitespace"],
     description: "Trailing spaces",
     rule_type: RuleType::Line,

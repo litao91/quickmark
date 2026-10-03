@@ -181,7 +181,7 @@ impl RuleLinter for MD059Linter {
 
 pub const MD059: Rule = Rule {
     id: "MD059",
-    alias: "descriptive-link-text",
+    aliases: &["descriptive-link-text"],
     tags: &["accessibility", "links"],
     description: "Link text should be descriptive",
     rule_type: RuleType::Token,

@@ -131,7 +131,7 @@ impl RuleLinter for MD032Linter {
 
 pub const MD032: Rule = Rule {
     id: "MD032",
-    alias: "blanks-around-lists",
+    aliases: &["blanks-around-lists"],
     tags: &["blank_lines", "bullet", "ol", "ul"],
     description: "Lists should be surrounded by blank lines",
     rule_type: RuleType::Token,

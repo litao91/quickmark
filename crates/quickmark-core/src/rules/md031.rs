@@ -166,7 +166,7 @@ impl RuleLinter for MD031Linter {
 
 pub const MD031: Rule = Rule {
     id: "MD031",
-    alias: "blanks-around-fences",
+    aliases: &["blanks-around-fences"],
     tags: &["blank_lines", "code"],
     description: "Fenced code blocks should be surrounded by blank lines",
     rule_type: RuleType::Hybrid,

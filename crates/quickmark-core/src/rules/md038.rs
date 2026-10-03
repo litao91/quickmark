@@ -225,7 +225,7 @@ impl RuleLinter for MD038Linter {
 
 pub const MD038: Rule = Rule {
     id: "MD038",
-    alias: "no-space-in-code",
+    aliases: &["no-space-in-code"],
     tags: &["whitespace", "code"],
     description: "Spaces inside code span elements",
     rule_type: RuleType::Token,

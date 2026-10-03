@@ -108,7 +108,7 @@ impl RuleLinter for MD018Linter {
 
 pub const MD018: Rule = Rule {
     id: "MD018",
-    alias: "no-missing-space-atx",
+    aliases: &["no-missing-space-atx"],
     tags: &["atx", "headings", "spaces"],
     description: "No space after hash on atx style heading",
     rule_type: RuleType::Line,

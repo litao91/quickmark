@@ -312,7 +312,7 @@ impl RuleLinter for MD052Linter {
 
 pub const MD052: Rule = Rule {
     id: "MD052",
-    alias: "reference-links-images",
+    aliases: &["reference-links-images"],
     tags: &["links", "images"],
     description: "Reference links and images should use a label that is defined",
     rule_type: RuleType::Document,

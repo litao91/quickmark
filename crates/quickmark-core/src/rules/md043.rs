@@ -235,7 +235,7 @@ impl RuleLinter for MD043Linter {
 
 pub const MD043: Rule = Rule {
     id: "MD043",
-    alias: "required-headings",
+    aliases: &["required-headings"],
     tags: &["headings"],
     description: "Required heading structure",
     rule_type: RuleType::Document,

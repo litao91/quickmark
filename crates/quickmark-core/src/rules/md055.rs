@@ -237,7 +237,7 @@ impl MD055Linter {
 
 pub const MD055: Rule = Rule {
     id: "MD055",
-    alias: "table-pipe-style",
+    aliases: &["table-pipe-style"],
     tags: &["table"],
     description: "Table pipe style",
     rule_type: RuleType::Token,

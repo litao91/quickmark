@@ -82,7 +82,7 @@ impl RuleLinter for MD035Linter {
 
 pub const MD035: Rule = Rule {
     id: "MD035",
-    alias: "hr-style",
+    aliases: &["hr-style"],
     tags: &["hr"],
     description: "Horizontal rule style",
     rule_type: RuleType::Token,

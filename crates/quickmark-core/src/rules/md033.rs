@@ -309,7 +309,7 @@ impl RuleLinter for MD033Linter {
 
 pub const MD033: Rule = Rule {
     id: "MD033",
-    alias: "no-inline-html",
+    aliases: &["no-inline-html"],
     tags: &["html"],
     description: "Inline HTML",
     rule_type: RuleType::Token,

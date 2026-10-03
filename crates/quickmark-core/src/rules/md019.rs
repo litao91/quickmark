@@ -88,7 +88,7 @@ impl RuleLinter for MD019Linter {
 
 pub const MD019: Rule = Rule {
     id: "MD019",
-    alias: "no-multiple-space-atx",
+    aliases: &["no-multiple-space-atx"],
     tags: &["headings", "atx", "spaces"],
     description: "Multiple spaces after hash on atx style heading",
     rule_type: RuleType::Token,

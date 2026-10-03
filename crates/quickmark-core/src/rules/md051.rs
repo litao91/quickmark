@@ -406,7 +406,7 @@ impl RuleLinter for MD051Linter {
 
 pub const MD051: Rule = Rule {
     id: "MD051",
-    alias: "link-fragments",
+    aliases: &["link-fragments"],
     tags: &["links"],
     description: "Link fragments should be valid",
     rule_type: RuleType::Document,

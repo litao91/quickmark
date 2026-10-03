@@ -171,7 +171,7 @@ impl MD005Linter {
 
 pub const MD005: Rule = Rule {
     id: "MD005",
-    alias: "list-indent",
+    aliases: &["list-indent"],
     tags: &["bullet", "ul", "indentation"],
     description: "Inconsistent indentation for list items at the same level",
     rule_type: RuleType::Token,

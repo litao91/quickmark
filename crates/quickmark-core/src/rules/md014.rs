@@ -200,7 +200,7 @@ impl RuleLinter for MD014Linter {
 
 pub const MD014: Rule = Rule {
     id: "MD014",
-    alias: "commands-show-output",
+    aliases: &["commands-show-output"],
     tags: &["code"],
     description: "Dollar signs used before commands without showing output",
     rule_type: RuleType::Token,

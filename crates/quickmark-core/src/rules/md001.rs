@@ -81,7 +81,7 @@ impl RuleLinter for MD001Linter {
 
 pub const MD001: Rule = Rule {
     id: "MD001",
-    alias: "heading-increment",
+    aliases: &["heading-increment"],
     tags: &["headings"],
     description: "Heading levels should only increment by one level at a time",
     rule_type: RuleType::Token,

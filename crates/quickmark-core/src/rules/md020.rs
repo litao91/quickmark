@@ -109,7 +109,7 @@ impl RuleLinter for MD020Linter {
 
 pub const MD020: Rule = Rule {
     id: "MD020",
-    alias: "no-missing-space-closed-atx",
+    aliases: &["no-missing-space-closed-atx"],
     tags: &["headings", "atx_closed", "spaces"],
     description: "No space inside hashes on closed atx style heading",
     rule_type: RuleType::Line,

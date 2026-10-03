@@ -199,7 +199,7 @@ impl RuleLinter for MD049Linter {
 
 pub const MD049: Rule = Rule {
     id: "MD049",
-    alias: "emphasis-style",
+    aliases: &["emphasis-style"],
     tags: &["emphasis"],
     description: "Emphasis style",
     rule_type: RuleType::Token,

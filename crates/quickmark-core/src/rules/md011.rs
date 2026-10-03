@@ -138,7 +138,7 @@ impl RuleLinter for MD011Linter {
 
 pub const MD011: Rule = Rule {
     id: "MD011",
-    alias: "no-reversed-links",
+    aliases: &["no-reversed-links"],
     tags: &["links"],
     description: "Reversed link syntax",
     rule_type: RuleType::Line,

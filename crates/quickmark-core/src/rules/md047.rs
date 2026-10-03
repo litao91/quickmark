@@ -80,7 +80,7 @@ impl RuleLinter for MD047Linter {
 
 pub const MD047: Rule = Rule {
     id: "MD047",
-    alias: "single-trailing-newline",
+    aliases: &["single-trailing-newline"],
     tags: &["blank_lines"],
     description: "Files should end with a single newline character",
     rule_type: RuleType::Line,

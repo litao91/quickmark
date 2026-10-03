@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::config::RuleSeverity;
 use crate::linter::{Context, RuleLinter};
 
 pub mod md001;
@@ -193,12 +195,44 @@ pub(crate) fn closing_bracket(bytes: &[u8], open: usize) -> Option<usize> {
 #[derive(Debug)]
 pub struct Rule {
     pub id: &'static str,
-    pub alias: &'static str,
+    /// Every name markdownlint gives the rule, in the order it prints them. Almost every rule has
+    /// one; MD025 is also `single-title` and MD041 is also `first-line-h1`, and a config written for
+    /// markdownlint may spell either.
+    pub aliases: &'static [&'static str],
     pub tags: &'static [&'static str],
     pub description: &'static str,
     pub rule_type: RuleType,
     pub required_nodes: &'static [&'static str], // For caching optimization
     pub new_linter: fn(Rc<Context>) -> Box<dyn RuleLinter>,
+}
+
+impl Rule {
+    /// The name the rest of quickmark keys on, which is the first one markdownlint prints.
+    pub fn alias(&self) -> &'static str {
+        self.aliases[0]
+    }
+
+    /// How markdownlint names a rule in its output: the id and then every alias, slash-separated, so
+    /// `MD025/single-title/single-h1`.
+    pub fn qualified_name(&self) -> String {
+        let mut name = self.id.to_string();
+        for alias in self.aliases {
+            name.push('/');
+            name.push_str(alias);
+        }
+        name
+    }
+
+    /// The severity a config gives this rule, under whichever of its names the config spelled it.
+    ///
+    /// `normalize_severities` folds a rule's names onto its first, but a config assembled by hand —
+    /// as every rule test does — has not been through it, so each name is tried.
+    pub fn severity_in<'a>(
+        &self,
+        severities: &'a HashMap<String, RuleSeverity>,
+    ) -> Option<&'a RuleSeverity> {
+        self.aliases.iter().find_map(|alias| severities.get(*alias))
+    }
 }
 
 pub const ALL_RULES: &[Rule] = &[

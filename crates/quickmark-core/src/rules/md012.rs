@@ -148,7 +148,7 @@ impl RuleLinter for MD012Linter {
 
 pub const MD012: Rule = Rule {
     id: "MD012",
-    alias: "no-multiple-blanks",
+    aliases: &["no-multiple-blanks"],
     tags: &["blank_lines", "whitespace"],
     description: "Multiple consecutive blank lines",
     rule_type: RuleType::Line,

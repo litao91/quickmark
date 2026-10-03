@@ -268,7 +268,7 @@ impl RuleLinter for MD022Linter {
 
 pub const MD022: Rule = Rule {
     id: "MD022",
-    alias: "blanks-around-headings",
+    aliases: &["blanks-around-headings"],
     tags: &["headings", "blank_lines"],
     description: "Headings should be surrounded by blank lines",
     rule_type: RuleType::Hybrid,

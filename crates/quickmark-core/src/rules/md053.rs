@@ -209,7 +209,7 @@ impl RuleLinter for MD053Linter {
 
 pub const MD053: Rule = Rule {
     id: "MD053",
-    alias: "link-image-reference-definitions",
+    aliases: &["link-image-reference-definitions"],
     tags: &["links", "images"],
     description: "Link and image reference definitions should be needed",
     rule_type: RuleType::Document,

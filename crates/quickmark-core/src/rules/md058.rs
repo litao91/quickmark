@@ -96,7 +96,7 @@ impl RuleLinter for MD058Linter {
 
 pub const MD058: Rule = Rule {
     id: "MD058",
-    alias: "blanks-around-tables",
+    aliases: &["blanks-around-tables"],
     tags: &["table", "blank_lines"],
     description: "Tables should be surrounded by blank lines",
     rule_type: RuleType::Token,

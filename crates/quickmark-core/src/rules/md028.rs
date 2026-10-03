@@ -91,7 +91,7 @@ impl RuleLinter for MD028Linter {
 
 pub const MD028: Rule = Rule {
     id: "MD028",
-    alias: "no-blanks-blockquote",
+    aliases: &["no-blanks-blockquote"],
     tags: &["blockquote", "whitespace"],
     description: "Blank line inside blockquote",
     rule_type: RuleType::Token,

@@ -274,7 +274,7 @@ impl RuleLinter for MD027Linter {
 
 pub const MD027: Rule = Rule {
     id: "MD027",
-    alias: "no-multiple-space-blockquote",
+    aliases: &["no-multiple-space-blockquote"],
     tags: &["blockquote", "whitespace", "indentation"],
     description: "Multiple spaces after blockquote symbol",
     rule_type: RuleType::Hybrid,

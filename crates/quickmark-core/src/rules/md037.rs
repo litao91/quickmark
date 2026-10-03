@@ -257,7 +257,7 @@ impl RuleLinter for MD037Linter {
 
 pub const MD037: Rule = Rule {
     id: "MD037",
-    alias: "no-space-in-emphasis",
+    aliases: &["no-space-in-emphasis"],
     tags: &["whitespace", "emphasis"],
     description: "Spaces inside emphasis markers",
     rule_type: RuleType::Token,

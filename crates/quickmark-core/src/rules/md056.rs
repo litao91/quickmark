@@ -128,7 +128,7 @@ impl RuleLinter for MD056Linter {
 
 pub const MD056: Rule = Rule {
     id: "MD056",
-    alias: "table-column-count",
+    aliases: &["table-column-count"],
     tags: &["table"],
     description: "Table column count",
     rule_type: RuleType::Token,

@@ -301,7 +301,7 @@ impl RuleLinter for MD034Linter {
 
 pub const MD034: Rule = Rule {
     id: "MD034",
-    alias: "no-bare-urls",
+    aliases: &["no-bare-urls"],
     tags: &["links", "url"],
     description: "Bare URL used",
     rule_type: RuleType::Token,

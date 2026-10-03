@@ -187,7 +187,7 @@ impl RuleLinter for MD003Linter {
 
 pub const MD003: Rule = Rule {
     id: "MD003",
-    alias: "heading-style",
+    aliases: &["heading-style"],
     tags: &["headings"],
     description: "Heading style",
     rule_type: RuleType::Token,

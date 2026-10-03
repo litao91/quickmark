@@ -310,7 +310,7 @@ impl RuleLinter for MD060Linter {
 
 pub const MD060: Rule = Rule {
     id: "MD060",
-    alias: "table-column-style",
+    aliases: &["table-column-style"],
     tags: &["table"],
     description: "Table column style",
     rule_type: RuleType::Token,

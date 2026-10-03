@@ -365,7 +365,7 @@ impl RuleLinter for MD054Linter {
 
 pub const MD054: Rule = Rule {
     id: "MD054",
-    alias: "link-image-style",
+    aliases: &["link-image-style"],
     tags: &["links", "images"],
     description: "Link and image style",
     rule_type: RuleType::Token,

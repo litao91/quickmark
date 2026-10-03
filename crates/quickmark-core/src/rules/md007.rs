@@ -235,7 +235,7 @@ impl MD007Linter {
 
 pub const MD007: Rule = Rule {
     id: "MD007",
-    alias: "ul-indent",
+    aliases: &["ul-indent"],
     tags: &["bullet", "indentation", "ul"],
     description: "Unordered list indentation",
     rule_type: RuleType::Token,

@@ -188,7 +188,7 @@ impl RuleLinter for MD010Linter {
 
 pub const MD010: Rule = Rule {
     id: "MD010",
-    alias: "no-hard-tabs",
+    aliases: &["no-hard-tabs"],
     tags: &["hard_tab", "whitespace"],
     description: "Hard tabs",
     rule_type: RuleType::Line,

@@ -276,7 +276,7 @@ impl RuleLinter for MD041Linter {
 
 pub const MD041: Rule = Rule {
     id: "MD041",
-    alias: "first-line-heading",
+    aliases: &["first-line-heading", "first-line-h1"],
     tags: &["headings"],
     description: "First line in a file should be a top-level heading",
     rule_type: RuleType::Document,
@@ -309,6 +309,28 @@ mod test {
                 ..Default::default()
             },
         )
+    }
+
+    /// markdownlint gives this rule two names and a config may spell either, so both have to reach
+    /// the same linter. Measured against markdownlint-cli2 v0.23.3.
+    #[test]
+    fn either_alias_configures_the_rule() {
+        for alias in ["first-line-heading", "first-line-h1"] {
+            let config = test_config_with_settings(
+                vec![(alias, RuleSeverity::Error)],
+                LintersSettingsTable {
+                    first_line_heading: MD041FirstLineHeadingTable {
+                        level: 1,
+                        front_matter_title: String::new(),
+                        allow_preamble: false,
+                    },
+                    ..Default::default()
+                },
+            );
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, "## a\n");
+            assert_eq!(1, linter.analyze().len(), "{alias}");
+        }
     }
 
     #[test]

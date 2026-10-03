@@ -512,7 +512,7 @@ If no `default` is specified, rules without explicit configuration use `"err"` (
 - **[MD022](docs/rules/md022.md)** *blanks-around-headings* - Headings surrounded by blank lines
 - **[MD023](docs/rules/md023.md)** *heading-start-left* - Headings must start at the beginning of the line
 - **[MD024](docs/rules/md024.md)** *no-duplicate-heading* - Multiple headings with same content
-- **[MD025](docs/rules/md025.md)** *single-h1* - Multiple top-level headings
+- **[MD025](docs/rules/md025.md)** *single-title*/*single-h1* - Multiple top-level headings
 - **[MD026](docs/rules/md026.md)** *no-trailing-punctuation* - Trailing punctuation in headings
 - **[MD027](docs/rules/md027.md)** *no-multiple-space-blockquote* - Multiple spaces after blockquote symbol
 - **[MD028](docs/rules/md028.md)** *no-blanks-blockquote* - Blank line inside blockquote
@@ -528,7 +528,7 @@ If no `default` is specified, rules without explicit configuration use `"err"` (
 - **[MD038](docs/rules/md038.md)** *no-space-in-code* - Spaces inside code span elements
 - **[MD039](docs/rules/md039.md)** *no-space-in-links* - Spaces inside link text
 - **[MD040](docs/rules/md040.md)** *fenced-code-language* - Language specified for fenced code blocks
-- **[MD041](docs/rules/md041.md)** *first-line-heading* - First line should be top-level heading
+- **[MD041](docs/rules/md041.md)** *first-line-heading*/*first-line-h1* - First line should be top-level heading
 - **[MD042](docs/rules/md042.md)** *no-empty-links* - Empty links
 - **[MD043](docs/rules/md043.md)** *required-headings* - Required heading structure
 - **[MD044](docs/rules/md044.md)** *proper-names* - Proper names with correct capitalization

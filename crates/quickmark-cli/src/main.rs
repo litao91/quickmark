@@ -140,13 +140,12 @@ fn print_cli_errors(results: &[RuleViolation]) -> (i32, i32) {
         };
         // Convert 0-based line and character numbers to 1-based for CLI display
         eprintln!(
-            "{}: {}:{}:{} {}/{} {}",
+            "{}: {}:{}:{} {} {}",
             prefix,
             v.location().file_path.to_string_lossy(),
             v.location().range.start.line + 1,
             v.location().range.start.character + 1,
-            v.rule().id,
-            v.rule().alias,
+            v.rule().qualified_name(),
             v.message()
         );
         (new_err, new_warns)

@@ -163,7 +163,7 @@ fn is_gemoji_code(text: &str) -> bool {
 
 pub const MD026: Rule = Rule {
     id: "MD026",
-    alias: "no-trailing-punctuation",
+    aliases: &["no-trailing-punctuation"],
     tags: &["headings"],
     description: "Trailing punctuation in heading",
     rule_type: RuleType::Token,

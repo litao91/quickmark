@@ -76,12 +76,11 @@ impl Display for RuleViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}:{}:{} {}/{} {}",
+            "{}:{}:{} {} {}",
             self.location().file_path.to_string_lossy(),
             self.location().range.start.line,
             self.location().range.start.character,
-            self.rule().id,
-            self.rule().alias,
+            self.rule().qualified_name(),
             self.message()
         )
     }
@@ -293,10 +292,7 @@ impl MultiRuleLinter {
         let active_rules: Vec<_> = ALL_RULES
             .iter()
             .filter(|r| {
-                config
-                    .linters
-                    .severity
-                    .get(r.alias)
+                r.severity_in(&config.linters.severity)
                     .map(|severity| *severity != RuleSeverity::Off)
                     .unwrap_or(false)
             })
@@ -366,11 +362,9 @@ impl MultiRuleLinter {
             let mut linter_violations = linter.finalize();
             // Inject severity into each violation based on current config
             for violation in &mut linter_violations {
-                let severity = self
-                    .config
-                    .linters
-                    .severity
-                    .get(violation.rule().alias)
+                let severity = violation
+                    .rule()
+                    .severity_in(&self.config.linters.severity)
                     .cloned()
                     .unwrap_or(RuleSeverity::Error);
                 violation.severity = severity;
@@ -396,9 +390,9 @@ mod test {
     #[test]
     fn test_multiple_violations() {
         let severity: HashMap<_, _> = vec![
-            (MD001.alias.to_string(), RuleSeverity::Error),
-            (MD003.alias.to_string(), RuleSeverity::Error),
-            (MD013.alias.to_string(), RuleSeverity::Error),
+            (MD001.alias().to_string(), RuleSeverity::Error),
+            (MD003.alias().to_string(), RuleSeverity::Error),
+            (MD013.alias().to_string(), RuleSeverity::Error),
         ]
         .into_iter()
         .collect();

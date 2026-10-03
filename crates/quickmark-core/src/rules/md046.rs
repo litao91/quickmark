@@ -158,7 +158,7 @@ impl RuleLinter for MD046Linter {
 
 pub const MD046: Rule = Rule {
     id: "MD046",
-    alias: "code-block-style",
+    aliases: &["code-block-style"],
     tags: &["code"],
     description: "Code block style",
     rule_type: RuleType::Document,

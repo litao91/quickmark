@@ -172,7 +172,7 @@ impl RuleLinter for MD050Linter {
 
 pub const MD050: Rule = Rule {
     id: "MD050",
-    alias: "strong-style",
+    aliases: &["strong-style"],
     tags: &["emphasis"],
     description: "Strong style",
     rule_type: RuleType::Token,

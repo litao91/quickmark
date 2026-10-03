@@ -56,10 +56,9 @@ impl Backend {
         config: &quickmark_core::config::QuickmarkConfig,
     ) -> Diagnostic {
         // Get severity from configuration
-        let rule_severity = config
-            .linters
-            .severity
-            .get(violation.rule().alias)
+        let rule_severity = violation
+            .rule()
+            .severity_in(&config.linters.severity)
             .unwrap_or(&RuleSeverity::Warning);
 
         let severity = match rule_severity {
@@ -81,7 +80,7 @@ impl Backend {
                 },
             },
             severity: Some(severity),
-            code: Some(NumberOrString::String(violation.rule().alias.to_string())),
+            code: Some(NumberOrString::String(violation.rule().alias().to_string())),
             source: Some("quickmark".to_string()),
             message: violation.message().to_string(),
             related_information: None,
@@ -342,10 +341,9 @@ mod tests {
         violation: quickmark_core::linter::RuleViolation,
     ) -> Diagnostic {
         // Get severity from configuration
-        let rule_severity = config
-            .linters
-            .severity
-            .get(violation.rule().alias)
+        let rule_severity = violation
+            .rule()
+            .severity_in(&config.linters.severity)
             .unwrap_or(&RuleSeverity::Warning);
 
         let severity = match rule_severity {
@@ -367,7 +365,7 @@ mod tests {
                 },
             },
             severity: Some(severity),
-            code: Some(NumberOrString::String(violation.rule().alias.to_string())),
+            code: Some(NumberOrString::String(violation.rule().alias().to_string())),
             source: Some("quickmark".to_string()),
             message: violation.message().to_string(),
             related_information: None,

@@ -269,7 +269,7 @@ impl RuleLinter for MD013Linter {
 
 pub const MD013: Rule = Rule {
     id: "MD013",
-    alias: "line-length",
+    aliases: &["line-length"],
     tags: &["line_length"],
     description: "Line length",
     rule_type: RuleType::Line,

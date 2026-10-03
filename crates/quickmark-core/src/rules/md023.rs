@@ -208,7 +208,7 @@ impl RuleLinter for MD023Linter {
 
 pub const MD023: Rule = Rule {
     id: "MD023",
-    alias: "heading-start-left",
+    aliases: &["heading-start-left"],
     tags: &["headings", "spaces"],
     description: "Headings must start at the beginning of the line",
     rule_type: RuleType::Token,

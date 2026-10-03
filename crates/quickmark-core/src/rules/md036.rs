@@ -205,7 +205,7 @@ impl RuleLinter for MD036Linter {
 
 pub const MD036: Rule = Rule {
     id: "MD036",
-    alias: "no-emphasis-as-heading",
+    aliases: &["no-emphasis-as-heading"],
     tags: &["headings", "emphasis"],
     description: "Emphasis used instead of a heading",
     rule_type: RuleType::Token,
