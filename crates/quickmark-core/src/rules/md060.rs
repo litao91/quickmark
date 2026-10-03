@@ -51,6 +51,22 @@ struct PipeError<'a> {
     message: &'static str,
 }
 
+/// The display width of `text`, counted the way markdownlint's `string-width` counts it.
+///
+/// `unicode-width` gives a control character one column where `string-width` gives it none, and
+/// that is the only difference this has to correct: one stray C0 byte in a cell would otherwise
+/// shift every pipe after it and a row that is not aligned would look as if it were. Splitting
+/// rather than filtering keeps the measurement over contiguous text, so an emoji sequence still
+/// counts as one wide glyph.
+///
+/// `string-width` also strips ANSI escape sequences, which this does not — a cell holding one is
+/// measured five columns too wide for `\u{1b}[31m`.
+fn display_width(text: &str) -> usize {
+    text.split(|ch: char| ch.is_control())
+        .map(UnicodeWidthStr::width)
+        .sum()
+}
+
 pub(crate) struct MD060Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
@@ -76,7 +92,7 @@ impl MD060Linter {
     /// glyphs count double and two rows that look aligned really compare equal. This mirrors
     /// markdownlint, which uses `string-width` for the same reason.
     fn effective_column(&self, line: &str, byte_column: usize) -> usize {
-        line.get(..byte_column).map_or(0, UnicodeWidthStr::width)
+        line.get(..byte_column).map_or(0, display_width)
     }
 
     /// Every pipe after the header row that does not sit at one of the header's columns.
@@ -350,6 +366,62 @@ mod test {
     }
 
     // Every count below was checked against markdownlint-cli2 v0.23.3 (markdownlint v0.41.1).
+    /// The header and delimiter row the display-width cases below share: both put their last pipe
+    /// at display column fifty.
+    const WIDE_HEADER: &str = "| aaa   | bbb                                     |\n| ----- | --------------------------------------- |\n";
+
+    /// A body row holding `cell`, padded so its last pipe lands at display column fifty once the
+    /// cell's own width is allowed for.
+    fn wide_row(cell: &str, padding: usize) -> String {
+        format!("| ccc   | ddd{cell}{}|\n", " ".repeat(padding))
+    }
+
+    /// A pipe's column is its *display* column, so what a cell's characters are worth decides
+    /// whether the row lines up. Every table here is aligned and every count is markdownlint's.
+    #[test]
+    fn display_width_decides_alignment() {
+        // `string-width` skips control characters, combining marks and zero-width ones; a tab is
+        // "ignored by design". None of them shift the pipes after them.
+        for cell in [
+            "\u{5}", "\u{7f}", "\u{85}", "\u{200b}", "\u{ad}", "\u{301}", "\t",
+        ] {
+            let table = format!("{WIDE_HEADER}{}", wide_row(cell, 37));
+            assert_eq!(
+                0,
+                count(&table, TableColumnStyle::Aligned, false),
+                "cell {cell:?}"
+            );
+        }
+        // A CJK ideograph and an emoji are two columns each, so the padding is two shorter.
+        for cell in ["\u{4e2d}", "\u{1f600}"] {
+            let table = format!("{WIDE_HEADER}{}", wide_row(cell, 35));
+            assert_eq!(
+                0,
+                count(&table, TableColumnStyle::Aligned, false),
+                "cell {cell:?}"
+            );
+        }
+    }
+
+    /// One column short of aligned. `unicode-width` counts a control character as one column where
+    /// `string-width` counts none, so before the row was measured without it a stray C0 byte left
+    /// the row looking level with the header and nothing was reported.
+    #[test]
+    fn a_row_one_column_short_is_not_aligned() {
+        let table = format!("{WIDE_HEADER}{}", wide_row("\u{5}", 36));
+        assert_eq!(1, count(&table, TableColumnStyle::Aligned, false));
+        let table = format!("{WIDE_HEADER}{}", wide_row("\u{4e2d}", 34));
+        assert_eq!(1, count(&table, TableColumnStyle::Aligned, false));
+    }
+
+    /// `string-width` strips ANSI escape sequences before measuring and this does not, so a cell
+    /// holding one measures five columns too wide for `\u{1b}[31m` and an aligned row looks
+    /// misaligned. markdownlint reports nothing here.
+    #[test]
+    fn an_ansi_escape_in_a_cell_is_a_known_difference() {
+        let table = format!("{WIDE_HEADER}{}", wide_row("\u{1b}[31m", 37));
+        assert_eq!(1, count(&table, TableColumnStyle::Aligned, false));
+    }
 
     #[test]
     fn test_any_style_accepts_each_pure_style() {
