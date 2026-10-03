@@ -14,8 +14,10 @@ use crate::{
 /// [`in_label_attempt`], which is why this stops the walk rather than blanking the span.
 const UNSCANNED: &[&str] = &["link", "image"];
 
-/// Leaves whose contents are literal by construction, so a bracket in one opens no label.
-const OPAQUE: &[&str] = &["code_span", "math"];
+/// Leaves whose contents are literal by construction, so a bracket in one opens no label. `math` is
+/// not here: comrak's and micromark's pairings of `$` disagree, so the spans come from
+/// [`synth::inline_math_spans`] instead.
+const OPAQUE: &[&str] = &["code_span"];
 
 pub(crate) struct MD034Linter {
     context: Rc<Context>,
@@ -53,6 +55,7 @@ impl MD034Linter {
 
         let mut text = Vec::new();
         let mut opaque = Vec::new();
+        let mut comrak_math = Vec::new();
         let mut tags = Vec::new();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
@@ -62,6 +65,8 @@ impl MD034Linter {
             }
             if kind == "text" {
                 text.push((node.start_byte(), node.end_byte()));
+            } else if kind == "math" {
+                comrak_math.push((node.start_byte(), node.end_byte()));
             } else if OPAQUE.contains(&kind) {
                 opaque.push((node.start_byte(), node.end_byte()));
             } else if kind == "html_inline" {
@@ -73,15 +78,19 @@ impl MD034Linter {
                 }
             }
         }
-        text.sort_unstable();
         // The walk pops siblings in reverse, and tag pairing reads left to right.
         tags.sort_unstable_by_key(|tag| tag.start_byte());
         opaque.extend(html_tag_pairs(&tags, &source));
-        // micromark pairs bare `$` delimiters whatever the whitespace around them, so it forms math
-        // spans comrak's stricter `math_dollars` leaves as text, and a URL inside one is not bare. The
-        // spans comrak did find are already opaque, so their `$` cannot be taken for a delimiter.
+        // comrak's `math_dollars` follows pandoc, so it pairs `$` differently from micromark's math
+        // extension in both directions: it forms spans micromark would not, and misses ones it
+        // would. Take micromark's pairing as the truth — what it covers is literal, and what it
+        // leaves of a span comrak called math is text that still gets scanned.
         let math = synth::inline_math_spans(&source, root.start_byte(), root.end_byte(), &opaque);
+        for &(from, to) in &comrak_math {
+            text.extend(uncovered(from, to, &math));
+        }
         opaque.extend(math);
+        text.sort_unstable();
 
         let mut found = Vec::new();
         for (start, end) in text {
@@ -221,6 +230,25 @@ fn gfm_email_domain(bytes: &[u8], from: usize) -> Option<usize> {
         }
     }
     (dot && ends_in_letter).then_some(at)
+}
+
+/// The parts of `from..to` that none of the sorted `spans` covers.
+fn uncovered(from: usize, to: usize, spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut parts = Vec::new();
+    let mut at = from;
+    for &(start, end) in spans {
+        if end <= at || start >= to {
+            continue;
+        }
+        if start > at {
+            parts.push((at, start));
+        }
+        at = end;
+    }
+    if at < to {
+        parts.push((at, to));
+    }
+    parts
 }
 
 /// The spans between a matching pair of inline HTML tags.
@@ -526,6 +554,20 @@ mod test {
         ("$a$ https://x.com $b$\n", &[(1, 5, 13)]),
         ("\\$ https://x.com $\n", &[(1, 4, 13)]),
         ("$ https://x.com\n", &[(1, 3, 13)]),
+        // micromark pairs runs of `$`, and a run only closes one of its own length — a run of any
+        // other length is content and the search carries on past it. comrak's pandoc-shaped
+        // `math_dollars` pairs them differently, so the spans come from micromark's rule and what
+        // it leaves of a span comrak called math is scanned as text.
+        ("see $a$ https://x.com $b$\n", &[(1, 9, 13)]),
+        ("see $a$$b$ https://x.com\n", &[(1, 12, 13)]),
+        ("see $a$$$ https://x.com\n", &[(1, 11, 13)]),
+        ("see $$a$ https://x.com $b$$\n", &[]),
+        ("see $a$$ https://x.com $$b$\n", &[]),
+        ("see $ https://x.com $$ $\n", &[]),
+        // comrak reads `$(a $b curl https://x.com c$` as one math span because pandoc lets a `$`
+        // preceded by a non-space close it; micromark closes at the second `$` and leaves the URL
+        // bare.
+        ("see $(a $b curl https://x.com c$d\n", &[(1, 17, 13)]),
         // A URL whose scheme GFM does not autolink is text, and an address inside it is still an
         // address: `:` is not atext, so the local part starts after it.
         (
@@ -598,9 +640,10 @@ mod test {
     /// - `5https://x.com` is bare to markdownlint at 1:2 and is missed here, because linkify does
     ///   not report a URL glued to a single preceding digit. Two digits (`15https://x.com`) and a
     ///   date (`2025-05-15https://x.com/a`) both work.
-    /// - GFM lets an autolink path run over `[` and over `\`, so `https://x.com[a]` is one
-    ///   15-column URL to markdownlint and `https://x.org/a;\` a 17-column one; linkify stops at
-    ///   the bracket and at the backslash. Same start, so only the underline is shorter.
+    /// - GFM lets an autolink path run over `[`, over `\` and over `$`, so `https://x.com[a]` is
+    ///   one 15-column URL to markdownlint, `https://x.org/a;\` a 17-column one and
+    ///   `https://x.com$c` a 15-column one; linkify stops at each. Same start, so only the
+    ///   underline is shorter.
     #[test]
     fn known_differences_from_markdownlint() {
         // markdownlint: [(1, 2, 13)]
@@ -609,6 +652,8 @@ mod test {
         assert_eq!(vec![(1, 1, 13)], urls("https://x.com[a]\n"));
         // markdownlint: [(1, 5, 17)]
         assert_eq!(vec![(1, 5, 15)], urls("see https://x.org/a;\\\nmore\n"));
+        // markdownlint: [(1, 17, 15)]
+        assert_eq!(vec![(1, 17, 13)], urls("see $(a $b curl https://x.com$c\n"));
     }
 
     #[test]

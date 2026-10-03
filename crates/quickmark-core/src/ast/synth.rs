@@ -285,14 +285,17 @@ pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
 
 /// The `$…$` spans micromark's math extension forms over `source[from..to]`, as absolute byte ranges.
 ///
-/// micromark pairs bare unescaped `$` delimiters left to right and asks nothing of the whitespace
-/// around them, which is looser than comrak's `math_dollars`: comrak follows pandoc, needing the
-/// opening `$` followed by a non-space and the closing one preceded by a non-space. So `$ a $` is
-/// math for markdownlint and ordinary text for comrak, and a URL inside it is not a bare URL.
+/// micromark pairs *runs* of `$`, not individual ones, and asks nothing of the whitespace around
+/// them, which is looser than comrak's `math_dollars`: comrak follows pandoc, needing the opening
+/// `$` followed by a non-space and the closing one preceded by a non-space. So `$ a $` is math for
+/// markdownlint and ordinary text for comrak, and a URL inside it is not a bare URL.
 ///
-/// `claimed` holds the ranges already accounted for — code spans, and the math comrak did find —
-/// because a `$` inside one is literal and delimits nothing. An odd trailing delimiter pairs with
-/// nothing and produces no span.
+/// A run closes the one that opened it only when the two are the same length; a run of any other
+/// length is content and the search carries on past it, so `$a$$b$` is one span rather than two. An
+/// opening run nothing closes produces nothing at all.
+///
+/// `claimed` holds the ranges already accounted for — code spans, and any other span whose `$` is
+/// literal — because a `$` inside one delimits nothing.
 pub fn inline_math_spans(
     source: &str,
     from: usize,
@@ -301,21 +304,44 @@ pub fn inline_math_spans(
 ) -> Vec<(usize, usize)> {
     let bytes = source.as_bytes();
     let to = to.min(bytes.len());
-    if from >= to {
-        return Vec::new();
+    let literal = |at: usize| {
+        bytes[at] != b'$'
+            || escaped_dollar(bytes, at)
+            || claimed.iter().any(|&(start, end)| start <= at && at < end)
+    };
+
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut at = from.min(to);
+    while at < to {
+        if literal(at) {
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while end < to && !literal(end) {
+            end += 1;
+        }
+        runs.push((at, end));
+        at = end;
     }
-    let delimiters: Vec<usize> = (from..to)
-        .filter(|&at| bytes[at] == b'$')
-        .filter(|&at| !escaped_dollar(bytes, at))
-        .filter(|&at| !claimed.iter().any(|&(start, end)| start <= at && at < end))
-        .collect();
-    delimiters
-        .chunks(2)
-        .filter_map(|pair| match pair {
-            [open, close] => Some((*open, close + 1)),
-            _ => None,
-        })
-        .collect()
+
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < runs.len() {
+        let (open, open_end) = runs[index];
+        let closer = runs[index + 1..]
+            .iter()
+            .position(|&(start, end)| end - start == open_end - open);
+        match closer {
+            Some(offset) => {
+                spans.push((open, runs[index + 1 + offset].1));
+                index += 2 + offset;
+            }
+            // The attempt fails and the whole opening run is spent, so scanning resumes past it.
+            None => index += 1,
+        }
+    }
+    spans
 }
 
 /// Whether the `$` at `at` is preceded by an odd number of backslashes, which makes it literal.
@@ -1088,5 +1114,22 @@ mod tests {
         );
         // Nothing outside the range asked about is considered.
         assert!(inline_math_spans("$ a $", 0, 1, &[]).is_empty());
+    }
+
+    /// micromark's `sequenceClose` compares the closing run's length with the opening one and, when
+    /// they differ, re-marks the whole run as content and keeps looking. Pairing individual dollars
+    /// instead — which is what a `chunks(2)` over the delimiter list does — splits `$a$$b$` into two
+    /// spans that happen to cover the same bytes, and splits `$a$$$b$` into two that do not.
+    #[test]
+    fn inline_math_pairs_runs_not_individual_dollars() {
+        let spans = |source: &str| inline_math_spans(source, 0, source.len(), &[]);
+        // The run of two is content, so the single delimiters pair across it.
+        assert_eq!(vec![(0, 6)], spans("$a$$b$"));
+        assert_eq!(vec![(0, 7)], spans("$a$$$b$"));
+        // A run of two needs a run of two to close it; the singles after it pair with each other.
+        assert_eq!(vec![(3, 7)], spans("$$a$ b$"));
+        assert_eq!(vec![(0, 5)], spans("$$a$$"));
+        // Neither run is closed, so there is no math at all.
+        assert!(spans("$a$$b").is_empty());
     }
 }
