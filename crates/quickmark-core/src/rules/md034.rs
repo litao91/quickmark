@@ -31,6 +31,9 @@ impl MD034Linter {
         // back out.
         let mut finder = LinkFinder::new();
         finder.url_must_have_scheme(false);
+        // Emails come from [`gfm_emails`] instead. linkify's matcher is RFC-shaped and disagrees
+        // with GFM in both directions, so its emails are switched off rather than filtered.
+        finder.kinds(&[LinkKind::Url]);
         Self {
             context,
             violations: Vec::new(),
@@ -82,20 +85,40 @@ impl MD034Linter {
 
         let mut found = Vec::new();
         for (start, end) in text {
-            for link in self.finder.links(&source[start..end]) {
-                let url = start + link.start();
-                let url_end = start + link.end();
-                if is_bare(
-                    &source,
-                    root.start_byte(),
-                    url,
-                    url_end,
-                    link.as_str(),
-                    link.kind(),
-                    &opaque,
-                ) {
-                    found.push((url, url_end, link.as_str().to_string()));
+            let span = &source[start..end];
+            let mut candidates = Vec::new();
+            for link in self.finder.links(span) {
+                candidates.push((
+                    start + link.start(),
+                    start + link.end(),
+                    link.as_str().to_string(),
+                    LinkKind::Url,
+                ));
+            }
+            for (from, to) in gfm_emails(span) {
+                candidates.push((
+                    start + from,
+                    start + to,
+                    span[from..to].to_string(),
+                    LinkKind::Email,
+                ));
+            }
+            candidates.retain(|&(from, to, ref url, ref kind)| {
+                is_bare(&source, root.start_byte(), from, to, url, kind, &opaque)
+            });
+            // micromark tokenizes left to right and one accepted literal swallows whatever starts
+            // inside it, and it tries an email before a `www.` or protocol URL at the same
+            // position. So `https://u:p@x.com` is one URL and not also an email, `www.a@b.com/c@d.com`
+            // is the email `www.a@b.com` and not the longer `www.` URL, and `a@b.com@c.org` is one
+            // email.
+            candidates.sort_by_key(|&(from, _, _, ref kind)| (from, *kind != LinkKind::Email));
+            let mut taken: Vec<(usize, usize)> = Vec::new();
+            for (from, to, url, _) in candidates {
+                if taken.iter().any(|&(kept, end)| kept <= from && from < end) {
+                    continue;
                 }
+                taken.push((from, to));
+                found.push((from, to, url));
             }
         }
 
@@ -129,6 +152,75 @@ pub(crate) fn is_gfm_autolink(url: &str) -> bool {
         url.get(..scheme.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
     })
+}
+
+/// The email autolink literals in a run of text, with GFM's own boundaries.
+///
+/// This is `micromark-extension-gfm-autolink-literal`'s `tokenizeEmailAutolink`: an atext run, an
+/// `@`, then a domain. linkify's email matcher is RFC-shaped instead and disagrees in both
+/// directions — it wants a two-letter alphabetic TLD, so it misses `a@b.c` and `a@b.1x`, and it
+/// trims a trailing `-` or `_`, so it reports `a@b.com` for `a@b.com-` where micromark consumes the
+/// `-` and then rejects the whole literal.
+fn gfm_emails(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    for (at_sign, &byte) in bytes.iter().enumerate() {
+        if byte != b'@' {
+            continue;
+        }
+        let mut local = at_sign;
+        while local > 0 && is_gfm_atext(bytes[local - 1]) {
+            local -= 1;
+        }
+        // The run may not be empty, and `previousEmail` refuses to start one after a slash or after
+        // another atext character — which is what makes the `garyli@host` in
+        // `ssh://garyli@host/path` text rather than an address.
+        if local == at_sign || (local > 0 && !can_start_email(bytes[local - 1])) {
+            continue;
+        }
+        if let Some(domain_end) = gfm_email_domain(bytes, at_sign + 1) {
+            found.push((local, domain_end));
+        }
+    }
+    found
+}
+
+/// GFM's atext: ASCII alphanumerics plus `+`, `-`, `.` and `_`. Notably narrower than RFC 5322's —
+/// `!`, `#`, `%`, `*`, `/` and `?` all end a local part, so `gary!li@example.com` is the address
+/// `li@example.com`.
+fn is_gfm_atext(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.' | b'_')
+}
+
+/// The character before an email's local part may be neither a slash nor atext.
+fn can_start_email(previous: u8) -> bool {
+    previous != b'/' && !is_gfm_atext(previous)
+}
+
+/// The end of a domain starting at `from`, or `None` when what is there is not one GFM accepts.
+///
+/// `emailDomainAfter` wants three things: a non-empty domain, at least one dot, and an ASCII letter
+/// as the last character. The dot has to be one an alphanumeric follows, so a trailing `.` ends the
+/// domain before itself — `a@b.com.` is the 7-character `a@b.com`.
+fn gfm_email_domain(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut at = from;
+    let mut dot = false;
+    let mut ends_in_letter = false;
+    while let Some(&byte) = bytes.get(at) {
+        if byte == b'.' {
+            if !bytes.get(at + 1).is_some_and(u8::is_ascii_alphanumeric) {
+                break;
+            }
+            dot = true;
+            at += 1;
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            ends_in_letter = byte.is_ascii_alphabetic();
+            at += 1;
+        } else {
+            break;
+        }
+    }
+    (dot && ends_in_letter).then_some(at)
 }
 
 /// The spans between a matching pair of inline HTML tags.
@@ -236,18 +328,18 @@ fn can_start_here(bytes: &[u8], start: usize, url: &str, kind: &LinkKind) -> boo
     let Some(&previous) = start.checked_sub(1).and_then(|before| bytes.get(before)) else {
         return true;
     };
-    let scheme_less = url
-        .get(..4)
-        .is_some_and(|head| head.eq_ignore_ascii_case("www."));
+    // `www.` only starts a URL. An email whose local part happens to begin `www.` follows the email
+    // rule instead, so `:www.a@b.com` is bare while `:www.a.b.com` is not.
+    let scheme_less = *kind == LinkKind::Url
+        && url
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case("www."));
     if scheme_less {
         return matches!(previous, b'(' | b'*' | b'_' | b'[' | b']' | b'~')
             || previous.is_ascii_whitespace();
     }
     match kind {
-        LinkKind::Email => {
-            !matches!(previous, b'/' | b'+' | b'-' | b'.' | b'_')
-                && !previous.is_ascii_alphanumeric()
-        }
+        LinkKind::Email => can_start_email(previous),
         _ => !previous.is_ascii_alphabetic(),
     }
 }
@@ -434,6 +526,63 @@ mod test {
         ("$a$ https://x.com $b$\n", &[(1, 5, 13)]),
         ("\\$ https://x.com $\n", &[(1, 4, 13)]),
         ("$ https://x.com\n", &[(1, 3, 13)]),
+        // A URL whose scheme GFM does not autolink is text, and an address inside it is still an
+        // address: `:` is not atext, so the local part starts after it.
+        (
+            "oss://key:secret@oss-cn-shanghai.aliyuncs.com/bucket\n",
+            &[(1, 11, 35)],
+        ),
+        (
+            "see oss://key:secret@oss-cn-shanghai.aliyuncs.com/bucket here\n",
+            &[(1, 15, 35)],
+        ),
+        ("ftp://user:pass@host.example.com/path\n", &[(1, 12, 21)]),
+        ("git://a:b@host.example.com/x\n", &[(1, 9, 18)]),
+        // GFM's email boundaries, which are not RFC 5322's. One letter is a whole TLD, a label may
+        // start with a digit, `-` or `_`, and a trailing dot is text rather than part of the
+        // address — but the domain must hold a dot and must end in an ASCII letter, so neither an
+        // IPv4 literal nor `x1` is one.
+        ("see garyli@example.4c here\n", &[(1, 5, 17)]),
+        ("see garyli@example.c0m here\n", &[(1, 5, 18)]),
+        ("see garyli@4.example.com here\n", &[(1, 5, 20)]),
+        ("see garyli@1.2.3.4.5 here\n", &[]),
+        ("see garyli@192.168.31.4 here\n", &[]),
+        ("see garyli@-example.com here\n", &[(1, 5, 19)]),
+        ("see garyli@example.com- here\n", &[]),
+        ("see garyli@example.com_ here\n", &[]),
+        ("see garyli@example.a-b here\n", &[(1, 5, 18)]),
+        ("see garyli@example.a_b here\n", &[(1, 5, 18)]),
+        ("see garyli@example_.com here\n", &[(1, 5, 19)]),
+        ("see garyli@example.com. here\n", &[(1, 5, 18)]),
+        ("see garyli@host.example.c here\n", &[(1, 5, 21)]),
+        ("see garyli@e.x here\n", &[(1, 5, 10)]),
+        ("see garyli@example.x1 here\n", &[]),
+        ("see garyli@example.1x here\n", &[(1, 5, 17)]),
+        ("see garyli@localhost here\n", &[]),
+        ("see garyli@.c here\n", &[(1, 5, 9)]),
+        ("see a.b.c@example.com here\n", &[(1, 5, 17)]),
+        ("see garyli@host.example.com/path here\n", &[(1, 5, 23)]),
+        ("see garyli+tag@example.com here\n", &[(1, 5, 22)]),
+        // `!` is not atext, so the local part is only what follows it.
+        ("see gary!li@example.com here\n", &[(1, 10, 14)]),
+        ("mailto:garyli@example.com here\n", &[(1, 8, 18)]),
+        // An atext run may not start after a slash, which is what keeps the address out of a
+        // `ssh://` URL.
+        ("see ssh://garyli@host.example.com here\n", &[]),
+        (
+            "- ssh://garyli@192.168.31.4:2222/litao91/adb_tasks.git\n",
+            &[],
+        ),
+        // A local part that begins `www.` follows the email rule, not the `www.` URL rule.
+        ("see www.a@b.com here\n", &[(1, 5, 11)]),
+        ("see :www.a@b.com here\n", &[(1, 6, 11)]),
+        ("see :www.a.b.com here\n", &[]),
+        // One accepted literal swallows whatever would start inside it, and at one position an
+        // email is tried before a URL.
+        ("see https://user:pass@x.com here\n", &[(1, 5, 23)]),
+        ("see HTTPS://USER:PASS@X.COM here\n", &[(1, 5, 23)]),
+        ("see www.a@b.com/c@d.com here\n", &[(1, 5, 11)]),
+        ("see garyli@example.com@garyli.org here\n", &[(1, 5, 18)]),
     ];
 
     #[test]
@@ -443,14 +592,12 @@ mod test {
         }
     }
 
-    /// Three measured gaps, each a difference between linkify and micromark rather than a mistake
+    /// Two measured gaps, each a difference between linkify and micromark rather than a mistake
     /// in the walk:
     ///
     /// - `5https://x.com` is bare to markdownlint at 1:2 and is missed here, because linkify does
     ///   not report a URL glued to a single preceding digit. Two digits (`15https://x.com`) and a
     ///   date (`2025-05-15https://x.com/a`) both work.
-    /// - `oss://user:pass@host/path` holds an email micromark autolinks at the `:` and linkify
-    ///   swallows into the surrounding `oss://` URL, which is not a GFM scheme and so is dropped.
     /// - GFM lets an autolink path run over `[` and over `\`, so `https://x.com[a]` is one
     ///   15-column URL to markdownlint and `https://x.org/a;\` a 17-column one; linkify stops at
     ///   the bracket and at the backslash. Same start, so only the underline is shorter.
@@ -458,11 +605,6 @@ mod test {
     fn known_differences_from_markdownlint() {
         // markdownlint: [(1, 2, 13)]
         assert_eq!(0, urls("5https://x.com\n").len());
-        // markdownlint: [(1, 22, 40)] for the email inside the `oss://` URL
-        assert_eq!(
-            0,
-            urls("oss://key:secret@oss-cn-shanghai.aliyuncs.com/bucket\n").len()
-        );
         // markdownlint: [(1, 1, 15)]
         assert_eq!(vec![(1, 1, 13)], urls("https://x.com[a]\n"));
         // markdownlint: [(1, 5, 17)]
