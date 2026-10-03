@@ -8,7 +8,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{Rule, RuleType},
+    rules::{default_on, Rule, RuleType},
 };
 
 // MD044-specific configuration types
@@ -18,14 +18,10 @@ pub struct MD044ProperNamesTable {
     pub names: Vec<String>,
     /// markdownlint scans code and HTML unless it is explicitly told not to, which `bool::default`
     /// has the other way round.
-    #[serde(default = "on")]
+    #[serde(default = "default_on")]
     pub code_blocks: bool,
-    #[serde(default = "on")]
+    #[serde(default = "default_on")]
     pub html_elements: bool,
-}
-
-fn on() -> bool {
-    true
 }
 
 impl Default for MD044ProperNamesTable {

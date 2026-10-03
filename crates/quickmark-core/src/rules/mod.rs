@@ -119,6 +119,63 @@ pub(crate) fn ellipsify(text: &str, start: bool, end: bool) -> String {
     }
 }
 
+/// markdownlint reads an absent setting as its documented default, which for the flags that turn a
+/// style or a scope on is the opposite of `bool::default`.
+pub(crate) fn default_on() -> bool {
+    true
+}
+
+/// A bracketed group's contents, with `to` the index of the closing `]` rather than one past it.
+#[derive(Clone, Copy)]
+pub(crate) struct Label {
+    pub from: usize,
+    pub to: usize,
+}
+
+/// The label of a link or image — what sits between the `[` the node starts at and its matching `]`.
+/// Counted rather than taken from the node's children, because a label of nothing but whitespace has
+/// no children and one holding a code span has several.
+pub(crate) fn label_span(node: crate::ast::Node, source: &str) -> Option<Label> {
+    let bytes = source.as_bytes();
+    let mut open = node.start_byte();
+    if bytes.get(open) == Some(&b'!') {
+        open += 1;
+    }
+    if bytes.get(open) != Some(&b'[') {
+        return None;
+    }
+    let close = closing_bracket(bytes, open)?;
+    Some(Label {
+        from: open + 1,
+        to: close,
+    })
+}
+
+/// The index of the `]` closing the `[` at `open`, counting nested brackets and skipping whatever a
+/// backslash escapes.
+pub(crate) fn closing_bracket(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut at = open;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'[' => {
+                depth += 1;
+                at += 1;
+            }
+            b']' => {
+                depth -= 1;
+                at += 1;
+                if depth == 0 {
+                    return Some(at - 1);
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    None
+}
+
 #[derive(Debug)]
 pub struct Rule {
     pub id: &'static str,

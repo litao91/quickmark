@@ -994,7 +994,9 @@ impl<'a> Builder<'a> {
         // Taken before `kind` because both borrow the node's value and the borrow has to end before
         // `add` can take `&mut self`.
         let target = match &node.data().value {
-            NodeValue::Link(link) => Some(LinkTarget {
+            // An image carries the same payload as a link, and MD054 needs an image reference's
+            // destination to tell a resolved one from a definition with none.
+            NodeValue::Link(link) | NodeValue::Image(link) => Some(LinkTarget {
                 url: link.url.clone(),
                 title: link.title.clone(),
             }),

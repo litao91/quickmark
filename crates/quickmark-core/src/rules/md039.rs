@@ -4,7 +4,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{Rule, RuleType},
+    rules::{label_span, Rule, RuleType},
 };
 
 /// MD039 - Spaces inside link text
@@ -133,45 +133,6 @@ struct Placed {
     column: usize,
     width: usize,
     trailing: bool,
-}
-
-/// The byte range of a link's label — what sits between the `[` the node starts at and its matching
-/// `]`. Counted rather than taken from the node's children, because a label of nothing but
-/// whitespace has no children and one holding a code span has several.
-fn label_span(link: Node, source: &str) -> Option<Label> {
-    let bytes = source.as_bytes();
-    let from = link.start_byte();
-    if bytes.get(from) != Some(&b'[') {
-        return None;
-    }
-    let mut depth = 0usize;
-    let mut at = from;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\\' => at += 2,
-            b'[' => {
-                depth += 1;
-                at += 1;
-            }
-            b']' => {
-                depth -= 1;
-                at += 1;
-                if depth == 0 {
-                    return Some(Label {
-                        from: from + 1,
-                        to: at - 1,
-                    });
-                }
-            }
-            _ => at += 1,
-        }
-    }
-    None
-}
-
-struct Label {
-    from: usize,
-    to: usize,
 }
 
 /// How many whitespace characters that are neither `\r` nor `\n` sit at the start (`leading`) or the
