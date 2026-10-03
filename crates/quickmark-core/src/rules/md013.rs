@@ -158,66 +158,33 @@ impl MD013Linter {
         false
     }
 
-    fn has_no_spaces_beyond_limit(&self, line: &str, limit: usize) -> bool {
-        if line.len() <= limit {
-            return false;
-        }
-
-        // Use character-aware slicing to avoid UTF-8 boundary panics
-        // Find the character boundary at or after the limit position
-        let mut char_boundary = limit;
-        while char_boundary < line.len() && !line.is_char_boundary(char_boundary) {
-            char_boundary += 1;
-        }
-
-        // If we've gone beyond the string length, there's nothing beyond the limit
-        if char_boundary >= line.len() {
-            return true; // No characters beyond limit, so no spaces
-        }
-
-        let beyond_limit = &line[char_boundary..];
-        !beyond_limit.contains(' ')
-    }
-
     fn should_violate_line(&self, line: &str, limit: usize) -> bool {
         let settings = &self.context.config.linters.settings.line_length;
 
-        // Check if line exceeds limit
-        if line.len() <= limit {
+        if self.is_link_reference_definition(line) {
             return false;
         }
 
-        // Apply exceptions
-        if self.is_link_reference_definition(line) {
-            return false;
+        let length = utf16_len(line);
+
+        // Strict mode measures the line as it stands and takes no further exception.
+        if settings.strict {
+            return length > limit;
         }
 
         if self.is_standalone_link_or_image(line) {
             return false;
         }
 
-        // Strict mode: all lines beyond limit are violations
-        if settings.strict {
-            return true;
-        }
-
-        // Stern mode: more aggressive than default, but allows lines without spaces beyond limit
+        // Stern mode measures the line as it stands too, but spares one there is nowhere to wrap.
         if settings.stern {
-            // In stern mode, allow lines without spaces beyond limit (like default)
-            // but be more strict about other cases
-            if self.has_no_spaces_beyond_limit(line, limit) {
-                return false;
-            }
-            // If there are spaces beyond limit, it's a violation in stern mode
-            return true;
+            return length > limit && !not_wrappable(line);
         }
 
-        // Default mode: allow lines without spaces beyond the limit
-        if self.has_no_spaces_beyond_limit(line, limit) {
-            return false;
-        }
-
-        true
+        // The default mode measures the line with its last run of non-whitespace folded to a single
+        // character, and then reports nothing when the real length equals the limit: markdownlint
+        // routes this through `addErrorDetailIf`, which stays quiet when expected equals actual.
+        folded_len(line) > limit && length != limit
     }
 
     fn create_violation_for_line(
@@ -226,13 +193,17 @@ impl MD013Linter {
         line_number: usize,
         limit: usize,
     ) -> RuleViolation {
+        // markdownlint points at the column just past the limit and runs to the end of the line,
+        // counting both in UTF-16 units; `byte_at_unit` translates the start into the bytes this
+        // range reports.
+        let column = byte_at_unit(line, limit);
         RuleViolation::new(
             &MD013,
             format!(
                 "{} [Expected: {}; Actual: {}]",
                 MD013.description,
                 limit,
-                line.len()
+                utf16_len(line)
             ),
             self.context.file_path.clone(),
             range_from_node_range(&crate::ast::NodeRange {
@@ -240,7 +211,7 @@ impl MD013Linter {
                 end_byte: line.len(),
                 start_point: crate::ast::Point {
                     row: line_number,
-                    column: 0,
+                    column,
                 },
                 end_point: crate::ast::Point {
                     row: line_number,
@@ -249,6 +220,64 @@ impl MD013Linter {
             }),
         )
     }
+}
+
+/// JavaScript's `String.length`, which is what markdownlint measures every MD013 length in: UTF-16
+/// code units, so a character outside the basic multilingual plane counts twice.
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// JavaScript's `\s`, which markdownlint's `/\S*$/u` and `notWrappableRe` are written against. It
+/// differs from Rust's `char::is_whitespace` on two characters: U+0085 is whitespace there and not
+/// here, and U+FEFF is whitespace here and not there.
+fn is_js_whitespace(character: char) -> bool {
+    (character.is_whitespace() && character != '\u{85}') || character == '\u{feff}'
+}
+
+/// markdownlint's `line.replace(/\S*$/u, "#").length`: the line with its last run of non-whitespace
+/// folded to a single character. That is how "the last word may hang over the limit as long as it
+/// starts inside it" works — `aaa bbb` against a limit of four becomes `aaa #` and is still too long,
+/// while one unbreakable run becomes `#` and is not. A line ending in whitespace has an empty run, so
+/// it grows by one.
+fn folded_len(line: &str) -> usize {
+    let run: usize = line
+        .chars()
+        .rev()
+        .take_while(|&character| !is_js_whitespace(character))
+        .map(char::len_utf16)
+        .sum();
+    utf16_len(line) - run + 1
+}
+
+/// markdownlint's `notWrappableRe`, `/^(?:[#>\s]*\s)?\S*$/u`, which stern mode uses to spare a line
+/// there is nowhere to wrap. The group can only end at the line's last whitespace, because `\S*$`
+/// forbids another one after it, so the question is whether everything before that last whitespace is
+/// heading markers, quote markers or whitespace — or whether the line has no whitespace at all.
+fn not_wrappable(line: &str) -> bool {
+    match line
+        .char_indices()
+        .rev()
+        .find(|&(_, character)| is_js_whitespace(character))
+    {
+        // No whitespace at all: the whole line is one unbreakable run.
+        None => true,
+        Some((last, _)) => line[..last]
+            .chars()
+            .all(|character| character == '#' || character == '>' || is_js_whitespace(character)),
+    }
+}
+
+/// The byte offset of a UTF-16 code-unit index, clamped to the line.
+fn byte_at_unit(line: &str, units: usize) -> usize {
+    let mut seen = 0;
+    for (offset, character) in line.char_indices() {
+        if seen >= units {
+            return offset;
+        }
+        seen += character.len_utf16();
+    }
+    line.len()
 }
 
 impl RuleLinter for MD013Linter {
@@ -443,21 +472,24 @@ mod test {
         assert_eq!(1, violations.len()); // Should violate in stern mode
     }
 
+    /// Stern mode measures the line as it stands, so a long final word no longer saves it — only a
+    /// line `notWrappableRe` matches does, and this one has prose before its URL. Measured against
+    /// markdownlint-cli2 v0.23.3, which reports `Actual: 123`.
     #[test]
-    fn test_stern_mode_without_spaces_beyond_limit() {
+    fn test_stern_mode_reports_a_long_trailing_word() {
         let config = MD013LineLengthTable {
             stern: true,
             ..MD013LineLengthTable::default()
         };
 
-        // Line without spaces beyond limit - should NOT violate in stern mode
         let input = "This line has exactly eighty characters and then continues without spaces: https://example.com/very-long-url-without-spaces";
 
         let full_config = test_config_with_line_length(config);
         let mut linter =
             MultiRuleLinter::new_for_document(PathBuf::from("test.md"), full_config, input);
         let violations = linter.analyze();
-        assert_eq!(0, violations.len()); // Should NOT violate in stern mode
+        assert_eq!(1, violations.len());
+        assert!(violations[0].message().contains("Actual: 123"));
     }
 
     #[test]
@@ -505,7 +537,7 @@ mod test {
         }
         case1.push_str(" spaces"); // Add spaces beyond limit
 
-        // Case 2: Line without spaces beyond limit - only strict mode should catch this
+        // Case 2: a long final word, which the default mode folds away but stern and strict do not
         let case2 = "This line has exactly eighty characters and then continues without spaces: https://example.com/url".to_string();
 
         // Case 3: Line within limit - no mode should catch this
@@ -513,7 +545,7 @@ mod test {
 
         let test_cases = vec![
             (&case1, true, true, true),    // Has spaces beyond limit
-            (&case2, false, false, true),  // No spaces beyond limit
+            (&case2, false, true, true),   // Long final word, prose before it
             (&case3, false, false, false), // Within limit
         ];
 
@@ -607,6 +639,122 @@ mod test {
         assert!(violations
             .iter()
             .all(|violation| violation.message().contains("Expected: 20")));
+    }
+
+    /// Stern mode spares a line markdownlint's `notWrappableRe` matches — an optional run of heading
+    /// markers, quote markers and whitespace closed by one space, then nothing but non-whitespace —
+    /// because there is nowhere to wrap it. Strict mode spares nothing. Every expectation is a
+    /// markdownlint-cli2 v0.23.3 measurement at `line_length = 20`.
+    #[test]
+    fn stern_spares_a_line_there_is_nowhere_to_wrap() {
+        fn reported(input: &str, stern: bool, strict: bool) -> Vec<usize> {
+            let config = test_config_with_line_length(MD013LineLengthTable {
+                line_length: 20,
+                stern,
+                strict,
+                ..MD013LineLengthTable::default()
+            });
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+            linter
+                .analyze()
+                .iter()
+                .map(|violation| violation.location().range.start.line + 1)
+                .collect()
+        }
+
+        let run = "a".repeat(40);
+        let unwrappable = [
+            format!("# {run}\n"),
+            format!("> {run}\n"),
+            format!("###   {run}\n"),
+            format!("  {run}\n"),
+            format!("{run}aaaaa\n"),
+        ];
+        let wrappable = format!("word {run}\n");
+        let both = || unwrappable.iter().chain(std::iter::once(&wrappable));
+
+        // The default mode folds the last run away, so none of these is over the limit.
+        for input in both() {
+            assert!(reported(input, false, false).is_empty(), "{input:?}");
+        }
+        // Stern measures the line as it stands but spares the ones it cannot wrap.
+        for input in &unwrappable {
+            assert!(reported(input, true, false).is_empty(), "{input:?}");
+        }
+        assert_eq!(vec![1], reported(&wrappable, true, false));
+        // Strict spares nothing.
+        for input in both() {
+            assert_eq!(vec![1], reported(input, false, true), "{input:?}");
+        }
+    }
+
+    /// The report starts just past the limit. markdownlint counts that column in UTF-16 units and
+    /// quickmark's ranges count bytes, as every other rule's do, so the two agree on ASCII and differ
+    /// on a line of multi-byte characters by exactly the width those characters add.
+    #[test]
+    fn a_report_starts_just_past_the_limit() {
+        fn column(input: &str) -> usize {
+            let config = test_config_with_line_length(MD013LineLengthTable {
+                line_length: 20,
+                ..MD013LineLengthTable::default()
+            });
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+            let violations = linter.analyze();
+            assert_eq!(1, violations.len(), "{input:?}");
+            violations[0].location().range.start.character
+        }
+
+        assert_eq!(20, column("aaa bbb ccc ddd eee fff\n"));
+        // Twenty UTF-16 units of `日本語 ` is five groups of ten bytes.
+        let cjk = "日本語 ".repeat(8) + "\n";
+        assert_eq!(50, column(&cjk));
+    }
+    /// Outside strict and stern mode markdownlint compares the line with its last run of
+    /// non-whitespace folded to a single character, and it measures every length in UTF-16 code
+    /// units. Every expectation is a markdownlint-cli2 v0.23.3 measurement at `line_length = 20`.
+    #[test]
+    fn a_long_last_word_is_folded_before_the_limit_is_applied() {
+        let table = MD013LineLengthTable {
+            line_length: 20,
+            ..MD013LineLengthTable::default()
+        };
+        let cases: Vec<(String, Option<usize>)> = vec![
+            // Folds to `aaa bbb ccc ddd eee #`, which is still over the limit.
+            ("aaa bbb ccc ddd eee fff\n".to_string(), Some(23)),
+            ("aaa bbb ccc ddd eee ff\n".to_string(), Some(22)),
+            // Folds to 21, but the line's own length is exactly the limit and `addErrorDetailIf`
+            // stays quiet when expected equals actual.
+            ("aaa bbb ccc ddd eee \n".to_string(), None),
+            ("aaaaaaaaaaaaaaaaaaaa bbb\n".to_string(), Some(24)),
+            // One unbreakable run folds to `#`, so there is nowhere to wrap and nothing to report.
+            ("aaaaaaaaaaaaaaaaaaaabbbbb\n".to_string(), None),
+            // 32 UTF-16 units in 80 bytes; what gets reported is the units.
+            (("日本語 ".repeat(8)) + "\n", Some(32)),
+            // An astral character is two units, so 45 units in 75 bytes.
+            (("😀 ".repeat(15)) + "\n", Some(45)),
+        ];
+
+        for (input, actual) in cases {
+            let config = test_config_with_line_length(table.clone());
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, &input);
+            let violations = linter.analyze();
+            match actual {
+                None => assert!(violations.is_empty(), "{input:?}"),
+                Some(actual) => {
+                    assert_eq!(1, violations.len(), "{input:?}");
+                    assert!(
+                        violations[0]
+                            .message()
+                            .contains(&format!("Expected: 20; Actual: {actual}")),
+                        "{input:?}: {}",
+                        violations[0].message()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
