@@ -4,7 +4,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{Rule, RuleType},
+    rules::{is_blank_line, Rule, RuleType},
 };
 
 /// MD058 - Tables should be surrounded by blank lines
@@ -39,35 +39,24 @@ impl MD058Linter {
 
         let actual_end_line = last_row.end_position().row;
 
-        // Check for a blank line above the table if it's not at the document start.
-        if start_line > 0 {
-            // A blank line is required only if there is non-blank content somewhere above the table.
-            let has_content_above = (0..start_line).any(|i| !lines[i].trim().is_empty());
-
-            if has_content_above && !lines[start_line - 1].trim().is_empty() {
-                self.violations.push(RuleViolation::new(
-                    &MD058,
-                    format!("{} [Above]", MD058.description),
-                    self.context.file_path.clone(),
-                    range_from_node_range(&table_node.range()),
-                ));
-            }
+        // markdownlint looks at the single line on each side and nothing else: a table at either
+        // end of the document reads a line that is not there, which is blank.
+        if start_line > 0 && !is_blank_line(&lines[start_line - 1]) {
+            self.violations.push(RuleViolation::new(
+                &MD058,
+                format!("{} [Above]", MD058.description),
+                self.context.file_path.clone(),
+                range_from_node_range(&table_node.range()),
+            ));
         }
 
-        // Check for a blank line below the table if it's not at the document end.
-        if actual_end_line + 1 < lines.len() {
-            // A blank line is required only if there is non-blank content somewhere below the table.
-            let has_content_below =
-                ((actual_end_line + 1)..lines.len()).any(|i| !lines[i].trim().is_empty());
-
-            if has_content_below && !lines[actual_end_line + 1].trim().is_empty() {
-                self.violations.push(RuleViolation::new(
-                    &MD058,
-                    format!("{} [Below]", MD058.description),
-                    self.context.file_path.clone(),
-                    range_from_node_range(&table_node.range()),
-                ));
-            }
+        if actual_end_line + 1 < lines.len() && !is_blank_line(&lines[actual_end_line + 1]) {
+            self.violations.push(RuleViolation::new(
+                &MD058,
+                format!("{} [Below]", MD058.description),
+                self.context.file_path.clone(),
+                range_from_node_range(&table_node.range()),
+            ));
         }
     }
 }
@@ -304,5 +293,36 @@ Final text"#;
         let violations = linter.analyze();
         // Should not violate - no actual content above or below
         assert_eq!(0, violations.len());
+    }
+
+    /// markdownlint asks `isBlankLine` of the one line on each side and looks at nothing else, so a
+    /// line of block quote markers or an HTML comment separates a table as well as an empty one.
+    /// Every expectation is a markdownlint-cli2 v0.23.3 measurement.
+    #[test]
+    fn quote_markers_and_comments_count_as_blank() {
+        fn sides(input: &str) -> Vec<&'static str> {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|violation| violation.rule().id == "MD058")
+                .map(|violation| {
+                    if violation.message().contains("[Above]") {
+                        "Above"
+                    } else {
+                        "Below"
+                    }
+                })
+                .collect()
+        }
+
+        assert!(sides("<!-- c -->\n| a |\n| - |\n| b |\n").is_empty());
+        assert!(sides("| a |\n| - |\n| b |\n<!-- c -->\n").is_empty());
+        assert_eq!(vec!["Above"], sides("text\n| a |\n| - |\n"));
+        // A line with no pipe is absorbed as a one-cell row, so there is nothing below the table.
+        assert!(sides("| a |\n| - |\n| b |\ntext\n").is_empty());
+        assert!(sides(">\n> | a |\n> | - |\n> | b |\n").is_empty());
+        assert!(sides("| a |\n| - |\n| b |\n>\n").is_empty());
     }
 }

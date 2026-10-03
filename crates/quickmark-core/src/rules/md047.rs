@@ -4,7 +4,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    rules::{is_blank_line, Context, Rule, RuleLinter, RuleType},
 };
 
 /// MD047 Single Trailing Newline Rule Linter
@@ -36,40 +36,9 @@ impl MD047Linter {
         let last_line_index = lines.len() - 1;
         let last_line = &lines[last_line_index];
 
-        if !self.is_blank_line(last_line) {
+        if !is_blank_line(last_line) {
             let violation = self.create_violation(last_line_index, last_line);
             self.violations.push(violation);
-        }
-    }
-
-    /// Check if a line is "blank" according to markdownlint's logic.
-    /// A line is blank if it's empty or consists of only whitespace,
-    /// blockquote markers (`>`), or HTML comments (`<!-- ... -->`).
-    /// This implementation is optimized to avoid string allocations.
-    fn is_blank_line(&self, mut line: &str) -> bool {
-        loop {
-            line = line.trim_start(); // Skips leading whitespace
-
-            if line.is_empty() {
-                return true;
-            }
-
-            if line.starts_with('>') {
-                line = &line[1..];
-                continue;
-            }
-
-            if line.starts_with("<!--") {
-                if let Some(end_index) = line.find("-->") {
-                    line = &line[end_index + 3..];
-                    continue;
-                }
-                // Unmatched "<!--" means the rest of the line is a comment
-                return true;
-            }
-
-            // Anything else is considered content
-            return false;
         }
     }
 
@@ -265,5 +234,29 @@ mod test {
         assert_eq!("MD047", violation.rule().id);
         // Should point to the end of the last line
         assert_eq!(2, violation.location().range.start.line); // 0-indexed, so line 2 = third line
+    }
+
+    /// markdownlint asks `isBlankLine` of the last line, which strips HTML comments and block quote
+    /// markers before deciding. Every count is a markdownlint-cli2 v0.23.3 measurement.
+    #[test]
+    fn matches_markdownlint_on_the_last_line() {
+        fn reports(input: &str) -> usize {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|violation| violation.rule().id == "MD047")
+                .count()
+        }
+
+        assert_eq!(1, reports("text"));
+        assert_eq!(0, reports("text\n"));
+        assert_eq!(0, reports("<!-- c -->"));
+        assert_eq!(1, reports("text <!-- c -->"));
+        assert_eq!(0, reports(">"));
+        assert_eq!(0, reports(">>"));
+        // An unmatched `-->` is stripped too, which leaves nothing on the line.
+        assert_eq!(0, reports("x -->"));
     }
 }

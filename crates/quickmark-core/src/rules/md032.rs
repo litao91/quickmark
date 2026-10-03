@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::{Rule, RuleType};
+use super::{is_blank_line, Rule, RuleType};
 
 // Pre-computed violation messages to avoid format! allocations
 const MISSING_BLANK_BEFORE: &str =
@@ -24,17 +24,10 @@ impl MD032Linter {
         }
     }
 
-    /// markdownlint's `isBlankLine`. A row the document does not have is blank, which is what keeps
-    /// a list at either end of the file from reporting. Block quote markers and HTML comments are
-    /// blank too: `>` alone separates two quotes without being content, and a comment is invisible.
+    /// A row the document does not have is blank, which is what keeps a list at either end of the
+    /// file from reporting.
     fn is_blank(row: usize, lines: &[String]) -> bool {
-        let Some(line) = lines.get(row) else {
-            return true;
-        };
-        if line.trim().is_empty() {
-            return true;
-        }
-        without_comments(line).replace('>', "").trim().is_empty()
+        lines.get(row).is_none_or(|line| is_blank_line(line))
     }
 
     /// Whether a list is one markdownlint looks at. It descends into every token except lists and
@@ -122,27 +115,6 @@ impl MD032Linter {
                 end_point: Point { row, column: width },
             }),
         ));
-    }
-}
-
-/// The line with every complete HTML comment cut out, mirroring markdownlint's `removeComments`. An
-/// unterminated `<!--` swallows the rest of the line and an unmatched `-->` the part before it,
-/// both of which leave whatever is outside.
-fn without_comments(line: &str) -> String {
-    let mut out = String::from(line);
-    loop {
-        let start = out.find("<!--");
-        let end = out.find("-->");
-        if let Some(end) = end.filter(|&end| start.is_none_or(|start| end < start)) {
-            out.drain(..end + 3);
-        } else if let (Some(start), Some(end)) = (start, end) {
-            out.replace_range(start..end + 3, "");
-        } else if let Some(start) = start {
-            out.truncate(start);
-            return out;
-        } else {
-            return out;
-        }
     }
 }
 

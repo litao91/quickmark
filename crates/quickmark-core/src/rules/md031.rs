@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::{Rule, RuleType};
+use super::{is_blank_line, Rule, RuleType};
 
 // MD031-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
@@ -148,43 +148,6 @@ impl MD031Linter {
             ));
         }
     }
-}
-
-/// markdownlint's `isBlankLine`: a line counts as blank when it holds nothing but whitespace, HTML
-/// comments and block quote markers. The `>` matters here because a fenced block inside a block quote
-/// is separated from the text above it by a line holding only the quote marker, and the comment
-/// stripping is markdownlint's own loop, unmatched `-->` and unclosed `<!--` included.
-fn is_blank_line(line: &str) -> bool {
-    if line.trim().is_empty() {
-        return true;
-    }
-    let mut outside = String::new();
-    let mut rest = line;
-    loop {
-        match (rest.find("<!--"), rest.find("-->")) {
-            // An end comment with no start comment before it: everything up to it goes.
-            (None, Some(end)) => {
-                rest = &rest[end + "-->".len()..];
-            }
-            (Some(start), Some(end)) if end < start => {
-                rest = &rest[end + "-->".len()..];
-            }
-            (Some(start), Some(end)) => {
-                outside.push_str(&rest[..start]);
-                rest = &rest[end + "-->".len()..];
-            }
-            // An unclosed start comment swallows the rest of the line.
-            (Some(start), None) => {
-                outside.push_str(&rest[..start]);
-                break;
-            }
-            (None, None) => {
-                outside.push_str(rest);
-                break;
-            }
-        }
-    }
-    outside.replace('>', "").trim().is_empty()
 }
 
 impl RuleLinter for MD031Linter {
@@ -476,5 +439,8 @@ More text";
         assert_eq!(vec![4], rows("text\n<!-- c -->\n```\ncode\n```\ntext\n"));
         // And a comment below the closing fence is blank too, so nothing fires.
         assert!(rows("text\n\n```\ncode\n```\n<!-- c -->\ntext\n").is_empty());
+        // A `>` on either side is blank as well, at the document's start and at its end.
+        assert!(rows(">\n> ```\n> code\n> ```\n").is_empty());
+        assert!(rows("```\ncode\n```\n>\n").is_empty());
     }
 }

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::{Rule, RuleType};
+use super::{is_blank_line, Rule, RuleType};
 
 // MD022-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
@@ -102,11 +102,10 @@ impl MD022Linter {
             return true;
         }
         let lines = self.context.lines.borrow();
-        if line_number < lines.len() {
-            lines[line_number].trim().is_empty()
-        } else {
-            true // Consider out-of-bounds lines as blank
-        }
+        // A row past the end is blank, as it is for markdownlint, whose `getLine` returns "".
+        lines
+            .get(line_number)
+            .is_none_or(|line| is_blank_line(line))
     }
 
     fn count_blank_lines_above(&self, start_line: usize) -> usize {
@@ -573,5 +572,21 @@ Text";
     fn brace_front_matter_is_a_known_difference() {
         // markdownlint: []
         assert_eq!(vec![(4, "Above")], directions("{\nfront\n}\n# Heading\n"));
+    }
+
+    /// markdownlint asks `isBlankLine`, which counts a line of nothing but block quote markers as
+    /// blank and strips HTML comments before asking. Both shapes the vault comparison turned up
+    /// were a heading inside a block quote with a `>` line under it. Every expectation is a
+    /// markdownlint-cli2 v0.23.3 measurement.
+    #[test]
+    fn quote_markers_and_comments_count_as_blank() {
+        assert!(directions("> # H\n>\n> text\n").is_empty());
+        assert!(directions("> text\n>\n> # H\n").is_empty());
+        assert!(directions(">\n> # H\n>\n").is_empty());
+        assert_eq!(vec![(1, "Below")], directions("> # H\n> text\n"));
+        assert_eq!(vec![(2, "Above")], directions("> text\n> # H\n"));
+        assert!(directions("<!-- c -->\n# H\n\ntext\n").is_empty());
+        assert!(directions("# H\n<!-- c -->\ntext\n").is_empty());
+        assert_eq!(vec![(1, "Below")], directions("# H\ntext\n"));
     }
 }

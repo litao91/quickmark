@@ -68,6 +68,38 @@ pub enum RuleType {
     Hybrid,
 }
 
+/// Whether a line is blank, in markdownlint's sense (`helpers.cjs:isBlankLine`). MD022, MD031,
+/// MD032, MD047 and MD058 all ask this same question, and the answer is not "holds no
+/// non-whitespace": a line of nothing but block quote markers separates two quotes without being
+/// content, and an HTML comment is invisible.
+pub(crate) fn is_blank_line(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return true;
+    }
+    without_comments(line).replace('>', "").trim().is_empty()
+}
+
+/// The line with every complete HTML comment cut out, mirroring markdownlint's `removeComments`. An
+/// unterminated `<!--` swallows the rest of the line and an unmatched `-->` the part before it,
+/// both of which leave whatever is outside.
+fn without_comments(line: &str) -> String {
+    let mut out = String::from(line);
+    loop {
+        let start = out.find("<!--");
+        let end = out.find("-->");
+        if let Some(end) = end.filter(|&end| start.is_none_or(|start| end < start)) {
+            out.drain(..end + 3);
+        } else if let (Some(start), Some(end)) = (start, end) {
+            out.replace_range(start..end + 3, "");
+        } else if let Some(start) = start {
+            out.truncate(start);
+            return out;
+        } else {
+            return out;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Rule {
     pub id: &'static str,
