@@ -981,6 +981,24 @@ mod test {
         );
     }
 
+    /// markdownlint scans code and HTML unless a config says otherwise, so a `[proper-names]` table
+    /// that lists nothing but names must not turn either off.
+    #[test]
+    fn test_proper_names_settings_default_to_on() {
+        let parsed = parse_toml_config(
+            r#"
+        [linters.settings.proper-names]
+        names = ["JavaScript"]
+        "#,
+        )
+        .unwrap();
+
+        let proper_names = &parsed.linters.settings.proper_names;
+        assert_eq!(vec!["JavaScript"], proper_names.names);
+        assert!(proper_names.code_blocks);
+        assert!(proper_names.html_elements);
+    }
+
     #[test]
     fn test_parse_empty_config_uses_defaults() {
         let config_str = r#"
