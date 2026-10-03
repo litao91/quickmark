@@ -5,7 +5,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{Rule, RuleType},
+    rules::{ellipsify, Rule, RuleType},
 };
 
 // MD025-specific configuration types
@@ -267,7 +267,11 @@ impl RuleLinter for MD025Linter {
             for heading in self.matching_headings.iter().skip(start_index) {
                 self.violations.push(RuleViolation::new(
                     &MD025,
-                    format!("{} [{}]", MD025.description, heading.content),
+                    format!(
+                        "{} [Context: \"{}\"]",
+                        MD025.description,
+                        ellipsify(&heading.content, false, false)
+                    ),
                     self.context.file_path.clone(),
                     range_from_node_range(&heading.range),
                 ));

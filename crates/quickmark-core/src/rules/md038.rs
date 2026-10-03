@@ -4,9 +4,15 @@ use crate::ast::Node;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::{Rule, RuleType};
+use super::{ellipsify, Rule, RuleType};
 
-const VIOLATION_MESSAGE: &str = "Spaces inside code span elements";
+/// One whitespace run markdownlint reports: where it is, the code span it is in, and which end of
+/// that span it is at — the two decide how the quoted span is shortened.
+struct Run {
+    span: (usize, usize),
+    run: (usize, usize),
+    leading: bool,
+}
 
 pub(crate) struct MD038Linter {
     context: Rc<Context>,
@@ -22,7 +28,7 @@ impl MD038Linter {
     }
 
     /// The whitespace runs markdownlint reports in one inline subtree, as absolute byte ranges.
-    fn runs(&self, root: Node) -> Vec<(usize, usize)> {
+    fn runs(&self, root: Node) -> Vec<Run> {
         let source = self.context.get_document_content();
         let mut runs = Vec::new();
         let mut cursor = root.walk();
@@ -30,10 +36,12 @@ impl MD038Linter {
         loop {
             let node = cursor.node();
             if node.kind() == "code_span" {
-                runs.extend(padded_runs(
-                    &source[node.start_byte()..node.end_byte()],
-                    node.start_byte(),
-                ));
+                let span = (node.start_byte(), node.end_byte());
+                runs.extend(
+                    padded_runs(&source[span.0..span.1], span.0)
+                        .into_iter()
+                        .map(|(run, leading)| Run { span, run, leading }),
+                );
             }
 
             if cursor.goto_first_child() {
@@ -53,10 +61,18 @@ impl MD038Linter {
         }
     }
 
-    fn report(&mut self, start: usize, end: usize) {
-        self.violations.push(RuleViolation::new(
+    fn violation(&self, found: &Run, source: &str) -> RuleViolation {
+        let (start, end) = found.run;
+        // markdownlint quotes the whole code span, backticks and all, keeping the end the report is
+        // about when it has to shorten it.
+        let context = ellipsify(
+            &source[found.span.0..found.span.1],
+            found.leading,
+            !found.leading,
+        );
+        RuleViolation::new(
             &MD038,
-            VIOLATION_MESSAGE.to_string(),
+            format!("{} [Context: \"{context}\"]", MD038.description),
             self.context.file_path.clone(),
             range_from_node_range(&crate::ast::NodeRange {
                 start_byte: start,
@@ -64,7 +80,7 @@ impl MD038Linter {
                 start_point: self.context.point_at(start),
                 end_point: self.context.point_at(end),
             }),
-        ));
+        )
     }
 }
 
@@ -75,7 +91,7 @@ impl MD038Linter {
 /// begins and ends with one and is not nothing but spaces; those two are the padding and what is
 /// left is the data. A violation is whitespace the strip did not account for, so a single space that
 /// was stripped is quiet and one that was not is not: `` ` a` `` is reported, `` ` a ` `` is not.
-fn padded_runs(raw: &str, base: usize) -> Vec<(usize, usize)> {
+fn padded_runs(raw: &str, base: usize) -> Vec<((usize, usize), bool)> {
     let delimiter = raw.bytes().take_while(|&byte| byte == b'`').count();
     // The closing run is as long as the opening one; that is what made this a code span.
     let content = &raw[delimiter..raw.len() - delimiter];
@@ -118,12 +134,12 @@ fn padded_runs(raw: &str, base: usize) -> Vec<(usize, usize)> {
             first.0
         };
         let length = leading.count + usize::from(remove_padding);
-        runs.push((from, from + length));
+        runs.push(((from, from + length), true));
     }
     if trailing.count > 0 {
         let to = if remove_padding { content_end } else { last.1 };
         let length = trailing.count + usize::from(remove_padding);
-        runs.push((to - length, to));
+        runs.push(((to - length, to), false));
     }
     runs
 }
@@ -193,9 +209,13 @@ impl RuleLinter for MD038Linter {
             return;
         }
         let runs = self.runs(*node);
-        for (start, end) in runs {
-            self.report(start, end);
-        }
+        let found = {
+            let source = self.context.get_document_content();
+            runs.iter()
+                .map(|run| self.violation(run, &source))
+                .collect::<Vec<_>>()
+        };
+        self.violations.extend(found);
     }
 
     fn finalize(&mut self) -> Vec<RuleViolation> {
@@ -335,5 +355,28 @@ mod test {
         assert!(positions("This has `` empty code spans.\n").is_empty());
         assert!(positions("a ` b\n").is_empty());
         assert!(positions("a `` b ` c\n").is_empty());
+    }
+
+    /// markdownlint quotes the whole code span, backticks and all, keeping whichever end the report
+    /// is about when it has to shorten it.
+    #[test]
+    fn a_report_quotes_the_code_span() {
+        let config = test_config_with_rules(vec![("no-space-in-code", RuleSeverity::Error)]);
+        for (source, message) in [
+            (
+                "see `a ` here\n",
+                "Spaces inside code span elements [Context: \"`a `\"]",
+            ),
+            (
+                "see ` a` here\n",
+                "Spaces inside code span elements [Context: \"` a`\"]",
+            ),
+        ] {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config.clone(), source);
+            let violations = linter.analyze();
+            assert_eq!(1, violations.len(), "{source:?}");
+            assert_eq!(message, violations[0].message(), "{source:?}");
+        }
     }
 }

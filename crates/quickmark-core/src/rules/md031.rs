@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::{is_blank_line, Rule, RuleType};
+use super::{ellipsify, is_blank_line, Rule, RuleType};
 
 // MD031-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
@@ -18,12 +18,6 @@ impl Default for MD031FencedCodeBlanksTable {
         Self { list_items: true }
     }
 }
-
-// Pre-computed violation messages to avoid format! allocations
-const MISSING_BLANK_BEFORE: &str =
-    "Fenced code blocks should be surrounded by blank lines [Missing blank line before]";
-const MISSING_BLANK_AFTER: &str =
-    "Fenced code blocks should be surrounded by blank lines [Missing blank line after]";
 
 pub(crate) struct MD031Linter {
     context: Rc<Context>,
@@ -96,7 +90,11 @@ impl MD031Linter {
             if !self.is_line_blank_cached(line_above, &lines) {
                 self.violations.push(RuleViolation::new(
                     &MD031,
-                    MISSING_BLANK_BEFORE.to_string(),
+                    format!(
+                        "{} [Context: \"{}\"]",
+                        MD031.description,
+                        ellipsify(lines[start_line].trim(), false, false)
+                    ),
                     self.context.file_path.clone(),
                     range_from_node_range(&node.range()),
                 ));
@@ -131,7 +129,11 @@ impl MD031Linter {
             let start_byte = self.context.line_start_byte(close_row) + column;
             self.violations.push(RuleViolation::new(
                 &MD031,
-                MISSING_BLANK_AFTER.to_string(),
+                format!(
+                    "{} [Context: \"{}\"]",
+                    MD031.description,
+                    ellipsify(lines[close_row].trim(), false, false)
+                ),
                 self.context.file_path.clone(),
                 range_from_node_range(&crate::ast::NodeRange {
                     start_byte,
@@ -378,7 +380,7 @@ More text";
     /// `blanks-around-fences` enabled, converted to the 0-based rows `range.start.line` holds.
     #[test]
     fn test_reports_each_missing_blank_at_its_own_fence() {
-        fn reports(input: &str) -> Vec<(usize, bool)> {
+        fn reports(input: &str) -> Vec<usize> {
             let mut linter = MultiRuleLinter::new_for_document(
                 PathBuf::from("test.md"),
                 test_config_default(),
@@ -388,31 +390,44 @@ More text";
                 .analyze()
                 .iter()
                 .filter(|v| v.rule().id == "MD031")
-                .map(|v| {
-                    (
-                        v.location().range.start.line,
-                        v.message().contains("blank line after"),
-                    )
-                })
+                .map(|v| v.location().range.start.line)
                 .collect()
         }
 
-        // (row, is_after)
-        assert_eq!(
-            vec![(1, false), (3, true)],
-            reports("text\n```\ncode\n```\ntext\n")
-        );
-        assert_eq!(vec![(4, true)], reports("text\n\n```\ncode\n```\ntext\n"));
-        assert_eq!(vec![(1, false)], reports("text\n```\ncode\n```\n\ntext\n"));
+        // A missing blank above is reported on the opening fence's row and one below on the closing
+        // fence's, which is what tells the two apart.
+        assert_eq!(vec![1, 3], reports("text\n```\ncode\n```\ntext\n"));
+        assert_eq!(vec![4], reports("text\n\n```\ncode\n```\ntext\n"));
+        assert_eq!(vec![1], reports("text\n```\ncode\n```\n\ntext\n"));
         // Nothing above the opening fence at the start of the document, so only the "after" fires.
-        assert_eq!(vec![(2, true)], reports("```\ncode\n```\ntext\n"));
+        assert_eq!(vec![2], reports("```\ncode\n```\ntext\n"));
         // An unclosed fence at the end of the document has no line below it.
         assert!(reports("text\n\n```\ncode\n```").is_empty());
-        assert_eq!(
-            vec![(4, true)],
-            reports("- item\n\n  ```\n  code\n  ```\n- next\n")
+        assert_eq!(vec![4], reports("- item\n\n  ```\n  code\n  ```\n- next\n"));
+        assert_eq!(vec![4], reports("text\n\n~~~\ncode\n~~~\ntext\n"));
+    }
+
+    /// markdownlint quotes the fence line trimmed.
+    #[test]
+    fn a_report_quotes_the_fence() {
+        let mut linter = MultiRuleLinter::new_for_document(
+            PathBuf::from("test.md"),
+            test_config_default(),
+            "text\n  ```\ncode\n```\ntext\n",
         );
-        assert_eq!(vec![(4, true)], reports("text\n\n~~~\ncode\n~~~\ntext\n"));
+        let messages: Vec<String> = linter
+            .analyze()
+            .iter()
+            .filter(|v| v.rule().id == "MD031")
+            .map(|v| v.message().to_string())
+            .collect();
+        assert_eq!(
+            vec![
+                "Fenced code blocks should be surrounded by blank lines [Context: \"```\"]",
+                "Fenced code blocks should be surrounded by blank lines [Context: \"```\"]",
+            ],
+            messages
+        );
     }
 
     /// markdownlint's `isBlankLine` counts a line as blank when it holds nothing but whitespace, HTML

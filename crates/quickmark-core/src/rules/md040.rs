@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::{
     linter::{CharPosition, Context, Range, RuleLinter, RuleViolation},
-    rules::{Rule, RuleType},
+    rules::{ellipsify, Rule, RuleType},
 };
 
 // MD040-specific configuration types
@@ -109,7 +109,11 @@ impl RuleLinter for MD040Linter {
                         None => {
                             self.violations.push(RuleViolation::new(
                                 &MD040,
-                                "Fenced code blocks should have a language specified".to_string(),
+                                format!(
+                                    "{} [Context: \"{}\"]",
+                                    MD040.description,
+                                    ellipsify(first_line.trim(), false, false)
+                                ),
                                 self.context.file_path.clone(),
                                 range,
                             ));
@@ -121,7 +125,7 @@ impl RuleLinter for MD040Linter {
                         if !set.contains(language) {
                             self.violations.push(RuleViolation::new(
                                 &MD040,
-                                format!("\"{language}\" is not allowed"),
+                                format!("{} [\"{language}\" is not allowed]", MD040.description),
                                 self.context.file_path.clone(),
                                 range,
                             ));
@@ -144,7 +148,8 @@ impl RuleLinter for MD040Linter {
                         let violation = RuleViolation::new(
                             &MD040,
                             format!(
-                                "Info string contains more than language: \"{}\"",
+                                "{} [Info string contains more than language: \"{}\"]",
+                                MD040.description,
                                 first_line.trim()
                             ),
                             self.context.file_path.clone(),
@@ -593,7 +598,9 @@ def hello():
 
         let attributes = "```py{#id}\nx\n```\n";
         assert_eq!(
-            vec![r#""py{#id}" is not allowed"#],
+            vec![
+                r#"Fenced code blocks should have a language specified ["py{#id}" is not allowed]"#,
+            ],
             messages(test_config_with_allowed_languages(vec!["py"]), attributes)
         );
         assert!(messages(
@@ -609,7 +616,9 @@ def hello():
 
         let pandoc = "```{.python .numberLines}\nx\n```\n";
         assert_eq!(
-            vec![r#"Info string contains more than language: "```{.python .numberLines}""#],
+            vec![
+                r#"Fenced code blocks should have a language specified [Info string contains more than language: "```{.python .numberLines}"]"#,
+            ],
             messages(test_config_with_language_only(true), pandoc)
         );
         assert!(messages(test_config_with_language_only(true), attributes).is_empty());

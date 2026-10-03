@@ -3,13 +3,7 @@ use std::rc::Rc;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::{is_blank_line, Rule, RuleType};
-
-// Pre-computed violation messages to avoid format! allocations
-const MISSING_BLANK_BEFORE: &str =
-    "Lists should be surrounded by blank lines [Missing blank line before]";
-const MISSING_BLANK_AFTER: &str =
-    "Lists should be surrounded by blank lines [Missing blank line after]";
+use super::{ellipsify, is_blank_line, Rule, RuleType};
 
 pub(crate) struct MD032Linter {
     context: Rc<Context>,
@@ -94,19 +88,24 @@ impl MD032Linter {
             (before, after)
         };
 
-        if let Some(row) = before {
-            self.report(MISSING_BLANK_BEFORE, row);
-        }
-        if let Some(row) = after {
-            self.report(MISSING_BLANK_AFTER, row);
+        for row in [before, after].into_iter().flatten() {
+            self.report(row);
         }
     }
 
-    fn report(&mut self, message: &str, row: usize) {
-        let width = self.context.lines.borrow().get(row).map_or(0, String::len);
+    fn report(&mut self, row: usize) {
+        let lines = self.context.lines.borrow();
+        let line = lines.get(row).map_or("", String::as_str);
+        let width = line.len();
+        // markdownlint quotes the list's own line at whichever end is missing its blank.
+        let message = format!(
+            "{} [Context: \"{}\"]",
+            MD032.description,
+            ellipsify(line.trim(), false, false)
+        );
         self.violations.push(RuleViolation::new(
             &MD032,
-            message.to_string(),
+            message,
             self.context.file_path.clone(),
             range_from_node_range(&NodeRange {
                 start_byte: 0,
@@ -151,25 +150,19 @@ mod test {
         test_config_with_rules(vec![("blanks-around-lists", RuleSeverity::Error)])
     }
 
-    /// A case's name, its document, and the reports markdownlint makes on it.
-    type Case = (&'static str, &'static str, &'static [(usize, &'static str)]);
+    /// A case's name, its document, and the 1-based lines markdownlint reports on. A missing blank
+    /// above is reported on the list's first line and one below on its last content line, so the line
+    /// is what tells the two apart.
+    type Case = (&'static str, &'static str, &'static [usize]);
 
-    /// The 1-based lines MD032 reports on, each tagged with the check that fired.
-    fn reports(source: &str) -> Vec<(usize, &'static str)> {
+    fn reports(source: &str) -> Vec<usize> {
         let mut linter =
             MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), source);
         linter
             .analyze()
             .iter()
             .filter(|violation| violation.rule().id == "MD032")
-            .map(|violation| {
-                let missing = if violation.message().ends_with("before]") {
-                    "before"
-                } else {
-                    "after"
-                };
-                (violation.location().range.start.line + 1, missing)
-            })
+            .map(|violation| violation.location().range.start.line + 1)
             .collect()
     }
 
@@ -180,42 +173,42 @@ mod test {
     fn matches_markdownlint() {
         let cases: &[Case] = &[
             ("surrounded", "text\n\n- a\n- b\n\ntext\n", &[]),
-            ("nothing above", "text\n- a\n- b\n\ntext\n", &[(2, "before")]),
+            ("nothing above", "text\n- a\n- b\n\ntext\n", &[2]),
             // `text` continues the last item's paragraph lazily, so the list reaches the end.
             ("lazy continuation below", "text\n\n- a\n- b\ntext\n", &[]),
-            ("neither blank", "text\n- a\n- b\ntext\n", &[(2, "before")]),
+            ("neither blank", "text\n- a\n- b\ntext\n", &[2]),
             ("at the document start", "- a\n- b\n\ntext\n", &[]),
             ("at the document end", "text\n\n- a\n- b\n", &[]),
             ("the whole document", "- a\n- b\n", &[]),
             ("no final newline", "- a\n- b", &[]),
-            ("no final newline, text above", "text\n- a\n- b", &[(2, "before")]),
-            ("thematic break below", "- a\n- b\n---\n", &[(2, "after")]),
-            ("heading below", "- a\n- b\n# H\n", &[(2, "after")]),
-            ("fence below", "- a\n- b\n```\ncode\n```\n", &[(2, "after")]),
+            ("no final newline, text above", "text\n- a\n- b", &[2]),
+            ("thematic break below", "- a\n- b\n---\n", &[2]),
+            ("heading below", "- a\n- b\n# H\n", &[2]),
+            ("fence below", "- a\n- b\n```\ncode\n```\n", &[2]),
             ("blank then thematic break", "- a\n- b\n\n---\n", &[]),
             ("blank then heading", "- a\n- b\n\n# H\n", &[]),
-            ("thematic break above", "---\n- a\n- b\n", &[(2, "before")]),
-            ("heading above", "# H\n- a\n- b\n", &[(2, "before")]),
-            ("fence above", "```\ncode\n```\n- a\n- b\n", &[(4, "before")]),
+            ("thematic break above", "---\n- a\n- b\n", &[2]),
+            ("heading above", "# H\n- a\n- b\n", &[2]),
+            ("fence above", "```\ncode\n```\n- a\n- b\n", &[4]),
             ("quoted, blank `>` around", "> text\n>\n> - a\n> - b\n>\n> text\n", &[]),
-            ("quoted, nothing around", "> text\n> - a\n> - b\n> text\n", &[(2, "before")]),
+            ("quoted, nothing around", "> text\n> - a\n> - b\n> text\n", &[2]),
             ("quoted, blank `>` above", "> text\n>\n> - a\n> - b\n", &[]),
             ("quoted, blank `>` below", "> - a\n> - b\n>\n> text\n", &[]),
             ("doubly quoted", ">> - a\n>> - b\n", &[]),
             ("nested items", "- a\n  - nested\n  - nested\n- b\n\ntext\n", &[]),
             ("loose", "text\n\n- a\n\n- b\n\ntext\n", &[]),
             ("loose, lazy below", "text\n\n- a\n\n- b\ntext\n", &[]),
-            ("loose, thematic break below", "- a\n\n- b\n---\n", &[(3, "after")]),
+            ("loose, thematic break below", "- a\n\n- b\n---\n", &[3]),
             ("ordered", "text\n\n1. a\n2. b\n\ntext\n", &[]),
-            ("ordered, neither blank", "text\n1. a\n2. b\n---\n", &[(2, "before"), (3, "after")]),
+            ("ordered, neither blank", "text\n1. a\n2. b\n---\n", &[2, 3]),
             // `+ a` and `- b` are two lists, so each reports against the other.
-            ("mixed markers", "text\n\n+ a\n- b\n\ntext\n", &[(3, "after"), (4, "before")]),
+            ("mixed markers", "text\n\n+ a\n- b\n\ntext\n", &[3, 4]),
             ("comment below", "- a\n- b\n<!-- c -->\ntext\n", &[]),
             ("comment above", "text\n<!-- c -->\n- a\n- b\n", &[]),
             ("comment below then blank", "- a\n- b\n<!-- c -->\n\ntext\n", &[]),
             ("quote below", "- a\n- b\n\n> quote\n", &[]),
-            ("quote below, no blank", "- a\n- b\n> quote\n", &[(2, "after")]),
-            ("quote above", "> quote\n- a\n- b\n", &[(2, "before")]),
+            ("quote below, no blank", "- a\n- b\n> quote\n", &[2]),
+            ("quote above", "> quote\n- a\n- b\n", &[2]),
             ("table below", "- a\n- b\n\n| x |\n| - |\n", &[]),
             ("table below, no blank", "- a\n- b\n| x |\n| - |\n", &[]),
             ("indented code below", "- a\n- b\n\n    indented\n", &[]),
@@ -225,11 +218,11 @@ mod test {
             (
                 "item ending in a fence, text below",
                 "- a\n\n  ```\n  code\n  ```\ntext\n",
-                &[(5, "after")],
+                &[5],
             ),
             ("two lists, blank between", "- a\n- b\n\n- c\n- d\n", &[]),
             ("one long list", "- a\n- b\n- c\n- d\n", &[]),
-            ("two-line paragraph above", "para one\npara two\n- a\n- b\n", &[(3, "before")]),
+            ("two-line paragraph above", "para one\npara two\n- a\n- b\n", &[3]),
             ("two-line lazy continuation", "- a\n- b\npara one\npara two\n", &[]),
             ("two-line paragraph below", "- a\n- b\n\npara one\npara two\n", &[]),
             ("setext underline below", "- a\n- b\n=====\n", &[]),
@@ -239,8 +232,8 @@ mod test {
             ("several blanks below", "- a\n- b\n\n\n\ntext\n", &[]),
             ("several blanks above", "text\n\n\n\n- a\n- b\n", &[]),
             ("indented list", "   - a\n   - b\n\ntext\n", &[]),
-            ("indented list, text above", "text\n   - a\n   - b\n", &[(2, "before")]),
-            ("html block below", "- a\n- b\n<div>\nx\n</div>\n", &[(2, "after")]),
+            ("indented list, text above", "text\n   - a\n   - b\n", &[2]),
+            ("html block below", "- a\n- b\n<div>\nx\n</div>\n", &[2]),
             // An unclosed type-6 HTML block runs to the end of the document and swallows the list,
             // so there is no list to report on at all.
             ("html block above", "<div>\nx\n</div>\n- a\n- b\n", &[]),
@@ -267,9 +260,9 @@ mod test {
             ("unmatched close below", "- a\n- b\n--> rest\n", &[]),
             ("unmatched close above", "text -->\n- a\n- b\n", &[]),
             ("math block below", "- a\n- b\n\n$$\nx\n$$\n", &[]),
-            ("quoted thematic break below", "> - a\n> - b\n> ---\n", &[(2, "after")]),
+            ("quoted thematic break below", "> - a\n> - b\n> ---\n", &[2]),
             ("whitespace-only line between items", "- a\n- b\n   \n- c\n", &[]),
-            ("two lists, nothing between", "+ a\n- b\n", &[(1, "after"), (2, "before")]),
+            ("two lists, nothing between", "+ a\n- b\n", &[1, 2]),
             ("tab-only line below", "- a\n- b\n\t\ntext\n", &[]),
             ("quoted list inside a quote below", "- a\n- b\n\n> x\n>\n> - c\n> - d\n", &[]),
             ("loose list, lazy below", "text\n\n- a\n- b\n\n- c\n- d\ntext\n", &[]),
@@ -277,7 +270,7 @@ mod test {
             (
                 "html block between two lists",
                 "- a\n- b\n<div>\nx\n</div>\n\n- c\n- d\n",
-                &[(2, "after")],
+                &[2],
             ),
             ("blank first line", "   \n- a\n- b\n", &[]),
             ("trailing blanks only", "- a\n- b\n\n\n", &[]),
@@ -287,7 +280,7 @@ mod test {
             .iter()
             .filter(|&&(name, source, expected)| {
                 let actual = reports(source);
-                let expected: Vec<(usize, &str)> = expected.to_vec();
+                let expected: Vec<usize> = expected.to_vec();
                 if actual == expected {
                     return false;
                 }
@@ -301,6 +294,27 @@ mod test {
             "{} of {} cases disagree with markdownlint: {failures:?}",
             failures.len(),
             cases.len()
+        );
+    }
+
+    /// markdownlint quotes the list's own line trimmed — the first one for a missing blank above and
+    /// the last content one for a missing blank below.
+    #[test]
+    fn a_report_quotes_the_list_line() {
+        let mut linter = MultiRuleLinter::new_for_document(
+            PathBuf::from("test.md"),
+            test_config(),
+            "text\n- a\n- b\ntext\n",
+        );
+        let messages: Vec<String> = linter
+            .analyze()
+            .iter()
+            .filter(|violation| violation.rule().id == "MD032")
+            .map(|violation| violation.message().to_string())
+            .collect();
+        assert_eq!(
+            vec!["Lists should be surrounded by blank lines [Context: \"- a\"]"],
+            messages
         );
     }
 

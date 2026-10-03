@@ -7,7 +7,7 @@ use regex::Regex;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{Rule, RuleType},
+    rules::{ellipsify, Rule, RuleType},
 };
 
 // MD041-specific configuration types
@@ -182,6 +182,26 @@ impl MD041Linter {
         };
         !comment.starts_with('>') && !comment.starts_with("->") && !comment.ends_with('-')
     }
+    /// markdownlint has one message for both halves of this rule, quoting the line it reports on.
+    fn violation(&self, range: &crate::ast::NodeRange) -> RuleViolation {
+        let line = self
+            .context
+            .lines
+            .borrow()
+            .get(range.start_point.row)
+            .cloned()
+            .unwrap_or_default();
+        RuleViolation::new(
+            &MD041,
+            format!(
+                "{} [Context: \"{}\"]",
+                MD041.description,
+                ellipsify(&line, false, false)
+            ),
+            self.context.file_path.clone(),
+            range_from_node_range(range),
+        )
+    }
 }
 
 /// Whether a node is one of the document's own blocks rather than something nested in one.
@@ -238,26 +258,13 @@ impl RuleLinter for MD041Linter {
             FirstElement::Heading(level, range) => {
                 // First element is a heading - check if it has the correct level
                 if *level != config.level {
-                    self.violations.push(RuleViolation::new(
-                        &MD041,
-                        format!(
-                            "Expected first heading to be level {}, but found level {}",
-                            config.level, level
-                        ),
-                        self.context.file_path.clone(),
-                        range_from_node_range(range),
-                    ));
+                    self.violations.push(self.violation(range));
                 }
             }
             FirstElement::Content(range) => {
                 // First element is content - only a violation if preamble is not allowed
                 if !config.allow_preamble {
-                    self.violations.push(RuleViolation::new(
-                        &MD041,
-                        "First line in a file should be a top-level heading".to_string(),
-                        self.context.file_path.clone(),
-                        range_from_node_range(range),
-                    ));
+                    self.violations.push(self.violation(range));
                 }
             }
             FirstElement::None => {
@@ -349,9 +356,9 @@ Content";
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(violations.len(), 1);
-        assert!(violations[0]
-            .message()
-            .contains("Expected first heading to be level 1, but found level 2"));
+        assert!(violations[0].message().contains(
+            "First line in a file should be a top-level heading [Context: \"## Title\"]",
+        ));
     }
 
     #[test]
@@ -376,9 +383,11 @@ Content";
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(violations.len(), 1);
-        assert!(violations[0]
-            .message()
-            .contains("Expected first heading to be level 2, but found level 1"));
+        assert!(
+            violations[0].message().contains(
+                "First line in a file should be a top-level heading [Context: \"# Title\"]",
+            )
+        );
     }
 
     #[test]
@@ -407,7 +416,7 @@ Content";
         assert_eq!(violations.len(), 1);
         assert!(violations[0]
             .message()
-            .contains("Expected first heading to be level 1, but found level 2"));
+            .contains("First line in a file should be a top-level heading [Context: \"Title\"]",));
     }
 
     #[test]

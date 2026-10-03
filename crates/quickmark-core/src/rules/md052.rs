@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{md037::is_escaped, Context, Rule, RuleLinter, RuleType},
+    rules::{md037::is_escaped, one_line, Context, Rule, RuleLinter, RuleType},
 };
 
 // MD052-specific configuration types
@@ -286,11 +286,20 @@ impl RuleLinter for MD052Linter {
             if ignored_labels.contains(&reference.label) {
                 continue;
             }
+            // markdownlint quotes the reference's own source and, unlike `addErrorContext`, does not
+            // shorten it.
+            let context = {
+                let source = self.context.get_document_content();
+                source
+                    .get(reference.range.start_byte..reference.range.end_byte)
+                    .map(one_line)
+                    .unwrap_or_default()
+            };
             violations.push(RuleViolation::new(
                 &MD052,
                 format!(
-                    "Missing link or image reference definition: \"{}\"",
-                    reference.label
+                    "{} [Missing link or image reference definition: \"{}\"] [Context: \"{context}\"]",
+                    MD052.description, reference.label
                 ),
                 self.context.file_path.clone(),
                 range_from_node_range(&reference.range),
@@ -499,8 +508,8 @@ mod test {
             .collect();
         assert_eq!(
             vec![
-                r#"Missing link or image reference definition: "abc""#,
-                r#"Missing link or image reference definition: "a b""#,
+                r#"Reference links and images should use a label that is defined [Missing link or image reference definition: "abc"] [Context: "[x][ABC]"]"#,
+                r#"Reference links and images should use a label that is defined [Missing link or image reference definition: "a b"] [Context: "[y][A  B]"]"#,
             ],
             messages
         );

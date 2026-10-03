@@ -8,6 +8,7 @@ use std::rc::Rc;
 use crate::{
     linter::{CharPosition, Range, RuleViolation},
     rules::{
+        ellipsify,
         md052::{bracket_label, normalize_label},
         Context, Rule, RuleLinter, RuleType,
     },
@@ -141,17 +142,16 @@ impl MD053Linter {
     /// markdownlint's `errorRange` for a definition is its whole first line, however many lines the
     /// definition itself spans.
     fn report(&self, kind: &str, definition: &Definition) -> RuleViolation {
-        let width = self
-            .context
-            .lines
-            .borrow()
-            .get(definition.row)
-            .map_or(0, |line| line.len());
+        let lines = self.context.lines.borrow();
+        let line = lines.get(definition.row).map_or("", String::as_str);
+        let width = line.len();
         RuleViolation::new(
             &MD053,
             format!(
-                "{kind} link or image reference definition: \"{}\"",
-                definition.label
+                "{} [{kind} link or image reference definition: \"{}\"] [Context: \"{}\"]",
+                MD053.description,
+                definition.label,
+                ellipsify(line, false, false)
             ),
             self.context.file_path.clone(),
             Range {
@@ -261,7 +261,11 @@ mod test {
             .iter()
             .map(|violation| {
                 let message = violation.message();
-                let (kind, label) = message
+                let detail = message
+                    .split_once(" [")
+                    .and_then(|(_, rest)| rest.split_once("] [Context: "))
+                    .map_or(message, |(detail, _)| detail);
+                let (kind, label) = detail
                     .split_once(" link or image reference definition: \"")
                     .and_then(|(kind, rest)| rest.strip_suffix('"').map(|label| (kind, label)))
                     .unwrap_or((message, ""));

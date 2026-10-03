@@ -100,23 +100,37 @@ fn without_comments(line: &str) -> String {
     }
 }
 
-/// Shortens the context a message quotes, exactly as markdownlint's `helpers.cjs:ellipsify` does:
-/// over thirty characters it keeps the start, the end, or fifteen of each. `start` and `end` say
-/// which of the two the rule cares about, and a rule that cares about neither gets the head.
+/// Prepares the context a message quotes, exactly as markdownlint does: `addErrorContext` normalizes
+/// line endings and calls `helpers.cjs:ellipsify`, which over thirty characters keeps the start, the
+/// end, or fifteen of each — `start` and `end` say which the rule cares about, and a rule that cares
+/// about neither gets the head — and `markdownlint.mjs` then turns every remaining line break into a
+/// space.
+/// Every line break in a quoted context becomes a space, which `markdownlint.mjs` does to one before
+/// it reaches the output — including one a rule passed to `addError` rather than `addErrorContext`,
+/// which is the only way MD052's long labels stay on a single line.
+pub(crate) fn one_line(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', " ")
+}
+
 pub(crate) fn ellipsify(text: &str, start: bool, end: bool) -> String {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= 30 {
-        return text.to_string();
-    }
-    let head = |count: usize| chars.iter().take(count).collect::<String>();
-    let tail = |count: usize| chars.iter().skip(chars.len() - count).collect::<String>();
-    if start && end {
-        format!("{}...{}", head(15), tail(15))
-    } else if end {
-        format!("...{}", tail(30))
+    let shortened = if chars.len() <= 30 {
+        text
     } else {
-        format!("{}...", head(30))
-    }
+        let head = |count: usize| chars.iter().take(count).collect::<String>();
+        let tail = |count: usize| chars.iter().skip(chars.len() - count).collect::<String>();
+        if start && end {
+            format!("{}...{}", head(15), tail(15))
+        } else if end {
+            format!("...{}", tail(30))
+        } else {
+            format!("{}...", head(30))
+        }
+    };
+    shortened.replace('\n', " ")
 }
 
 /// markdownlint reads an absent setting as its documented default, which for the flags that turn a

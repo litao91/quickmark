@@ -4,7 +4,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    rules::{ellipsify, Context, Rule, RuleLinter, RuleType},
 };
 
 /// MD042 - No empty links
@@ -35,9 +35,21 @@ impl MD042Linter {
             let node = cursor.node();
             if node.kind() == "link" && self.is_empty_link(node) {
                 let range = node.range();
+                // markdownlint quotes the link's own source, which may span lines.
+                let message = {
+                    let source = self.context.get_document_content();
+                    let text = source
+                        .get(range.start_byte..range.end_byte)
+                        .unwrap_or_default();
+                    format!(
+                        "{} [Context: \"{}\"]",
+                        MD042.description,
+                        ellipsify(text, false, false)
+                    )
+                };
                 self.violations.push(RuleViolation::new(
                     &MD042,
-                    MD042.description.to_string(),
+                    message,
                     self.context.file_path.clone(),
                     range_from_node_range(&range),
                 ));
@@ -244,5 +256,18 @@ mod test {
             assert_eq!(1, found.len(), "source {source:?}");
             assert_eq!((1, 1), (found[0].0, found[0].1), "source {source:?}");
         }
+    }
+
+    /// markdownlint quotes the link's own source.
+    #[test]
+    fn a_report_quotes_the_link() {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), "[a]()\n");
+        let violations = linter.analyze();
+        assert_eq!(1, violations.len());
+        assert_eq!(
+            "No empty links [Context: \"[a]()\"]",
+            violations[0].message()
+        );
     }
 }

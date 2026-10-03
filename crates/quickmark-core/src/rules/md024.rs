@@ -5,7 +5,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{Rule, RuleType},
+    rules::{ellipsify, Rule, RuleType},
 };
 
 // MD024-specific configuration types
@@ -136,8 +136,9 @@ impl MD024Linter {
                     self.violations.push(RuleViolation::new(
                         &MD024,
                         format!(
-                            "{} [Duplicate heading: '{}']",
-                            MD024.description, current_heading.content
+                            "{} [Context: \"{}\"]",
+                            MD024.description,
+                            ellipsify(current_heading.content.trim(), false, false)
                         ),
                         self.context.file_path.clone(),
                         range_from_node_range(&current_heading.node_range),

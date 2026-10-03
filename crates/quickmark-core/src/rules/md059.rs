@@ -55,12 +55,6 @@ fn normalize_text(text: &str) -> String {
         .to_string()
 }
 
-/// markdownlint's `addErrorContext` turns every `\r\n` and `\r` into a `\n`, and `markdownlint.mjs`
-/// then turns every `\n` in a context into a space — so a label spanning lines still reads as one.
-fn one_line(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
-
 /// MD059 - Link text should be descriptive
 ///
 /// Reports a link whose label is nothing but one of the prohibited texts.
@@ -160,7 +154,7 @@ impl MD059Linter {
             format!(
                 "{} [Context: \"{}\"]",
                 MD059.description,
-                ellipsify(&one_line(quoted), false, false).replace('\n', " ")
+                ellipsify(quoted, false, false)
             ),
             self.context.file_path.clone(),
             range_from_node_range(&crate::ast::NodeRange {

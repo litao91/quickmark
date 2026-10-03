@@ -3,9 +3,7 @@ use std::rc::Rc;
 
 use crate::linter::{CharPosition, Context, Range, RuleLinter, RuleViolation};
 
-use super::{Rule, RuleType};
-
-const VIOLATION_MESSAGE: &str = "Dollar signs used before commands without showing output";
+use super::{ellipsify, Rule, RuleType};
 
 pub(crate) struct MD014Linter {
     context: Rc<Context>,
@@ -74,10 +72,20 @@ impl MD014Linter {
         }
 
         if found.len() == code_lines && code_lines > 0 {
+            let lines = self.context.lines.borrow();
             for (row, from, to) in found {
+                // markdownlint quotes the code line from where its text starts, trailing whitespace
+                // and all.
+                let context = lines
+                    .get(row)
+                    .map_or("", |line| &line[from.min(line.len())..]);
                 self.violations.push(RuleViolation::new(
                     &MD014,
-                    VIOLATION_MESSAGE.to_string(),
+                    format!(
+                        "{} [Context: \"{}\"]",
+                        MD014.description,
+                        ellipsify(context, false, false)
+                    ),
                     self.context.file_path.clone(),
                     Range {
                         start: CharPosition {

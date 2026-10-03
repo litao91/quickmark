@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::{is_blank_line, Rule, RuleType};
+use super::{ellipsify, is_blank_line, Rule, RuleType};
 
 // MD022-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
@@ -182,8 +182,11 @@ impl MD022Linter {
                     self.violations.push(RuleViolation::new(
                         &MD022,
                         format!(
-                            "{} [Above: Expected: {}; Actual: {}]",
-                            MD022.description, required_above, actual_above
+                            "{} [Expected: {}; Actual: {}; Above] [Context: \"{}\"]",
+                            MD022.description,
+                            required_above,
+                            actual_above,
+                            ellipsify(lines[actual_start_line].trim(), false, false)
                         ),
                         self.context.file_path.clone(),
                         range_from_node_range(&node.range()),
@@ -225,8 +228,11 @@ impl MD022Linter {
                     self.violations.push(RuleViolation::new(
                         &MD022,
                         format!(
-                            "{} [Below: Expected: {}; Actual: {}]",
-                            MD022.description, required_below, actual_below
+                            "{} [Expected: {}; Actual: {}; Below] [Context: \"{}\"]",
+                            MD022.description,
+                            required_below,
+                            actual_below,
+                            ellipsify(lines[actual_start_line].trim(), false, false)
                         ),
                         self.context.file_path.clone(),
                         range_from_node_range(&node.range()),
@@ -313,7 +319,7 @@ mod test {
         assert_eq!(1, violations.len());
         assert!(violations[0]
             .message()
-            .contains("Above: Expected: 1; Actual: 0"));
+            .contains("Expected: 1; Actual: 0; Above"));
     }
 
     #[test]
@@ -343,7 +349,7 @@ More text";
         assert_eq!(1, violations.len());
         assert!(violations[0]
             .message()
-            .contains("Above: Expected: 1; Actual: 0"));
+            .contains("Expected: 1; Actual: 0; Above"));
     }
 
     #[test]
@@ -359,7 +365,7 @@ More text";
         assert_eq!(1, violations.len());
         assert!(violations[0]
             .message()
-            .contains("Below: Expected: 1; Actual: 0"));
+            .contains("Expected: 1; Actual: 0; Below"));
     }
 
     #[test]
@@ -374,10 +380,10 @@ More text";
         assert_eq!(2, violations.len());
         assert!(violations[0]
             .message()
-            .contains("Above: Expected: 1; Actual: 0"));
+            .contains("Expected: 1; Actual: 0; Above"));
         assert!(violations[1]
             .message()
-            .contains("Below: Expected: 1; Actual: 0"));
+            .contains("Expected: 1; Actual: 0; Below"));
     }
 
     #[test]
@@ -396,7 +402,7 @@ More text";
         assert_eq!(1, violations.len());
         assert!(violations[0]
             .message()
-            .contains("Below: Expected: 1; Actual: 0"));
+            .contains("Expected: 1; Actual: 0; Below"));
     }
 
     #[test]
@@ -416,7 +422,7 @@ More text";
         assert_eq!(1, violations.len());
         assert!(violations[0]
             .message()
-            .contains("Above: Expected: 2; Actual: 1"));
+            .contains("Expected: 2; Actual: 1; Above"));
     }
 
     #[test]
@@ -436,7 +442,7 @@ More text";
         assert_eq!(1, violations.len());
         assert!(violations[0]
             .message()
-            .contains("Below: Expected: 2; Actual: 1"));
+            .contains("Expected: 2; Actual: 1; Below"));
     }
 
     #[test]
@@ -525,7 +531,7 @@ Text";
         assert_eq!(1, violations.len());
         assert!(violations[0]
             .message()
-            .contains("Above: Expected: 2; Actual: 1"));
+            .contains("Expected: 2; Actual: 1; Above"));
     }
 
     fn directions(source: &str) -> Vec<(usize, &'static str)> {
@@ -536,7 +542,7 @@ Text";
             .analyze()
             .iter()
             .map(|violation| {
-                let above = violation.message().contains("[Above:");
+                let above = violation.message().contains("; Above]");
                 (
                     violation.location().range.start.line + 1,
                     if above { "Above" } else { "Below" },

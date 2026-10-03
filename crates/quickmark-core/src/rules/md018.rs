@@ -5,7 +5,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    rules::{ellipsify, Context, Rule, RuleLinter, RuleType},
 };
 
 /// `#` followed by U+FE0F U+20E3, which renders as an emoji rather than a heading.
@@ -38,7 +38,11 @@ impl MD018Linter {
             };
             self.violations.push(RuleViolation::new(
                 &MD018,
-                MD018.description.to_string(),
+                format!(
+                    "{} [Context: \"{}\"]",
+                    MD018.description,
+                    ellipsify(line.trim(), false, false)
+                ),
                 self.context.file_path.clone(),
                 range_from_node_range(&crate::ast::NodeRange {
                     start_byte: 0,
@@ -241,5 +245,21 @@ mod test {
             .expect("one violation");
         // markdownlint's range is `[1, hashCount + 1]`: the hashes and the character after them.
         assert_eq!(range, (0, 0, 0, 3));
+    }
+
+    /// markdownlint quotes the heading line trimmed.
+    #[test]
+    fn a_report_quotes_the_heading() {
+        let mut linter = MultiRuleLinter::new_for_document(
+            PathBuf::from("test.md"),
+            test_config(),
+            "#Heading\n",
+        );
+        let violations = linter.analyze();
+        assert_eq!(1, violations.len());
+        assert_eq!(
+            "No space after hash on atx style heading [Context: \"#Heading\"]",
+            violations[0].message()
+        );
     }
 }
