@@ -6,108 +6,104 @@ use std::rc::Rc;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::{Rule, RuleType};
+use super::{ellipsify, Rule, RuleType};
 
 static CLOSED_ATX_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(#+)([ \t]*)([^# \t\\]|[^# \t][^#]*?[^# \t\\])([ \t]*)((?:\\#)?)(#+)(\s*)$")
         .expect("Invalid regex for MD020")
 });
 
+/// MD020 - No space inside hashes on closed atx style heading
+///
+/// Line-based, like markdownlint's: the pattern is what decides, and the tree only says which lines
+/// to leave alone.
 pub(crate) struct MD020Linter {
     context: Rc<Context>,
-    violations: Vec<RuleViolation>,
+    /// The 0-based rows markdownlint skips, because a code or HTML block covers them.
+    ignored_rows: HashSet<usize>,
 }
 
 impl MD020Linter {
     pub fn new(context: Rc<Context>) -> Self {
         Self {
             context,
-            violations: Vec::new(),
+            ignored_rows: HashSet::new(),
         }
     }
 
-    fn analyze_all_lines(&mut self) {
+    /// The rows a block covers. Its end swallows the trailing newline, so the last byte it claims
+    /// belongs to the row before the one `end_position` names.
+    fn cover(&mut self, node: Node) {
+        let from = node.start_position().row;
+        let to = self.context.point_at(node.end_byte().saturating_sub(1)).row;
+        self.ignored_rows.extend(from..=to);
+    }
+
+    fn analyze(&self) -> Vec<RuleViolation> {
         let lines = self.context.lines.borrow();
-
-        // Get line numbers that should be ignored (inside code blocks or HTML blocks)
-        let ignore_lines = self.get_ignore_lines();
-
-        for (line_index, line) in lines.iter().enumerate() {
-            if ignore_lines.contains(&(line_index + 1)) {
-                continue; // Skip lines in code blocks or HTML blocks
-            }
-
-            if let Some(violation) = self.check_line(line, line_index) {
-                self.violations.push(violation);
-            }
-        }
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| !self.ignored_rows.contains(row))
+            .filter_map(|(row, line)| self.check_line(line, row))
+            .collect()
     }
 
-    /// Get line numbers that should be ignored (inside code blocks or HTML blocks)
-    fn get_ignore_lines(&self) -> HashSet<usize> {
-        let mut ignore_lines = HashSet::new();
-        let node_cache = self.context.node_cache.borrow();
-
-        for node_type in ["fenced_code_block", "indented_code_block", "html_block"] {
-            if let Some(blocks) = node_cache.get(node_type) {
-                for node_info in blocks {
-                    for line_num in (node_info.line_start + 1)..=(node_info.line_end + 1) {
-                        ignore_lines.insert(line_num);
-                    }
-                }
-            }
+    fn check_line(&self, line: &str, row: usize) -> Option<RuleViolation> {
+        let captures = CLOSED_ATX_REGEX.captures(line)?;
+        let group = |index: usize| captures.get(index).map_or("", |group| group.as_str());
+        let (left_hash, right_hash) = (group(1), group(6));
+        let left = group(2).is_empty();
+        // An escaped hash on the right is not a space either.
+        let right = group(4).is_empty() || !group(5).is_empty();
+        if !left && !right {
+            return None;
         }
-
-        ignore_lines
-    }
-
-    fn check_line(&self, line: &str, line_index: usize) -> Option<RuleViolation> {
-        if let Some(captures) = CLOSED_ATX_REGEX.captures(line) {
-            let left_space = captures.get(2).unwrap().as_str();
-            let right_space = captures.get(4).unwrap().as_str();
-            let right_escape = captures.get(5).unwrap().as_str();
-
-            let missing_left_space = left_space.is_empty();
-            let missing_right_space = right_space.is_empty() || !right_escape.is_empty();
-
-            if missing_left_space || missing_right_space {
-                return Some(self.create_violation_for_line(line, line_index));
-            }
-        }
-        None
-    }
-
-    fn create_violation_for_line(&self, line: &str, line_index: usize) -> RuleViolation {
-        RuleViolation::new(
+        // markdownlint points at whichever side is missing its space, one column before the closing
+        // hashes, and the left side wins when both are.
+        let (column, width) = if left {
+            (0, left_hash.len() + 1)
+        } else {
+            (
+                line.len() - group(7).len() - right_hash.len() - 1,
+                right_hash.len() + 1,
+            )
+        };
+        Some(RuleViolation::new(
             &MD020,
-            MD020.description.to_string(),
+            format!(
+                "{} [Context: \"{}\"]",
+                MD020.description,
+                ellipsify(line.trim(), left, right)
+            ),
             self.context.file_path.clone(),
             range_from_node_range(&crate::ast::NodeRange {
-                start_byte: 0,
-                end_byte: line.len(),
-                start_point: crate::ast::Point {
-                    row: line_index,
-                    column: 0,
-                },
+                start_byte: self.context.line_start_byte(row) + column,
+                end_byte: self.context.line_start_byte(row) + column + width,
+                start_point: crate::ast::Point { row, column },
                 end_point: crate::ast::Point {
-                    row: line_index,
-                    column: line.len(),
+                    row,
+                    column: column + width,
                 },
             }),
-        )
+        ))
     }
 }
 
 impl RuleLinter for MD020Linter {
     fn feed(&mut self, node: &Node) {
-        // For line-based rules, we analyze all lines at once when we see the document node.
-        if node.kind() == "document" {
-            self.analyze_all_lines();
+        if matches!(
+            node.kind(),
+            "fenced_code_block" | "indented_code_block" | "html_block"
+        ) {
+            self.cover(*node);
         }
     }
 
+    /// The scan waits for `finalize` so that every block has been seen, however the document orders
+    /// them.
     fn finalize(&mut self) -> Vec<RuleViolation> {
-        std::mem::take(&mut self.violations)
+        self.analyze()
     }
 }
 
@@ -117,185 +113,151 @@ pub const MD020: Rule = Rule {
     tags: &["headings", "atx_closed", "spaces"],
     description: "No space inside hashes on closed atx style heading",
     rule_type: RuleType::Line,
-    required_nodes: &[], // Line-based rules don't require specific nodes
+    required_nodes: &["fenced_code_block", "indented_code_block", "html_block"],
     new_linter: |context| Box::new(MD020Linter::new(context)),
 };
 
 #[cfg(test)]
 mod test {
+    use std::path::PathBuf;
+
     use crate::config::RuleSeverity;
     use crate::linter::MultiRuleLinter;
     use crate::test_utils::test_helpers::test_config_with_rules;
-    use std::path::PathBuf;
 
-    fn test_config() -> crate::config::QuickmarkConfig {
-        test_config_with_rules(vec![("no-missing-space-closed-atx", RuleSeverity::Error)])
+    /// A report: the 1-based line and column, and the heading markdownlint quotes. The column is the
+    /// left hash run when that side is missing its space, and the character before the right hash run
+    /// otherwise.
+    type Report = (usize, usize, &'static str);
+    type Found = (usize, usize, String);
+    type Case = (&'static str, &'static str, &'static [Report]);
+
+    fn reports(input: &str) -> Vec<Found> {
+        let config =
+            test_config_with_rules(vec![("no-missing-space-closed-atx", RuleSeverity::Error)]);
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let context = violation
+                    .message()
+                    .split_once("[Context: \"")
+                    .and_then(|(_, rest)| rest.strip_suffix("\"]"))
+                    .unwrap_or_default();
+                let range = &violation.location().range;
+                (
+                    range.start.line + 1,
+                    range.start.character + 1,
+                    context.to_string(),
+                )
+            })
+            .collect()
     }
 
-    #[test]
-    fn test_md020_missing_space_left_side() {
-        let config = test_config();
-        let input = "#Heading 1#";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("No space inside hashes"));
+    fn owned(reports: &[Report]) -> Vec<Found> {
+        reports
+            .iter()
+            .map(|&(line, column, context)| (line, column, context.to_string()))
+            .collect()
     }
 
+    /// Every expectation measured against markdownlint-cli2 v0.23.3. This rule reads lines, not the
+    /// tree, so a heading micromark would not call closed — `#  x#`, whose hashes are not preceded
+    /// by a space — is still one as far as it is concerned.
     #[test]
-    fn test_md020_missing_space_right_side() {
-        let config = test_config();
-        let input = "# Heading 1#";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("No space inside hashes"));
-    }
-
-    #[test]
-    fn test_md020_missing_space_both_sides() {
-        let config = test_config();
-        let input = "##Heading 2##";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("No space inside hashes"));
-    }
-
-    #[test]
-    fn test_md020_correct_spacing() {
-        let config = test_config();
-        let input = "# Heading 1 #\n## Heading 2 ##\n### Heading 3 ###";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_open_atx_headings_ignored() {
-        let config = test_config();
-        let input = "# Open Heading 1\n## Open Heading 2\n### Open Heading 3";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_setext_headings_ignored() {
-        let config = test_config();
-        let input = "Setext Heading 1\n================\n\nSetext Heading 2\n----------------";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_escaped_hash() {
-        let config = test_config();
-        let input = "## Heading \\##";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("No space inside hashes"));
-    }
-
-    #[test]
-    fn test_md020_escaped_hash_with_space() {
-        let config = test_config();
-        let input = "## Heading \\# ##";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_multiple_violations_in_file() {
-        let config = test_config();
-        let input = "#Heading 1#\n\n## Heading 2##\n\n###Heading 3###\n\n#### Correct Heading ####";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 3);
-    }
-
-    #[test]
-    fn test_md020_code_blocks_ignored() {
-        let config = test_config();
-        let input =
-            "```\n#BadHeading#\n##AnotherBad##\n```\n\n    #IndentedCodeBad#\n\n# Good Heading #";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_html_flow_ignored() {
-        let config = test_config();
-        let input = "<div>\n#BadHeading#\n##AnotherBad##\n</div>\n\n# Good Heading #";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_trailing_spaces() {
-        let config = test_config();
-        let input = "# Heading 1 #   \n## Heading 2 ##\t\n### Heading 3 ###\n";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_unbalanced_closing_hashes() {
-        let config = test_config();
-        let input = "# Heading 1 ########\n## Heading 2##########\n### Heading 3 #";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1); // Only the second one violates (missing space before #)
-    }
-
-    #[test]
-    fn test_md020_tabs_as_spaces() {
-        let config = test_config();
-        let input = "#\tHeading 1\t#\n##\t\tHeading 2\t##\n###   Heading 3   ###";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_mixed_whitespace() {
-        let config = test_config();
-        let input = "# \tHeading 1 \t#\n##  Heading 2\t ##\n### \t Heading 3 \t ###";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_content_with_hashes() {
-        let config = test_config();
-        let input = "# Heading with # hash #\n## Another # heading ##\n### Multiple ## hashes ###";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_empty_heading() {
-        let config = test_config();
-        let input = "# #\n## ##\n### ###";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        // Empty headings should be ignored or handled by other rules
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_md020_complex_content() {
-        let config = test_config();
-        let input = "# Complex *italic* **bold** `code` content #\n## Link [text](url) content ##\n### Image ![alt](src) content ###";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        assert_eq!(linter.analyze().len(), 0);
+    fn matches_markdownlint() {
+        let cases: &[Case] = &[
+            ("an open heading with no space", "#x\n", &[]),
+            ("an open heading with one space", "# x\n", &[]),
+            ("an open heading with two spaces", "#  x\n", &[]),
+            ("an open heading with three spaces", "#   x\n", &[]),
+            ("a closed heading with no spaces", "#x#\n", &[(1, 1, "#x#")]),
+            ("a closed heading with one space each side", "# x #\n", &[]),
+            (
+                "a closed heading with two spaces each side",
+                "#  x  #\n",
+                &[],
+            ),
+            (
+                "a closed heading with two spaces before the hashes",
+                "# x  #\n",
+                &[],
+            ),
+            (
+                "a closed heading with two spaces after the hashes",
+                "#  x #\n",
+                &[],
+            ),
+            ("two hashes and nothing else", "##\n", &[]),
+            ("two hashes around two spaces", "##  ##\n", &[]),
+            ("two hashes around one space", "## ##\n", &[]),
+            ("four hashes and nothing else", "####\n", &[]),
+            ("a heading closed by an escaped hash", "# x \\#\n", &[]),
+            ("a hash inside the text", "# a#b #\n", &[]),
+            ("an open heading with a tab", "#\tx\n", &[]),
+            ("a closed heading with tabs", "# x\t#\n", &[]),
+            ("a closed heading followed by spaces", "# x #  \n", &[]),
+            ("an indented open heading", "  #  x\n", &[]),
+            ("an indented closed heading", "  #  x  #\n", &[]),
+            (
+                "a closed heading in a fenced code block",
+                "```\n#  x  #\n```\n",
+                &[],
+            ),
+            (
+                "a closed heading after a fenced code block",
+                "```\ncode\n```\n#  x  #\n",
+                &[],
+            ),
+            ("a closed heading in indented code", "    #  x  #\n", &[]),
+            ("a setext heading", "Setext\n======\n", &[]),
+            (
+                "a setext heading with trailing spaces",
+                "Setext  \n--------\n",
+                &[],
+            ),
+            ("seven hashes", "#######  x\n", &[]),
+            ("a heading closed by more hashes", "## x ###\n", &[]),
+            ("a heading closed by fewer hashes", "### x ##\n", &[]),
+            (
+                "a closed heading with a hash in the text",
+                "#  x  #  y  #\n",
+                &[],
+            ),
+            (
+                "a closed heading with no space after the hashes",
+                "#x  #\n",
+                &[(1, 1, "#x  #")],
+            ),
+            (
+                "a closed heading with no space before the hashes",
+                "#  x#\n",
+                &[(1, 4, "#  x#")],
+            ),
+            (
+                "a closed heading after an html block",
+                "<div>\nx\n</div>\n#  x  #\n",
+                &[],
+            ),
+            ("a heading with one space and no text", "# \n", &[]),
+            ("a heading with two spaces and no text", "#  \n", &[]),
+            (
+                "a closed heading and an open one",
+                "#  x  #\n\n##  y\n",
+                &[],
+            ),
+            ("a tab indented open heading", "\t#  x\n", &[]),
+            (
+                "a heading whose closing hash is not at the end",
+                "#  x  # trailing\n",
+                &[],
+            ),
+            ("a heading with two hashes inside", "# x # x #\n", &[]),
+            ("a closed heading around a dash", "#-#\n", &[(1, 1, "#-#")]),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(owned(expected), reports(input), "{name}");
+        }
     }
 }

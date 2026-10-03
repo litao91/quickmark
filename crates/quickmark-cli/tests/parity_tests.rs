@@ -56,10 +56,15 @@ fn parse_diagnostic(line: &str) -> Option<(String, usize, String)> {
     let rest = line
         .strip_prefix("ERR: ")
         .or_else(|| line.strip_prefix("WARN: "))?;
-    // The rule id is the last space-separated token's prefix, which keeps paths containing spaces
-    // or colons intact.
-    let at = rest.rfind(" MD")?;
-    let rule = rest[at + 1..].split('/').next()?.to_string();
+    // The rule id is the first `MD<digits>/` in the line. Taking the last space before `MD`, as this
+    // used to, breaks on a message that quotes a rule name — MD019's context is the heading it is
+    // about, and the fixture for it is a heading called `MD019`.
+    let (at, rule) = rest.match_indices(" MD").find_map(|(at, _)| {
+        let id = rest[at + 1..].split('/').next()?;
+        let digits = id.strip_prefix("MD")?;
+        (digits.len() == 3 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .then_some((at, id.to_string()))
+    })?;
     let mut parts = rest[..at].rsplitn(3, ':');
     let _column = parts.next()?;
     let line_number = parts.next()?.parse().ok()?;

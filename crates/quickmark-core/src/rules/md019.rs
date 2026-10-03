@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::linter::{Context, RuleLinter, RuleViolation};
 
-use super::{Rule, RuleType};
+use super::{ellipsify, Rule, RuleType};
 
 pub(crate) struct MD019Linter {
     context: Rc<Context>,
@@ -52,14 +52,13 @@ impl MD019Linter {
         }
 
         // markdownlint reports from the second character of the run to its end, which is the part
-        // its fix deletes.
+        // its fix deletes, and quotes the heading line trimmed — the start of it, because that is
+        // the end the report is about.
         let start = from - line_start + 1;
+        let context = ellipsify(source[line_start..line_end].trim(), true, false);
         self.violations.push(RuleViolation::new(
             &MD019,
-            format!(
-                "Multiple spaces after hash on atx style heading [Expected: 1; Actual: {}]",
-                to - from
-            ),
+            format!("{} [Context: \"{context}\"]", MD019.description),
             self.context.file_path.clone(),
             crate::linter::Range {
                 start: crate::linter::CharPosition {
@@ -185,6 +184,35 @@ mod test {
         for &(source, expected) in CASES {
             assert_eq!(expected, positions(source).as_slice(), "source {source:?}");
         }
+    }
+
+    /// markdownlint quotes the heading line trimmed, ellipsified towards its start because that is
+    /// the end the report is about.
+    #[test]
+    fn a_report_quotes_the_heading() {
+        let config = test_config_with_rules(vec![
+            ("no-multiple-space-atx", RuleSeverity::Error),
+            ("heading-style", RuleSeverity::Off),
+            ("heading-increment", RuleSeverity::Off),
+        ]);
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, "  #  x  \n");
+        let violations = linter.analyze();
+        assert_eq!(1, violations.len());
+        assert_eq!(
+            "Multiple spaces after hash on atx style heading [Context: \"#  x\"]",
+            violations[0].message()
+        );
+        let range = &violations[0].location().range;
+        assert_eq!(
+            (0, 4, 0, 5),
+            (
+                range.start.line,
+                range.start.character,
+                range.end.line,
+                range.end.character
+            )
+        );
     }
 
     #[test]
