@@ -8,54 +8,62 @@ use regex::Regex;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    rules::{ellipsify, label_span, Context, Label, Rule, RuleLinter, RuleType},
 };
 
 // MD059-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
 pub struct MD059DescriptiveLinkTextTable {
-    #[serde(default)]
+    // Not `#[serde(default)]`: a settings table that sets nothing still gets the default prohibited
+    // texts, which is what markdownlint's `config.prohibited_texts || [...]` does.
+    #[serde(default = "default_prohibited_texts")]
     pub prohibited_texts: Vec<String>,
+}
+
+fn default_prohibited_texts() -> Vec<String> {
+    vec![
+        "click here".to_string(),
+        "here".to_string(),
+        "link".to_string(),
+        "more".to_string(),
+    ]
 }
 
 impl Default for MD059DescriptiveLinkTextTable {
     fn default() -> Self {
         Self {
-            prohibited_texts: vec![
-                "click here".to_string(),
-                "here".to_string(),
-                "link".to_string(),
-                "more".to_string(),
-            ],
+            prohibited_texts: default_prohibited_texts(),
         }
     }
 }
 
-// Regular inline links: [text](url) - but NOT images ![text](url)
-static RE_INLINE_LINK: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?:^|[^!])\[([^\]]*)\]\(([^)]+)\)").expect("Failed to compile inline link regex")
-});
+/// markdownlint's `normalize`, first half: every run of characters that is not an ASCII letter or
+/// digit becomes one space. Spelled out rather than as markdownlint's `[\W_]`, which is ASCII-only
+/// in a JavaScript pattern without the `u` flag and so cannot be written that way here — a
+/// byte-oriented `\W` would match half of a multi-byte character.
+static NOT_ALPHANUMERIC: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[^A-Za-z0-9]+").expect("Invalid MD059 punctuation regex"));
+static WHITESPACE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\s+").expect("Invalid MD059 whitespace regex"));
 
-// Reference links: [text][ref] - but NOT images ![text][ref]
-static RE_REF_LINK: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?:^|[^!])\[([^\]]*)\]\[([^\]]+)\]")
-        .expect("Failed to compile reference link regex")
-});
+fn normalize_text(text: &str) -> String {
+    let punctuated = NOT_ALPHANUMERIC.replace_all(text, " ");
+    WHITESPACE
+        .replace_all(&punctuated, " ")
+        .to_lowercase()
+        .trim()
+        .to_string()
+}
 
-// Collapsed reference links: [text][] - but NOT images ![text][]
-static RE_COLLAPSED_REF_LINK: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?:^|[^!])\[([^\]]+)\]\[\]")
-        .expect("Failed to compile collapsed reference link regex")
-});
-
-static RE_NORMALIZE_PUNCTUATION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[\W_]+").expect("Failed to compile punctuation regex"));
-static RE_NORMALIZE_WHITESPACE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\s+").expect("Failed to compile whitespace regex"));
+/// markdownlint's `addErrorContext` turns every `\r\n` and `\r` into a `\n`, and `markdownlint.mjs`
+/// then turns every `\n` in a context into a space — so a label spanning lines still reads as one.
+fn one_line(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
 
 /// MD059 - Link text should be descriptive
 ///
-/// This rule checks that link text provides meaningful description instead of generic phrases.
+/// Reports a link whose label is nothing but one of the prohibited texts.
 pub(crate) struct MD059Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
@@ -80,95 +88,101 @@ impl MD059Linter {
             prohibited_texts,
         }
     }
+
+    fn collect(&mut self, root: Node) {
+        let found = {
+            let source = self.context.document_content.borrow();
+            self.links(root, &source)
+        };
+        self.violations.extend(found);
+    }
+
+    /// Walks the inline subtree, which `feed` never descends into because inline kinds are filtered
+    /// out of dispatch. Pre-order, so a link inside a link's label comes after the one containing it.
+    fn links(&self, root: Node, source: &str) -> Vec<RuleViolation> {
+        let mut found = Vec::new();
+        let mut cursor = root.walk();
+        let mut depth = 0;
+        loop {
+            let node = cursor.node();
+            if node.kind() == "link" {
+                found.extend(self.check(node, source));
+            }
+            if cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+            loop {
+                if depth == 0 {
+                    return found;
+                }
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    return found;
+                }
+                depth -= 1;
+            }
+        }
+    }
+
+    /// An image is not a link, and neither is a reference that resolved to nothing — the parser
+    /// leaves both out of the tree, so `[here]` with no definition is simply not here to find.
+    fn check(&self, link: Node, source: &str) -> Option<RuleViolation> {
+        let label = label_span(link, source)?;
+        // markdownlint skips a label holding a code span or inline HTML, because neither reads aloud
+        // as its own source.
+        let mut cursor = link.walk();
+        let holds_markup = link
+            .children(&mut cursor)
+            .any(|child| matches!(child.kind(), "code_span" | "html_inline"));
+        if holds_markup {
+            return None;
+        }
+        let text = source.get(label.from..label.to)?;
+        self.prohibited_texts
+            .contains(&normalize_text(text))
+            .then(|| self.violation(label, source))
+    }
+
+    fn violation(&self, label: Label, source: &str) -> RuleViolation {
+        // markdownlint quotes the label brackets and all, and points at what is between them.
+        let quoted = source.get(label.from - 1..=label.to).unwrap_or_default();
+        let start = self.context.point_at(label.from);
+        let end_byte = {
+            let lines = self.context.lines.borrow();
+            let line_end = self.context.line_start_byte(start.row) + lines[start.row].len();
+            (label.to + 1).min(line_end)
+        };
+        RuleViolation::new(
+            &MD059,
+            format!(
+                "{} [Context: \"{}\"]",
+                MD059.description,
+                ellipsify(&one_line(quoted), false, false).replace('\n', " ")
+            ),
+            self.context.file_path.clone(),
+            range_from_node_range(&crate::ast::NodeRange {
+                start_byte: label.from,
+                end_byte,
+                start_point: start,
+                end_point: self.context.point_at(end_byte),
+            }),
+        )
+    }
 }
 
 impl RuleLinter for MD059Linter {
     fn feed(&mut self, node: &Node) {
-        // `link` is an inline kind, so it is in the tree but never fed here; the regex scan over the
-        // enclosing `inline` is what finds link text.
         if node.kind() == "inline" {
-            self.check_inline_for_links(node);
+            self.collect(*node);
         }
     }
 
     fn finalize(&mut self) -> Vec<RuleViolation> {
         std::mem::take(&mut self.violations)
     }
-}
-
-impl MD059Linter {
-    fn check_inline_for_links(&mut self, inline_node: &Node) {
-        // Look for links within inline content using the text
-        let link_text = {
-            let document_content = self.context.document_content.borrow();
-            inline_node
-                .utf8_text(document_content.as_bytes())
-                .unwrap_or("")
-                .to_string()
-        };
-
-        // Parse the inline content for markdown links
-        if !link_text.is_empty() {
-            self.check_text_for_link_patterns(&link_text, inline_node);
-        }
-    }
-
-    fn check_text_for_link_patterns(&mut self, text: &str, node: &Node) {
-        let base = node.start_byte();
-        for re in [&*RE_INLINE_LINK, &*RE_REF_LINK, &*RE_COLLAPSED_REF_LINK] {
-            for caps in re.captures_iter(text) {
-                if let Some(label) = caps.get(1) {
-                    // markdownlint reports at the label's own line. An `inline` node spans a whole
-                    // wrapped paragraph, so reporting at its range put every link in the paragraph on
-                    // the paragraph's first line.
-                    self.check_label_for_prohibited_text(label.as_str(), base + label.start());
-                }
-            }
-        }
-    }
-
-    fn check_label_for_prohibited_text(&mut self, label_text: &str, label_byte: usize) {
-        // Check if label text contains code or HTML - if so, skip
-        if label_text.contains('`') || label_text.contains('<') {
-            return;
-        }
-
-        let normalized_text = normalize_text(label_text);
-
-        if self.prohibited_texts.contains(&normalized_text) {
-            self.create_violation(label_byte, label_text);
-        }
-    }
-
-    fn create_violation(&mut self, label_byte: usize, link_text: &str) {
-        let end_byte = label_byte + link_text.len();
-        let message = format!("Link text should be descriptive: '{link_text}'");
-
-        self.violations.push(RuleViolation::new(
-            &MD059,
-            message,
-            self.context.file_path.clone(),
-            range_from_node_range(&crate::ast::NodeRange {
-                start_byte: label_byte,
-                end_byte,
-                start_point: self.context.point_at(label_byte),
-                end_point: self.context.point_at(end_byte),
-            }),
-        ));
-    }
-}
-
-/// Normalizes text using the same algorithm as the original markdownlint
-/// Removes punctuation and extra whitespace, converts to lowercase
-fn normalize_text(text: &str) -> String {
-    // Replace all non-word and underscore characters with spaces
-    let step1 = RE_NORMALIZE_PUNCTUATION.replace_all(text, " ");
-
-    // Replace multiple spaces with single space
-    let step2 = RE_NORMALIZE_WHITESPACE.replace_all(&step1, " ");
-
-    // Convert to lowercase and trim
-    step2.to_lowercase().trim().to_string()
 }
 
 pub const MD059: Rule = Rule {
@@ -185,23 +199,245 @@ pub const MD059: Rule = Rule {
 mod test {
     use std::path::PathBuf;
 
-    use crate::config::RuleSeverity;
+    use crate::config::{LintersSettingsTable, MD059DescriptiveLinkTextTable, RuleSeverity};
     use crate::linter::MultiRuleLinter;
-    use crate::test_utils::test_helpers::test_config_with_rules;
+    use crate::test_utils::test_helpers::test_config_with_settings;
 
     use super::normalize_text;
 
-    fn test_config() -> crate::config::QuickmarkConfig {
-        test_config_with_rules(vec![
-            ("descriptive-link-text", RuleSeverity::Error),
-            ("heading-style", RuleSeverity::Off),
-            ("heading-increment", RuleSeverity::Off),
-            ("line-length", RuleSeverity::Off),
-        ])
+    /// A report: the 1-based line and column of the label's text, and the label markdownlint quotes
+    /// brackets and all.
+    type Report = (usize, usize, &'static str);
+    type Found = (usize, usize, String);
+    type Case = (&'static str, &'static str, &'static [Report]);
+
+    fn test_config(prohibited: &[&str]) -> crate::config::QuickmarkConfig {
+        test_config_with_settings(
+            vec![("descriptive-link-text", RuleSeverity::Error)],
+            LintersSettingsTable {
+                descriptive_link_text: MD059DescriptiveLinkTextTable {
+                    prohibited_texts: prohibited.iter().map(|&text| text.to_string()).collect(),
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    const DEFAULT: [&str; 4] = ["click here", "here", "link", "more"];
+
+    fn owned(reports: &[Report]) -> Vec<Found> {
+        reports
+            .iter()
+            .map(|&(line, column, context)| (line, column, context.to_string()))
+            .collect()
+    }
+
+    fn reports(input: &str, prohibited: &[&str]) -> Vec<Found> {
+        let config = test_config(prohibited);
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        let mut found: Vec<Found> = linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let context = violation
+                    .message()
+                    .split_once("[Context: \"")
+                    .and_then(|(_, rest)| rest.strip_suffix("\"]"))
+                    .unwrap_or_default();
+                let range = &violation.location().range;
+                (
+                    range.start.line + 1,
+                    range.start.character + 1,
+                    context.to_string(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Every expectation measured against markdownlint-cli2 v0.23.3 with its default prohibited
+    /// texts, which are also this crate's.
+    #[test]
+    fn matches_markdownlint() {
+        let cases: &[Case] = &[
+            (
+                "a link with a prohibited label",
+                "[here](https://x.com)\n",
+                &[(1, 2, "[here]")],
+            ),
+            (
+                "a two word prohibited label",
+                "[click here](https://x.com)\n",
+                &[(1, 2, "[click here]")],
+            ),
+            (
+                "a prohibited label in title case",
+                "[Click Here](https://x.com)\n",
+                &[(1, 2, "[Click Here]")],
+            ),
+            ("the word link", "[link](x)\n", &[(1, 2, "[link]")]),
+            ("the word more", "[more](x)\n", &[(1, 2, "[more]")]),
+            (
+                "a label that only contains a prohibited word",
+                "[a link](x)\n",
+                &[],
+            ),
+            (
+                "two links on one line",
+                "[here](x) and [here](y)\n",
+                &[(1, 2, "[here]"), (1, 16, "[here]")],
+            ),
+            ("an image with a prohibited label", "![here](x.png)\n", &[]),
+            (
+                "a full reference link",
+                "[here][ref]\n\n[ref]: /u\n",
+                &[(1, 2, "[here]")],
+            ),
+            (
+                "a collapsed reference link",
+                "[here][]\n\n[here]: /u\n",
+                &[(1, 2, "[here]")],
+            ),
+            (
+                "a shortcut reference link",
+                "[here]\n\n[here]: /u\n",
+                &[(1, 2, "[here]")],
+            ),
+            ("a label that is a code span", "[`here`](x)\n", &[]),
+            ("a label holding inline html", "[<b>here</b>](x)\n", &[]),
+            (
+                "a code span nested in an emphasis",
+                "[a *`here`* b](x)\n",
+                &[],
+            ),
+            ("inside a code span", "`[here](x)`\n", &[]),
+            ("inside a fenced code block", "```\n[here](x)\n```\n", &[]),
+            ("in a heading", "# [here](x)\n", &[(1, 4, "[here]")]),
+            (
+                "in a table cell",
+                "| a |\n| - |\n| [here](x) |\n",
+                &[(3, 4, "[here]")],
+            ),
+            ("in a block quote", "> [here](x)\n", &[(1, 4, "[here]")]),
+            ("in a list item", "- [here](x)\n", &[(1, 4, "[here]")]),
+            ("a label of single letters", "[h.e.r.e](x)\n", &[]),
+            (
+                "a label ending in punctuation",
+                "[here!](x)\n",
+                &[(1, 2, "[here!]")],
+            ),
+            ("a padded label", "[ here ](x)\n", &[(1, 2, "[ here ]")]),
+            ("a label in upper case", "[HERE](x)\n", &[(1, 2, "[HERE]")]),
+            (
+                "inside strong emphasis",
+                "**[here](x)**\n",
+                &[(1, 4, "[here]")],
+            ),
+            ("a label holding brackets", "[a[here]b](x)\n", &[]),
+            ("an autolink", "<https://x.com>\n", &[]),
+            (
+                "a link with a title",
+                "[here](x \"here\")\n",
+                &[(1, 2, "[here]")],
+            ),
+            (
+                "a full reference to its own label",
+                "[here][here]\n\n[here]: /u\n",
+                &[(1, 2, "[here]")],
+            ),
+            (
+                "the word link in title case",
+                "[Link](x)\n",
+                &[(1, 2, "[Link]")],
+            ),
+            ("an image inside a link label", "[![here](y.png)](x)\n", &[]),
+            (
+                "a label that is an emphasis",
+                "[*here*](x)\n",
+                &[(1, 2, "[*here*]")],
+            ),
+            ("inside an html block", "<div>\n[here](x)\n</div>\n", &[]),
+            ("a label with an accent", "[café](x)\n", &[]),
+            (
+                "a label with runs of spaces",
+                "[  click   here  ](x)\n",
+                &[(1, 2, "[  click   here  ]")],
+            ),
+            (
+                "two links in two paragraphs",
+                "[here](x)\n\n[here](y)\n",
+                &[(1, 2, "[here]"), (3, 2, "[here]")],
+            ),
+            (
+                "a shortcut reference with no definition",
+                "text [here] text\n",
+                &[],
+            ),
+            (
+                "before a hard line break",
+                "[here](x)\\\ntext\n",
+                &[(1, 2, "[here]")],
+            ),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(owned(expected), reports(input, &DEFAULT), "{name}");
+        }
+    }
+
+    /// A configured list replaces the default rather than adding to it, and is normalized the same
+    /// way the labels are.
+    #[test]
+    fn a_configured_list_replaces_the_default() {
+        let prohibited = ["download", "read more"];
+        let cases: &[Case] = &[
+            ("one word", "[Download](x)\n", &[(1, 2, "[Download]")]),
+            ("as part of a longer label", "[download it](x)\n", &[]),
+            ("a default that is no longer one", "[here](x)\n", &[]),
+            ("two words", "[Read More](x)\n", &[(1, 2, "[Read More]")]),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(owned(expected), reports(input, &prohibited), "{name}");
+        }
+    }
+
+    /// markdownlint gives a label spanning lines no range at all, so markdownlint-cli2 prints no
+    /// column — but it still quotes the whole label, with every line break turned into a space. The
+    /// report here keeps the line and the context, and its range stops at the end of that line.
+    #[test]
+    fn a_label_spanning_lines_is_quoted_as_one() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("[here\n](x)\n", &DEFAULT, "[here ]"),
+            ("[click\nhere](x)\n", &DEFAULT, "[click here]"),
+            ("[read\nmore](x)\n", &["read more"], "[read more]"),
+        ];
+        for (input, prohibited, context) in cases {
+            assert_eq!(
+                vec![(1, 2, context.to_string())],
+                reports(input, prohibited),
+                "{input:?}"
+            );
+        }
+
+        let config = test_config(&DEFAULT);
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, "[here\n](x)\n");
+        let violations = linter.analyze();
+        assert_eq!(1, violations.len());
+        let range = &violations[0].location().range;
+        assert_eq!(
+            (0, 1, 0, 5),
+            (
+                range.start.line,
+                range.start.character,
+                range.end.line,
+                range.end.character
+            )
+        );
     }
 
     #[test]
-    fn test_normalize_text() {
+    fn normalize_collapses_punctuation_and_case() {
         assert_eq!("click here", normalize_text("click here"));
         assert_eq!("click here", normalize_text("Click Here"));
         assert_eq!("click here", normalize_text("click   here"));
@@ -209,181 +445,7 @@ mod test {
         assert_eq!("click here", normalize_text("click-here"));
         assert_eq!("click here", normalize_text("  click here  "));
         assert_eq!("click here", normalize_text("click.here!"));
-    }
-
-    #[test]
-    fn test_descriptive_link_passes() {
-        let input = "[Download the budget document](https://example.com/budget.pdf)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_generic_link_text_fails() {
-        let input = "[click here](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-        let violation = &violations[0];
-        assert_eq!("MD059", violation.rule().id);
-        assert!(violation
-            .message()
-            .contains("Link text should be descriptive"));
-        assert!(violation.message().contains("click here"));
-    }
-
-    #[test]
-    fn test_prohibited_texts() {
-        let test_cases = vec![
-            "[here](url)",
-            "[link](url)",
-            "[more](url)",
-            "[click here](url)",
-        ];
-
-        for input in test_cases {
-            let config = test_config();
-            let mut linter =
-                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-            let violations = linter.analyze();
-
-            assert_eq!(1, violations.len(), "Failed for input: {input}");
-            let violation = &violations[0];
-            assert_eq!("MD059", violation.rule().id);
-        }
-    }
-
-    #[test]
-    fn test_case_insensitive() {
-        let input = "[CLICK HERE](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-    }
-
-    #[test]
-    fn test_punctuation_normalized() {
-        let input = "[click-here!](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-    }
-
-    #[test]
-    fn test_extra_whitespace_normalized() {
-        let input = "[  click   here  ](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-    }
-
-    #[test]
-    fn test_reference_links() {
-        let input = r#"[click here][ref]
-
-[ref]: https://example.com"#;
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-    }
-
-    #[test]
-    fn test_multiple_links() {
-        let input = "[good link](url1) and [click here](url2) and [another good](url3)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-        assert!(violations[0].message().contains("click here"));
-    }
-
-    #[test]
-    fn test_empty_link_text() {
-        let input = "[](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Empty link text should not match prohibited texts
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_links_with_code_allowed() {
-        let input = "[`click here`](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Links containing code should be allowed
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_image_links_ignored() {
-        let input = "![click here](image.jpg)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Images should be ignored by this rule
-        assert_eq!(0, violations.len());
-    }
-    /// An `inline` node spans a whole wrapped paragraph, so a violation built from its range lands
-    /// on the paragraph's first line no matter where the link is. markdownlint reports at the label's
-    /// own line. Every expectation is a markdownlint-cli2 0.23.3 measurement, 0-based.
-    #[test]
-    fn test_reports_the_line_the_link_label_is_on() {
-        fn rows(input: &str) -> Vec<usize> {
-            let mut linter =
-                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
-            linter
-                .analyze()
-                .iter()
-                .filter(|v| v.rule().id == "MD059")
-                .map(|v| v.location().range.start.line)
-                .collect()
-        }
-
-        assert_eq!(
-            vec![1],
-            rows("intro text here\nand [click here](/a) on line two\n")
-        );
-        assert_eq!(
-            vec![0],
-            rows("[here](/a) then more words\non a second line\n")
-        );
-        assert_eq!(vec![0, 0], rows("one [link](/x) and two [more](/y) here\n"));
-        assert_eq!(vec![0, 2], rows("a [here](/x) b\n\nc [more](/y) d\n"));
-        // Inside a list item, a block quote and a table cell.
-        assert_eq!(vec![3], rows("- item\n\n  text\n  [click here](/a)\n"));
-        assert_eq!(vec![1], rows("> quote\n> [more](/y) here\n"));
-        assert_eq!(vec![2], rows("| a |\n|---|\n| [here](/x) |\n"));
-        // A label holding a code span is exempt.
-        assert!(rows("see [`here`](/x) ok\n").is_empty());
+        // `\W` is ASCII-only in markdownlint's pattern, so an accent is punctuation.
+        assert_eq!("caf", normalize_text("café"));
     }
 }
