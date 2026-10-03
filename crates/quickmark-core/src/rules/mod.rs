@@ -100,6 +100,25 @@ fn without_comments(line: &str) -> String {
     }
 }
 
+/// Shortens the context a message quotes, exactly as markdownlint's `helpers.cjs:ellipsify` does:
+/// over thirty characters it keeps the start, the end, or fifteen of each. `start` and `end` say
+/// which of the two the rule cares about, and a rule that cares about neither gets the head.
+pub(crate) fn ellipsify(text: &str, start: bool, end: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= 30 {
+        return text.to_string();
+    }
+    let head = |count: usize| chars.iter().take(count).collect::<String>();
+    let tail = |count: usize| chars.iter().skip(chars.len() - count).collect::<String>();
+    if start && end {
+        format!("{}...{}", head(15), tail(15))
+    } else if end {
+        format!("...{}", tail(30))
+    } else {
+        format!("{}...", head(30))
+    }
+}
+
 #[derive(Debug)]
 pub struct Rule {
     pub id: &'static str,

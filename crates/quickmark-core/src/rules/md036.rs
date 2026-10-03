@@ -7,149 +7,26 @@ use crate::ast::Node;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::md037::is_escaped;
-use super::md049::{CODE_SPAN_REGEX, MATH_REGEX};
-use super::{Rule, RuleType};
+use super::{ellipsify, Rule, RuleType};
 
-// Inline content that micromark tokenises as something other than `data`, which is the only child
-// markdownlint tolerates inside a reported emphasis. Each alternative is one token type: character
-// escape, inline HTML tag, angle-bracket autolink, GFM autolink literal, GFM email literal, and
-// character reference. A bare `<`, `&` or `]` stays literal text, so none of those characters
-// appears here on its own.
-static NON_DATA_REGEX: Lazy<Regex> = Lazy::new(|| {
+/// Inline markup micromark tokenises on its own but comrak leaves inside a `text` node, which is
+/// what stops markdownlint reporting an emphasis that holds one. A bare URL or email is a GFM
+/// autolink literal and quickmark parses without that extension; a character reference comrak
+/// decodes and merges into the text around it.
+static NOT_PLAIN_TEXT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
-        r"\\[!-/:-@\[-_`{-~]",
-        r"|</?[A-Za-z][A-Za-z0-9-]*(?:[\s/][^>\n]*)?>",
-        r"|<(?:[A-Za-z][A-Za-z0-9+.-]*:[^<>\n]*|[^<>\s@]+@[^<>\s@]+\.[^<>\s]+)>",
-        r"|(?:www\.|[A-Za-z][A-Za-z0-9+.-]*://)[^<>\s]",
+        r"(?:www\.|[A-Za-z][A-Za-z0-9+.-]*://)[^<>\s]",
         r"|[^<>\s@]+@[^<>\s@]+\.[A-Za-z]{2,}",
         r"|&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]{1,31});",
     ))
-    .expect("Invalid MD036 non-data regex")
+    .expect("Invalid MD036 markup regex")
 });
-
-/// A run of `*` or `_` that CommonMark may use to open or close emphasis.
-struct DelimiterRun {
-    marker: u8,
-    len: usize,
-    can_open: bool,
-    can_close: bool,
-}
-
-/// The delimiter runs in `text`, approximating CommonMark's flanking rules: a run opens when
-/// non-whitespace follows it and closes when non-whitespace precedes it. A `_` between two
-/// alphanumeric characters is not a delimiter at all, which is why `snake_case_name` is plain text
-/// while `_name_` is not.
-fn delimiter_runs(text: &str) -> Vec<DelimiterRun> {
-    let bytes = text.as_bytes();
-    let mut runs = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        let marker = bytes[index];
-        if (marker != b'*' && marker != b'_') || is_escaped(text, index) {
-            index += 1;
-            continue;
-        }
-        let end = index + bytes[index..].iter().take_while(|&&b| b == marker).count();
-        let before = index.checked_sub(1).map(|previous| bytes[previous]);
-        let after = bytes.get(end).copied();
-        let intraword = marker == b'_'
-            && before.is_some_and(|byte| byte.is_ascii_alphanumeric())
-            && after.is_some_and(|byte| byte.is_ascii_alphanumeric());
-        if !intraword {
-            runs.push(DelimiterRun {
-                marker,
-                len: end - index,
-                can_open: after.is_some_and(|byte| !byte.is_ascii_whitespace()),
-                can_close: before.is_some_and(|byte| !byte.is_ascii_whitespace()),
-            });
-        }
-        index = end;
-    }
-    runs
-}
-
-/// Whether CommonMark's "rule of 3" keeps two runs apart: when either run can both open and close,
-/// their lengths must not sum to a multiple of three unless both are themselves multiples of three.
-/// This is what makes `**a*b**` one strong emphasis rather than a nested pair.
-fn rule_of_three_blocks(opener_can_close: bool, opener_len: usize, closer: &DelimiterRun) -> bool {
-    (opener_can_close || closer.can_open)
-        && (opener_len + closer.len).is_multiple_of(3)
-        && !(opener_len.is_multiple_of(3) && closer.len.is_multiple_of(3))
-}
-
-/// Whether `text` holds a matched emphasis pair. A marker that never finds a partner stays literal
-/// data, so counting markers is not enough — `**a*b**` is plain text but `**a*b*c**` is not.
-fn has_emphasis_pair(text: &str) -> bool {
-    let runs = delimiter_runs(text);
-    runs.iter().enumerate().any(|(opener_index, opener)| {
-        opener.can_open
-            && runs[opener_index + 1..].iter().any(|closer| {
-                closer.marker == opener.marker
-                    && closer.can_close
-                    && !rule_of_three_blocks(opener.can_close, opener.len, closer)
-            })
-    })
-}
-
-/// Whether the leading delimiter run of an emphasis is claimed by a run inside its own content,
-/// which leaves trailing text in the paragraph. In `**a**b**` the inner `**` closes the emphasis
-/// after `a`, so the paragraph is a strong plus the literal `b**` — two children, not one.
-fn opener_claimed_by_inner(inner: &str, outer_len: usize, marker: u8) -> bool {
-    delimiter_runs(inner)
-        .iter()
-        // The leading run sits at the start of the paragraph, so it can never close.
-        .any(|run| {
-            run.marker == marker && run.can_close && !rule_of_three_blocks(false, outer_len, run)
-        })
-}
-
-/// The content of `text` when the whole inline is a single emphasis span, otherwise `None`.
-///
-/// `***x***` nests an emphasis inside a strong, so neither token holds plain data on its own and
-/// the paragraph is left alone. Leading indentation is consumed at block level and does not matter,
-/// but whitespace *after* the closing delimiter does — the caller checks for it in the document.
-fn sole_emphasis_content(text: &str) -> Option<&str> {
-    let text = text.trim_start();
-    let bytes = text.as_bytes();
-    let marker = *bytes.first()?;
-    if marker != b'*' && marker != b'_' {
-        return None;
-    }
-    let run_len = bytes.iter().take_while(|&&byte| byte == marker).count();
-    if !matches!(run_len, 1 | 2) || bytes.len() <= 2 * run_len {
-        return None;
-    }
-    let closing = &bytes[bytes.len() - run_len..];
-    if closing.iter().any(|&byte| byte != marker) {
-        return None;
-    }
-    // Markers adjacent to the content belong to the delimiters, so the run lengths would be wrong.
-    if bytes[run_len] == marker || bytes[bytes.len() - run_len - 1] == marker {
-        return None;
-    }
-    let inner = &text[run_len..bytes.len() - run_len];
-    (!opener_claimed_by_inner(inner, run_len, marker)).then_some(inner)
-}
-
-/// Whether the emphasized content carries inline markup of its own. markdownlint reports an
-/// emphasis only when its text child is a single `data` token, so `**\`code\`**`, `**$x$**`,
-/// `**a [b] c**` and `**a _b_ c**` are all left alone. An unmatched marker is literal and does not
-/// count, which is why the emphasis scan is paired rather than a search for `*`.
-fn contains_inline_markup(text: &str) -> bool {
-    text.contains('\n')
-        || text.contains('[')
-        || NON_DATA_REGEX.is_match(text)
-        || CODE_SPAN_REGEX.is_match(text)
-        || MATH_REGEX.is_match(text)
-        || has_emphasis_pair(text)
-}
 
 /// markdownlint only considers a paragraph whose micromark parent is the document's `content`
 /// chunk, which excludes anything nested in a list item, block quote, table cell or HTML block.
-/// tree-sitter wraps document-level blocks in `section` nodes, so those are the only other
-/// ancestors a candidate paragraph may have.
-fn is_document_level(node: &Node) -> bool {
+/// The facade wraps document-level blocks in `section` nodes, so those are the only other ancestors
+/// a candidate paragraph may have.
+fn is_document_level(node: Node) -> bool {
     let mut current = node.parent();
     while let Some(ancestor) = current {
         if !matches!(ancestor.kind(), "section" | "document") {
@@ -158,6 +35,31 @@ fn is_document_level(node: &Node) -> bool {
         current = ancestor.parent();
     }
     true
+}
+
+/// Whether the text holds a backslash escape. CommonMark escapes any ASCII punctuation, and a
+/// backslash before anything else is a literal character that stays in the surrounding text.
+fn has_escape(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let Some(rest) = bytes.get(1..) else {
+        return false;
+    };
+    bytes
+        .iter()
+        .zip(rest)
+        .any(|(&left, &right)| left == b'\\' && right.is_ascii_punctuation())
+}
+
+/// Whether a paragraph child counts, in markdownlint's sense. An inline HTML tag does not, and
+/// neither does a run of whitespace that micromark tokenises as an empty `data`. Everything else
+/// does — including a soft line break and the trailing whitespace a `lineSuffix` covers, neither of
+/// which the facade has a node for, so [`MD036Linter::emphasis_heading`] looks for both itself.
+fn is_meaningful(node: Node, source: &str) -> bool {
+    match node.kind() {
+        "html_inline" => false,
+        "text" => !source[node.start_byte()..node.end_byte()].trim().is_empty(),
+        _ => true,
+    }
 }
 
 // MD036-specific configuration types
@@ -188,81 +90,111 @@ impl MD036Linter {
         }
     }
 
-    fn check_paragraph_for_emphasis_heading(&mut self, paragraph_node: &Node) {
-        if !is_document_level(paragraph_node) {
+    fn check(&mut self, paragraph: Node) {
+        if !is_document_level(paragraph) {
             return;
         }
-
         // A paragraph holds a single inline node covering all of its content.
-        let Some(inline_node) = paragraph_node.named_child(0) else {
+        let Some(inline) = paragraph.named_child(0) else {
             return;
         };
-        if inline_node.kind() != "inline" {
+        if inline.kind() != "inline" {
             return;
         }
 
-        let source = self.context.get_document_content();
-        let inline_text = &source[inline_node.start_byte()..inline_node.end_byte()];
-        let Some(inner_text) = sole_emphasis_content(inline_text) else {
+        let text = {
+            let source = self.context.get_document_content();
+            self.emphasis_heading(inline, &source)
+        };
+        let Some(text) = text else {
             return;
         };
-        // Whitespace trailing the closing delimiter is a token of its own and counts as a second
-        // meaningful child, so `**x** ` reads as prose. Leading indentation does not: it is
-        // consumed at block level. The inline node ends before the trailing whitespace, so it has
-        // to be looked for in the document rather than in `inline_text`.
-        if source[inline_node.end_byte()..].starts_with([' ', '\t']) {
-            return;
+
+        self.violations.push(RuleViolation::new(
+            &MD036,
+            format!(
+                "{} [Context: \"{}\"]",
+                MD036.description,
+                ellipsify(&text, false, false)
+            ),
+            self.context.file_path.clone(),
+            range_from_node_range(&inline.range()),
+        ));
+    }
+
+    /// The text of the emphasis a paragraph consists of, when there is one.
+    ///
+    /// markdownlint asks for a paragraph with exactly one child that is neither an inline HTML tag
+    /// nor whitespace, and then for an `emphasis` or `strong` among its children whose own content
+    /// is a single `data` token. The facade emits no marker nodes, so an emphasis's children are
+    /// exactly its content's.
+    fn emphasis_heading(&self, inline: Node, source: &str) -> Option<String> {
+        // A soft line break is a child of its own, so a paragraph spread over more than one line
+        // has at least two and never qualifies.
+        if inline.start_position().row != inline.end_position().row {
+            return None;
         }
-        if inner_text.trim().is_empty() || contains_inline_markup(inner_text) {
-            return;
+        // So is the whitespace a `lineSuffix` covers at the end of the line. It sits outside the
+        // inline, whose end skips it — except at EOF without a newline, where it does not, so this
+        // reads the line rather than the inline.
+        let from = inline.start_byte();
+        let line_end = source[from..]
+            .find(['\n', '\r'])
+            .map_or(source.len(), |offset| from + offset);
+        if source[from..line_end].ends_with([' ', '\t']) {
+            return None;
         }
 
-        let punctuation_chars = &self
+        let mut cursor = inline.walk();
+        let meaningful: Vec<Node> = inline
+            .children(&mut cursor)
+            .filter(|&child| is_meaningful(child, source))
+            .collect();
+        let [emphasis] = meaningful.as_slice() else {
+            return None;
+        };
+        if !matches!(emphasis.kind(), "emphasis" | "strong_emphasis") {
+            return None;
+        }
+        if emphasis.child_count() != 1 {
+            return None;
+        }
+        let inner = emphasis.child(0)?;
+        if inner.kind() != "text" {
+            return None;
+        }
+
+        let text = &source[inner.start_byte()..inner.end_byte()];
+        // micromark also splits `data` around a `[` that opens a link label — even one that never
+        // closes — and around a backslash escape, so an emphasis holding either has more than one
+        // child there and none here.
+        if text.contains('[') || has_escape(text) || NOT_PLAIN_TEXT.is_match(text) {
+            return None;
+        }
+        let punctuation = &self
             .context
             .config
             .linters
             .settings
             .emphasis_as_heading
             .punctuation;
-        if inner_text
+        // A sentence ending in punctuation reads as prose, not as a heading.
+        if text
             .chars()
             .next_back()
-            .is_some_and(|last_char| punctuation_chars.contains(last_char))
+            .is_some_and(|last| punctuation.contains(last))
         {
-            return; // A sentence ending in punctuation reads as prose, not as a heading
+            return None;
         }
 
-        let start = inline_node.start_position();
-        let end = inline_node.end_position();
-        let range = crate::ast::NodeRange {
-            start_byte: 0, // Not used by range_from_node_range
-            end_byte: 0,   // Not used by range_from_node_range
-            start_point: crate::ast::Point {
-                row: start.row,
-                column: start.column,
-            },
-            end_point: crate::ast::Point {
-                row: end.row,
-                column: end.column,
-            },
-        };
-
-        self.violations.push(RuleViolation::new(
-            &MD036,
-            format!("Emphasis used instead of heading: '{}'", inner_text.trim()),
-            self.context.file_path.clone(),
-            range_from_node_range(&range),
-        ));
+        Some(text.to_string())
     }
 }
 
 impl RuleLinter for MD036Linter {
     fn feed(&mut self, node: &Node) {
-        match node.kind() {
-            "paragraph" => self.check_paragraph_for_emphasis_heading(node),
-            _ => {
-                // Ignore other nodes
-            }
+        if node.kind() == "paragraph" {
+            self.check(*node);
         }
     }
 
@@ -289,6 +221,12 @@ mod test {
     use crate::linter::MultiRuleLinter;
     use crate::test_utils::test_helpers::test_config_with_settings;
 
+    /// A report: the 1-based line and the context markdownlint quotes. It gives no column, because
+    /// the rule passes `addErrorContext` no range.
+    type Report = (usize, &'static str);
+    type Found = (usize, String);
+    type Case = (&'static str, &'static str, &'static [Report]);
+
     fn test_config(punctuation: &str) -> crate::config::QuickmarkConfig {
         test_config_with_settings(
             vec![("no-emphasis-as-heading", RuleSeverity::Error)],
@@ -301,185 +239,338 @@ mod test {
         )
     }
 
-    fn test_default_config() -> crate::config::QuickmarkConfig {
-        test_config(".,;:!?。，；：！？")
+    fn owned(reports: &[Report]) -> Vec<Found> {
+        reports
+            .iter()
+            .map(|&(line, context)| (line, context.to_string()))
+            .collect()
+    }
+
+    fn reports(input: &str, punctuation: &str) -> Vec<Found> {
+        let config = test_config(punctuation);
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let context = violation
+                    .message()
+                    .split_once("[Context: \"")
+                    .and_then(|(_, rest)| rest.strip_suffix("\"]"))
+                    .unwrap_or_default();
+                (
+                    violation.location().range.start.line + 1,
+                    context.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every expectation measured against markdownlint-cli2 v0.23.3, which reports a paragraph whose
+    /// one meaningful child is an emphasis holding a single run of plain text.
+    #[test]
+    fn matches_markdownlint() {
+        let cases: &[Case] = &[
+            (
+                "a strong paragraph on its own",
+                "**Section 1**\n\nContent.\n",
+                &[(1, "Section 1")],
+            ),
+            (
+                "an emphasized paragraph on its own",
+                "*Section 1*\n\nContent.\n",
+                &[(1, "Section 1")],
+            ),
+            (
+                "an underscored paragraph on its own",
+                "_Section 1_\n\nContent.\n",
+                &[(1, "Section 1")],
+            ),
+            (
+                "a double underscored paragraph on its own",
+                "__Section 1__\n\nContent.\n",
+                &[(1, "Section 1")],
+            ),
+            (
+                "a strong emphasis inside an emphasis",
+                "***Section 1***\n\nContent.\n",
+                &[],
+            ),
+            (
+                "an emphasis inside a strong emphasis",
+                "**_Section 1_**\n\nContent.\n",
+                &[],
+            ),
+            (
+                "emphasis inside a longer paragraph",
+                "This is **not** a heading\n",
+                &[],
+            ),
+            ("ending in punctuation", "**Ends with.**\n\nContent.\n", &[]),
+            (
+                "followed by trailing whitespace",
+                "**x** \n\nContent.\n",
+                &[],
+            ),
+            (
+                "indented three spaces",
+                "  **x**\n\nContent.\n",
+                &[(1, "x")],
+            ),
+            ("spanning two lines", "**multi\nline**\n\nContent.\n", &[]),
+            ("in a block quote", "> **x**\n\nContent.\n", &[]),
+            ("in a list item", "- **x**\n\nContent.\n", &[]),
+            ("holding a link", "**[a](b)**\n\nContent.\n", &[]),
+            ("holding a code span", "**`a`**\n\nContent.\n", &[]),
+            ("holding math", "**$a$**\n\nContent.\n", &[]),
+            (
+                "inside inline html",
+                "<b>**x**</b>\n\nContent.\n",
+                &[(1, "x")],
+            ),
+            ("beside inline html", "**x** <b>y</b>\n\nContent.\n", &[]),
+            (
+                "holding an unpaired asterisk",
+                "**a*b**\n\nContent.\n",
+                &[(1, "a*b")],
+            ),
+            (
+                "holding an unpaired underscore",
+                "**a_b**\n\nContent.\n",
+                &[(1, "a_b")],
+            ),
+            (
+                "holding underscores between words",
+                "**snake_case_name**\n\nContent.\n",
+                &[(1, "snake_case_name")],
+            ),
+            (
+                "holding a bare ampersand",
+                "**AT&T**\n\nContent.\n",
+                &[(1, "AT&T")],
+            ),
+            (
+                "holding a character reference",
+                "**&amp;**\n\nContent.\n",
+                &[],
+            ),
+            ("holding a backslash escape", "**a\\_b**\n\nContent.\n", &[]),
+            (
+                "holding a bare url",
+                "**see www.example.com now**\n\nContent.\n",
+                &[],
+            ),
+            (
+                "holding an unclosed link label",
+                "**a[b**\n\nContent.\n",
+                &[],
+            ),
+            ("holding unpaired tildes", "** ~~a~~ **\n\nContent.\n", &[]),
+            ("inside an html block", "<div>\n**x**\n</div>\n", &[]),
+            (
+                "ending in full width punctuation",
+                "**Section 1。**\n\nContent.\n",
+                &[],
+            ),
+            ("four asterisks", "****\n\nContent.\n", &[]),
+            ("asterisks around a space", "** **\n\nContent.\n", &[]),
+            (
+                "two paragraphs",
+                "**one**\n\n**two**\n\nContent.\n",
+                &[(1, "one"), (3, "two")],
+            ),
+            (
+                "two lines each holding an emphasis",
+                "**a**\n**b**\n\nContent.\n",
+                &[],
+            ),
+            (
+                "before a link reference definition",
+                "**x**\n\n[a]: /u\n",
+                &[(1, "x")],
+            ),
+            ("in a table cell", "| a |\n| - |\n| **x** |\n", &[]),
+            ("two emphases side by side", "*a* *b*\n\nContent.\n", &[]),
+            ("followed by a trailing tab", "**x**\t\n\nContent.\n", &[]),
+            ("an emphasis closed early", "***a*b**\n\nContent.\n", &[]),
+            ("underscores between letters", "a_b_c\n\nContent.\n", &[]),
+            (
+                "in a fenced code block",
+                "```\n**x**\n```\n\nContent.\n",
+                &[],
+            ),
+            (
+                "after front matter",
+                "---\ntitle: x\n---\n\n**x**\n",
+                &[(5, "x")],
+            ),
+            (
+                "an emphasis with text after it",
+                "**a**b**\n\nContent.\n",
+                &[],
+            ),
+            ("alone in the document", "**x**\n", &[(1, "x")]),
+            (
+                "asterisks around padded text",
+                "**  spaced  **\n\nContent.\n",
+                &[],
+            ),
+            (
+                "holding an inline html tag",
+                "**a <b> b**\n\nContent.\n",
+                &[],
+            ),
+            (
+                "an emphasis closed on the next line",
+                "**a\n**\n\nContent.\n",
+                &[],
+            ),
+            (
+                "after inline html and a space",
+                "<b> **x**</b>\n\nContent.\n",
+                &[(1, "x")],
+            ),
+            (
+                "before a space and inline html",
+                "<b>**x** </b>\n\nContent.\n",
+                &[(1, "x")],
+            ),
+            (
+                "between blank lines in an html block",
+                "<div>\n\n**x**\n\n</div>\n",
+                &[(3, "x")],
+            ),
+            (
+                "longer than thirty characters",
+                "**a heading that is definitely longer than thirty characters**\n\nContent.\n",
+                &[(1, "a heading that is definitely l...")],
+            ),
+            (
+                "a short one and a punctuated one",
+                "_short_\n\n**exactly thirty characters long!!**\n",
+                &[(1, "short")],
+            ),
+            (
+                "holding an escaped backslash",
+                "**a\\\\b**\n\nContent.\n",
+                &[],
+            ),
+            (
+                "holding a backslash before a letter",
+                "**a\\db**\n\nContent.\n",
+                &[(1, "a\\db")],
+            ),
+            (
+                "holding a reference without its semicolon",
+                "**&amp**\n\nContent.\n",
+                &[(1, "&amp")],
+            ),
+            (
+                "holding a numeric character reference",
+                "**a&#35;b**\n\nContent.\n",
+                &[],
+            ),
+            (
+                "holding an angle bracket autolink",
+                "**<https://x.com>**\n\nContent.\n",
+                &[],
+            ),
+            (
+                "holding an unclosed image label",
+                "**a ![b**\n\nContent.\n",
+                &[],
+            ),
+            ("holding a bare email", "**foo@bar.com**\n\nContent.\n", &[]),
+            (
+                "with carriage returns",
+                "**x**\r\n\r\nContent.\r\n",
+                &[(1, "x")],
+            ),
+            ("with trailing spaces and no final newline", "**x**   ", &[]),
+            ("with no final newline", "**x**", &[(1, "x")]),
+            ("followed by a hard line break", "**x**  \ny\n", &[]),
+            ("with text after it", "**x**y\n\nContent.\n", &[]),
+            (
+                "holding a bare dollar",
+                "**a$b**\n\nContent.\n",
+                &[(1, "a$b")],
+            ),
+            (
+                "holding a bare angle bracket",
+                "**a<b**\n\nContent.\n",
+                &[(1, "a<b")],
+            ),
+            (
+                "before an html comment",
+                "**a**\n\n<!-- c -->\n",
+                &[(1, "a")],
+            ),
+            ("holding a url", "**https://x.com/a**\n\nContent.\n", &[]),
+            ("holding a www url", "**www.x.com**\n\nContent.\n", &[]),
+            ("followed by a backslash hard break", "**a**\\\nb\n", &[]),
+            ("indented with a tab", "\t**x**\n\nContent.\n", &[]),
+            (
+                "with trailing spaces at the end of the file",
+                "**x**  \n\nContent.\n",
+                &[],
+            ),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(
+                owned(expected),
+                reports(input, ".,;:!?。，；：！？"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A configured set replaces the default rather than adding to it, so the full-width exclamation
+    /// mark below stops suppressing a report.
+    #[test]
+    fn a_configured_set_replaces_the_default() {
+        let cases: &[Case] = &[
+            (
+                "an exclamation mark",
+                "**This heading has exclamation!**\n\nContent.\n",
+                &[(1, "This heading has exclamation!")],
+            ),
+            (
+                "a period",
+                "**This heading has period.**\n\nContent.\n",
+                &[],
+            ),
+            (
+                "no punctuation at all",
+                "**Empty punctuation**\n\nContent.\n",
+                &[(1, "Empty punctuation")],
+            ),
+            (
+                "a full-width exclamation mark",
+                "**Trailing ！**\n\nContent.\n",
+                &[(1, "Trailing ！")],
+            ),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(owned(expected), reports(input, ".,;:"), "{name}");
+        }
     }
 
     #[test]
-    fn test_emphasis_as_heading_violation() {
-        let config = test_default_config();
-        let input = "**Section 1**\n\nSome content here.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+    fn a_report_covers_the_inline() {
+        let config = test_config(".,;:!?。，；：！？");
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, "  **x**\n");
         let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Section 1"));
-    }
-
-    #[test]
-    fn test_italic_emphasis_as_heading_violation() {
-        let config = test_default_config();
-        let input = "*Section 1*\n\nSome content here.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].message().contains("Section 1"));
-    }
-
-    #[test]
-    fn test_valid_emphasis_in_paragraph() {
-        let config = test_default_config();
-        let input = "This is a normal paragraph with **some emphasis** in it.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_emphasis_with_punctuation_allowed() {
-        let config = test_default_config();
-        let input = "**This ends with punctuation.**\n\nSome content.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_multiline_emphasis_allowed() {
-        let config = test_default_config();
-        let input = "**This is an entire paragraph that has been emphasized\nand spans multiple lines**\n\nContent.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_custom_punctuation() {
-        let config = test_config(".,;:");
-        let input = "**This heading has exclamation!**\n\nContent.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1); // '!' not in custom punctuation
-    }
-
-    #[test]
-    fn test_custom_punctuation_with_allowed() {
-        let config = test_config(".,;:");
-        let input = "**This heading has period.**\n\nContent.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_mixed_emphasis_and_normal_text() {
-        let config = test_default_config();
-        let input = "**Violation here**\n\nThis is a normal paragraph\n**that just happens to have emphasized text in**\neven though the emphasized text is on its own line.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1); // Only the first one should be flagged
-    }
-
-    #[test]
-    fn test_emphasis_with_link() {
-        let config = test_default_config();
-        let input = "**[This is a link](https://example.com)**\n\nContent.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0); // Links should be allowed
-    }
-
-    #[test]
-    fn test_full_width_punctuation() {
-        let config = test_default_config();
-        let input = "**Section with full-width punctuation。**\n\nContent.";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    /// Every expectation below was measured against markdownlint-cli2 v0.23.3, whose MD036 reports
-    /// only a paragraph whose single meaningful child is an emphasis token holding one `data` token.
-    fn count(input: &str) -> usize {
-        let config = test_default_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        linter.analyze().len()
-    }
-
-    #[test]
-    fn test_emphasis_wrapping_code_span_allowed() {
-        assert_eq!(count("**`Lifecycle#start`**\n\nContent."), 0);
-        assert_eq!(count("**a `b` c**\n\nContent."), 0);
-    }
-
-    #[test]
-    fn test_emphasis_wrapping_math_allowed() {
-        assert_eq!(count("**$x^2$**\n\nContent."), 0);
-        assert_eq!(count("**a $b$ c**\n\nContent."), 0);
-        // An unpaired `$$` is literal text, so the content really is plain.
-        assert_eq!(count("**a $$ b**\n\nContent."), 1);
-    }
-
-    #[test]
-    fn test_emphasis_in_block_quote_allowed() {
-        assert_eq!(count("> **Cut**\n\nContent."), 0);
-        assert_eq!(count("> _License: TBD_\n\nContent."), 0);
-    }
-
-    #[test]
-    fn test_two_emphasis_spans_in_one_paragraph_allowed() {
-        assert_eq!(count("**Lexical analysis** or **scanning**\n\nContent."), 0);
-        // The inner `**` closes the leading run, leaving `b**` as a second child.
-        assert_eq!(count("**a**b**\n\nContent."), 0);
-    }
-
-    #[test]
-    fn test_nested_emphasis_allowed() {
-        assert_eq!(count("**an _lvalue_ or an _rvalue_**\n\nContent."), 0);
-        assert_eq!(count("**a*b*c**\n\nContent."), 0);
-        assert_eq!(count("**_a_**\n\nContent."), 0);
-        assert_eq!(count("***bold italic***\n\nContent."), 0);
-    }
-
-    #[test]
-    fn test_unpaired_markers_are_plain_text() {
-        // A marker that never finds a partner stays `data`, so the emphasis still qualifies.
-        assert_eq!(count("**a*b**\n\nContent."), 1);
-        assert_eq!(count("**a_b**\n\nContent."), 1);
-        assert_eq!(count("**snake_case_name**\n\nContent."), 1);
-        assert_eq!(count("**a]b**\n\nContent."), 1);
-        assert_eq!(count("**a<b**\n\nContent."), 1);
-        assert_eq!(count("**AT&T**\n\nContent."), 1);
-        assert_eq!(count("**a ~~b~~ c**\n\nContent."), 1);
-    }
-
-    #[test]
-    fn test_markup_characters_that_are_not_plain_text() {
-        assert_eq!(count("**a\\_b**\n\nContent."), 0); // character escape
-        assert_eq!(count("**a&nbsp;b**\n\nContent."), 0); // character reference
-        assert_eq!(count("**<a>**\n\nContent."), 0); // inline HTML
-        assert_eq!(count("**see www.example.com now**\n\nContent."), 0); // GFM autolink literal
-        assert_eq!(count("**mail foo@bar.com ok**\n\nContent."), 0); // GFM email literal
-        assert_eq!(count("**a[b**\n\nContent."), 0); // label start
-                                                     // A reference without its semicolon is not recognised, so this one stays plain.
-        assert_eq!(count("**&amp**\n\nContent."), 1);
-    }
-
-    #[test]
-    fn test_trailing_whitespace_allowed() {
-        // Trailing whitespace is a token of its own and makes the paragraph two children.
-        assert_eq!(count("**x** \n\nContent."), 0);
-        assert_eq!(count("**x**\t\n\nContent."), 0);
-        // Leading indentation is consumed at block level and changes nothing.
-        assert_eq!(count("  **x**\n\nContent."), 1);
+        assert_eq!(1, violations.len());
+        let range = &violations[0].location().range;
+        assert_eq!(
+            (0, 0, 0, 7),
+            (
+                range.start.line,
+                range.start.character,
+                range.end.line,
+                range.end.character
+            )
+        );
     }
 }

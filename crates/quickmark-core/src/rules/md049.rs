@@ -2,8 +2,6 @@ use serde::Deserialize;
 use std::rc::Rc;
 
 use crate::ast::Node;
-use once_cell::sync::Lazy;
-use regex::Regex;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleViolation},
@@ -40,26 +38,6 @@ impl Default for MD049EmphasisStyleTable {
         }
     }
 }
-
-// The two helpers below belong to md036, which still decides what is emphasis by scanning raw text.
-// Every other emphasis rule reads the inline tree instead, so a code span, a link destination or a
-// math region simply never reaches it as text.
-
-/// Code spans. The content class is dotall: a span may cross lines, and a URL like `l_orderkey__0`
-/// inside one is literal text rather than strong emphasis. Runs of one, two or three backticks are
-/// matched longest first.
-pub(crate) static CODE_SPAN_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?s)```.*?```|``.*?``|`[^`]*`").expect("Invalid code span regex"));
-
-/// Math regions. markdownlint's micromark tokenises `$...$` and `$$...$$` as math, so their content
-/// never becomes inline text and no emphasis rule sees it. Display math may span lines; inline math
-/// follows micromark's constraint that the opening `$` is not followed by whitespace and the
-/// closing `$` is not preceded by whitespace, which is what keeps a price like `$5 and $10` from
-/// being read as math.
-pub(crate) static MATH_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\$\$[\s\S]*?\$\$|\$(?:[^$\s\n]\$|[^$\s\n][^$\n]*[^$\s\n]\$)")
-        .expect("Invalid math regex")
-});
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Marker {

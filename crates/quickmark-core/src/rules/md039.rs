@@ -72,7 +72,7 @@ impl MD039Linter {
                     Side::Trailing.at(self.context.point_at(label.to), run)
                 }),
             ];
-            (ellipsify(&source[label.from - 1..=label.to]), found)
+            (collapsed(&source[label.from - 1..=label.to]), found)
         };
 
         for side in found.into_iter().flatten() {
@@ -81,7 +81,7 @@ impl MD039Linter {
                 format!(
                     "{} [Context: \"{}\"]",
                     MD039.description,
-                    ellipsified(&context, side)
+                    super::ellipsify(&context, false, side.trailing)
                 ),
                 self.context.file_path.clone(),
                 range_from_node_range(&crate::ast::NodeRange {
@@ -192,25 +192,9 @@ fn horizontal_run(text: &str, leading: bool) -> usize {
 }
 
 /// The label with every whitespace run collapsed to one space, which is what markdownlint puts in
-/// the message before [`ellipsified`] shortens it.
-fn ellipsify(label: &str) -> String {
+/// the message before [`super::ellipsify`] shortens it.
+fn collapsed(label: &str) -> String {
     label.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// markdownlint's `ellipsify`: over thirty characters, a leading report keeps the start and a
-/// trailing one the end.
-fn ellipsified(text: &str, side: Placed) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= 30 {
-        return text.to_string();
-    }
-    let head = |count: usize| chars.iter().take(count).collect::<String>();
-    let tail = |count: usize| chars.iter().skip(chars.len() - count).collect::<String>();
-    if side.trailing {
-        format!("...{}", tail(30))
-    } else {
-        format!("{}...", head(30))
-    }
 }
 
 impl RuleLinter for MD039Linter {
