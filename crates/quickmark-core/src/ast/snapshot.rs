@@ -776,6 +776,34 @@ const CASES: &[(&str, &str, &str)] = &[
 )
 "#,
     ),
+    (
+        // micromark's mathFlow ends at its closing fence and what follows is tokenized afresh, but
+        // comrak built one paragraph across the region. The rows after the region are parsed again
+        // as a document of their own, which is where the list MD032 reports on comes from.
+        "a math region ends a comrak block early",
+        "$$\na\n$$\ntext\n1. b\n",
+        r#"(document 0:0-5:0 0-18
+  (section 0:0-5:0 0-18
+    (math_block 0:0-3:0 0-8)
+    (paragraph 3:0-4:0 8-13
+      (inline 3:0-3:4 8-12
+        (text 3:0-3:4 8-12)
+      )
+    )
+    (list 4:0-5:0 13-18
+      (list_item 4:0-5:0 13-18
+        (list_marker_dot 4:0-4:3 13-16)
+        (paragraph 4:3-5:0 16-18
+          (inline 4:3-4:4 16-17
+            (text 4:3-4:4 16-17)
+          )
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
 ];
 
 #[test]

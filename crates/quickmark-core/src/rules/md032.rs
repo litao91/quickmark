@@ -274,6 +274,28 @@ mod test {
             ),
             ("blank first line", "   \n- a\n- b\n", &[]),
             ("trailing blanks only", "- a\n- b\n\n\n", &[]),
+            // A `$$` region ends at its closing fence and micromark tokenizes what follows afresh,
+            // so a list there is a list — even though comrak, which knows nothing of `$$`, built one
+            // block across the region and the tail has to be parsed again to see it.
+            ("math block above, list below", "$$\na\n$$\n- x\n- y\n", &[4]),
+            ("math block above, ordered", "$$\na\n$$\n2. b\n", &[4]),
+            ("math block above, paragraph then list", "$$\na\n$$\ntext\n1. b\n", &[5]),
+            ("math block above, blank below", "$$\na\n$$\n\n1. x\n", &[]),
+            // The region inside the item dies with the item, and the `$$` after it opens a new one,
+            // so `- item` is outside both. Stepping over that opener instead would put it in math.
+            (
+                "math in an item, list after the next region",
+                "- a\n\n  $$\n  x\n\n$$\ny\n$$\n- item\n",
+                &[9],
+            ),
+            (
+                "math in an item, blank before the list",
+                "- a\n\n  $$\n  x\n\n$$\ny\n$$\n\n- item\n",
+                &[],
+            ),
+            // The list after the region is the one an indented code block refuses to start, so
+            // there is no list to surround.
+            ("math block above, code then a refused list", "$$\na\n$$\n    code\n\n2. b\n", &[]),
         ];
 
         let failures: Vec<String> = cases

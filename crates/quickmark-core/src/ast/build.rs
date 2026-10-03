@@ -35,47 +35,42 @@ pub fn parse(source: &str) -> FacadeTree {
         link_targets: HashMap::new(),
         in_footnote_definition: false,
         closed_headings: HashSet::new(),
+        origin_row: 0,
     };
-    builder.math = synth::math_regions(&builder.lines);
-    clip_math_to_containers(&mut builder.math, &builder.lines, root);
-    builder.math_emitted = vec![false; builder.math.len()];
+    let math = math_regions(&builder.lines, root);
+    builder.math_emitted = vec![false; math.len()];
+    builder.math = math;
     builder.build(root, source)
 }
 
-/// Ends each math region with the container it opened in.
+/// The document's `$$…$$` regions.
 ///
 /// micromark's mathFlow is a flow construct, so it lives inside whatever container was open where it
 /// started and dies with it — `tokenizeNonLazyContinuation` gives up on a line the container no
 /// longer covers. An unclosed `$$` inside a list item therefore stops at the item, while the same `$$`
 /// at document level runs to the end of the file. [`synth::math_regions`] only sees lines and cannot
 /// tell the two apart; comrak's containers can.
-fn clip_math_to_containers(math: &mut [synth::Span], lines: &LineIndex<'_>, root: ComrakNode<'_>) {
-    for span in math.iter_mut() {
-        let opener = span.start().0;
-        // Containers holding a row form a chain, so the one that ends soonest is the innermost.
-        let innermost = root
-            .descendants()
-            .filter(|node| {
-                matches!(
-                    node.data().value,
-                    NodeValue::BlockQuote
-                        | NodeValue::List(_)
-                        | NodeValue::Item(_)
-                        | NodeValue::TaskItem(_)
-                )
-            })
-            .map(|node| node.data().sourcepos)
-            .filter(|sourcepos| {
-                let first = (sourcepos.start.line - 1) as u32;
-                let last = (sourcepos.end.line - 1) as u32;
-                first <= opener && opener <= last
-            })
-            .map(|sourcepos| (sourcepos.end.line - 1) as u32)
-            .min();
-        if let Some(last) = innermost {
-            *span = synth::Span::new(span.start(), lines.block_end_row(span.last_row().min(last)));
-        }
-    }
+fn math_regions(lines: &LineIndex<'_>, root: ComrakNode<'_>) -> Vec<synth::Span> {
+    let containers = root
+        .descendants()
+        .filter(|node| {
+            matches!(
+                node.data().value,
+                NodeValue::BlockQuote
+                    | NodeValue::List(_)
+                    | NodeValue::Item(_)
+                    | NodeValue::TaskItem(_)
+            )
+        })
+        .map(|node| node.data().sourcepos)
+        .map(|sourcepos| {
+            (
+                (sourcepos.start.line - 1) as u32,
+                (sourcepos.end.line - 1) as u32,
+            )
+        })
+        .collect::<Vec<_>>();
+    synth::math_regions(lines, &containers)
 }
 
 /// The comrak configuration quickmark parses with. Everything not set here stays at its default,
@@ -159,11 +154,11 @@ impl Node {
 /// A comrak `TableCell`'s inline subtree, waiting to be grafted onto a synthesized
 /// `pipe_table_cell`. `start_byte` is the graft key; `start`/`end` are the span the `inline` node
 /// gets, and `source` is the cell whose children fill it.
-struct CellInline<'a> {
+struct CellInline<'n> {
     start_byte: u32,
     start: (u32, u32),
     end: (u32, u32),
-    source: ComrakNode<'a>,
+    source: ComrakNode<'n>,
 }
 
 struct Builder<'a> {
@@ -196,10 +191,15 @@ struct Builder<'a> {
     in_footnote_definition: bool,
     /// Build-time indices of the closed `atx_heading` nodes, rekeyed by [`Builder::flatten`].
     closed_headings: HashSet<u32>,
+    /// Row added to every position the comrak tree being emitted reports. Zero except while
+    /// [`Builder::emit_math_tail`] emits a block's tail, which is parsed as a document of its own and
+    /// so counts rows from its own first line. Columns need no offset: a tail always starts at a line
+    /// boundary, so comrak's columns in it are already the real ones.
+    origin_row: u32,
 }
 
 impl<'a> Builder<'a> {
-    fn build(&mut self, root: ComrakNode<'a>, source: &str) -> FacadeTree {
+    fn build<'n>(&mut self, root: ComrakNode<'n>, source: &str) -> FacadeTree {
         let document = self.build_document(root, source);
         self.flatten(document)
     }
@@ -232,10 +232,16 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// comrak's 1-based inclusive start, converted to tree-sitter's 0-based exclusive one.
+    /// comrak's 1-based inclusive start, converted to tree-sitter's 0-based exclusive one and moved
+    /// into the document when a tail is being emitted.
     fn start_of(&self, node: ComrakNode<'_>) -> (u32, u32) {
         let sp = node.data().sourcepos;
-        ((sp.start.line - 1) as u32, (sp.start.column - 1) as u32)
+        (self.abs_row(sp.start.line), (sp.start.column - 1) as u32)
+    }
+
+    /// comrak's 1-based line as this document's 0-based row.
+    fn abs_row(&self, line: usize) -> u32 {
+        (line - 1) as u32 + self.origin_row
     }
 
     /// A block's end, normalized to tree-sitter-md's convention of swallowing the trailing newline:
@@ -243,10 +249,10 @@ impl<'a> Builder<'a> {
     /// At EOF with no trailing newline there is no line after, so the two agree.
     fn block_end(&self, node: ComrakNode<'_>) -> (u32, u32) {
         let sp = node.data().sourcepos;
-        if self.lines.has_line(sp.end.line) {
-            (sp.end.line as u32, 0)
+        if self.lines.has_line(sp.end.line + self.origin_row as usize) {
+            (self.abs_row(sp.end.line) + 1, 0)
         } else {
-            ((sp.end.line - 1) as u32, sp.end.column as u32)
+            (self.abs_row(sp.end.line), sp.end.column as u32)
         }
     }
 
@@ -268,7 +274,7 @@ impl<'a> Builder<'a> {
         )
     }
 
-    fn build_document(&mut self, root: ComrakNode<'a>, source: &str) -> u32 {
+    fn build_document<'n>(&mut self, root: ComrakNode<'n>, source: &str) -> u32 {
         let document_end = self.document_end();
         let document = self.add(Kind::Document, (0, 0), document_end);
 
@@ -301,7 +307,7 @@ impl<'a> Builder<'a> {
                 self.push(document, node);
                 continue;
             }
-            if self.math_at(child, &mut top_level) {
+            if self.math_at(child, true, &mut top_level) {
                 continue;
             }
             self.emit_block(child, Nesting::TopLevel, &mut top_level);
@@ -625,7 +631,7 @@ impl<'a> Builder<'a> {
 
     /// Emits one comrak block node and its descendants, appending to `out`. Emits nothing for the
     /// node kinds the facade does not reproduce.
-    fn emit_block(&mut self, node: ComrakNode<'a>, nesting: Nesting, out: &mut Vec<u32>) {
+    fn emit_block<'n>(&mut self, node: ComrakNode<'n>, nesting: Nesting, out: &mut Vec<u32>) {
         let data = node.data();
         match &data.value {
             NodeValue::FrontMatter(_) => {
@@ -688,7 +694,7 @@ impl<'a> Builder<'a> {
             NodeValue::Heading(heading) => {
                 let heading = *heading;
                 let (start, end) = (self.start_col(node, nesting), self.block_end(node));
-                let underline_row = (node.data().sourcepos.end.line - 1) as u32;
+                let underline_row = self.abs_row(node.data().sourcepos.end.line);
                 drop(data);
                 let index = self.emit_heading(&heading, start, end, underline_row, node);
                 out.push(index);
@@ -703,7 +709,7 @@ impl<'a> Builder<'a> {
                 let mut rows = Vec::new();
                 for child in node.children() {
                     if let NodeValue::TableRow(is_header) = child.data().value {
-                        rows.push(((child.data().sourcepos.start.line - 1) as u32, is_header));
+                        rows.push((self.abs_row(child.data().sourcepos.start.line), is_header));
                     }
                 }
                 drop(data);
@@ -748,7 +754,7 @@ impl<'a> Builder<'a> {
         index
     }
 
-    fn emit_container(&mut self, kind: Kind, node: ComrakNode<'a>, nesting: Nesting) -> u32 {
+    fn emit_container<'n>(&mut self, kind: Kind, node: ComrakNode<'n>, nesting: Nesting) -> u32 {
         let mut start = self.start_col(node, nesting);
         // tree-sitter-md starts a nested container at the enclosing item's content column even when
         // the container's own marker is indented past it, so `1. a` followed by `    * x` puts the
@@ -789,7 +795,7 @@ impl<'a> Builder<'a> {
                 awaiting_first_item = false;
                 self.pending_item_start = Some(list_start);
             }
-            if self.math_at(child, &mut children) {
+            if self.math_at(child, false, &mut children) {
                 continue;
             }
             self.emit_block(child, child_nesting, &mut children);
@@ -814,9 +820,9 @@ impl<'a> Builder<'a> {
     /// Only a list whose items hold nothing but paragraphs is rewritten: micromark folds the markers
     /// into the paragraph's own data, and there is no faithful facade shape for a rewritten item
     /// that also holds a nested list or a code block, so those keep comrak's reading.
-    fn interrupted_list_paragraph(
+    fn interrupted_list_paragraph<'n>(
         &mut self,
-        node: ComrakNode<'a>,
+        node: ComrakNode<'n>,
         list: &NodeList,
         previous: Option<u32>,
         nesting: Nesting,
@@ -861,7 +867,12 @@ impl<'a> Builder<'a> {
         Some(out)
     }
 
-    fn emit_list_item(&mut self, node: ComrakNode<'a>, list: &NodeList, nesting: Nesting) -> u32 {
+    fn emit_list_item<'n>(
+        &mut self,
+        node: ComrakNode<'n>,
+        list: &NodeList,
+        nesting: Nesting,
+    ) -> u32 {
         let comrak_start = self.start_col(node, nesting);
         let start = self.pending_item_start.take().unwrap_or(comrak_start);
         let index = self.add(Kind::ListItem, start, self.block_end(node));
@@ -896,7 +907,7 @@ impl<'a> Builder<'a> {
             self.pending_paragraph_start = Some((start.0, item_content_col));
         }
         for child in node.children() {
-            if self.math_at(child, &mut children) {
+            if self.math_at(child, false, &mut children) {
                 continue;
             }
             self.emit_block(child, Nesting::Content(item_content_col), &mut children);
@@ -932,7 +943,7 @@ impl<'a> Builder<'a> {
     ///
     /// Claiming the region's lines also keeps `attach_link_reference_definitions` from reading a
     /// `[a]: /u` inside a math block as a reference definition.
-    fn math_at(&mut self, child: ComrakNode<'a>, out: &mut Vec<u32>) -> bool {
+    fn math_at<'n>(&mut self, child: ComrakNode<'n>, top_level: bool, out: &mut Vec<u32>) -> bool {
         let row = self.start_of(child).0;
         let Some(slot) = self.math.iter().position(|span| span.contains_row(row)) else {
             return false;
@@ -948,14 +959,69 @@ impl<'a> Builder<'a> {
         if holds_region {
             return false;
         }
+        let span = self.math[slot];
         if !self.math_emitted[slot] {
             self.math_emitted[slot] = true;
-            let span = self.math[slot];
             let node = self.add(Kind::MathBlock, span.start(), span.end());
             self.cover(node);
             out.push(node);
         }
+        // Not behind `math_emitted`: the block that opens a region is rarely the one that overhangs
+        // it. Every block the region swallows is checked, and only the last can overhang — a later
+        // sibling starts after this one ends, which is past the region.
+        let end = self.block_end(child);
+        let last_row = if end.1 == 0 {
+            end.0.saturating_sub(1)
+        } else {
+            end.0
+        };
+        if top_level && span.last_row() < last_row {
+            self.emit_math_tail(span.last_row() + 1, last_row, out);
+        }
         true
+    }
+
+    /// Re-parses the rows after a math region's close as a document of their own and emits what it
+    /// finds.
+    ///
+    /// micromark's mathFlow is a flow construct: it ends at its closing fence and everything after
+    /// that is tokenized afresh. comrak knows nothing of `$$`, so the block it built across the
+    /// region has a shape that means nothing — a paragraph starting on the closing `$$` line, or a
+    /// list whose opening item the region swallowed. Dropping that block whole hides real content:
+    /// the tail is what micromark has there instead, and it is where MD032 finds the list a `$$`
+    /// region pushed into the middle of a document.
+    ///
+    /// The tail gets its own regions, so a nested `$$` is found the same way, and its own comrak
+    /// tree, so [`math_regions`] sees the containers the tail really has rather than the ones comrak
+    /// built across the region.
+    ///
+    /// Only a document-level block's tail is re-parsed. Inside a container the tail's rows carry the
+    /// container's prefix, and parsing them on their own would read that prefix as indentation.
+    fn emit_math_tail(&mut self, from: u32, to: u32, out: &mut Vec<u32>) {
+        let tail = self.lines.rows(from as usize, to as usize);
+        let tail_lines = LineIndex::new(tail);
+        let arena = Arena::new();
+        let root = parse_document(&arena, tail, &comrak_options());
+
+        let mut math = math_regions(&tail_lines, root);
+        for span in math.iter_mut() {
+            *span = offset_rows(*span, from);
+        }
+
+        let saved_math = std::mem::replace(&mut self.math, math);
+        let saved_emitted = std::mem::take(&mut self.math_emitted);
+        let saved_origin = self.origin_row;
+        self.math_emitted = vec![false; self.math.len()];
+        self.origin_row = from;
+        for child in root.children() {
+            if self.math_at(child, true, out) {
+                continue;
+            }
+            self.emit_block(child, Nesting::TopLevel, out);
+        }
+        self.origin_row = saved_origin;
+        self.math = saved_math;
+        self.math_emitted = saved_emitted;
     }
 
     /// Whether the task marker at `column` on `row` is the whole line, which is what stops GFM from
@@ -971,7 +1037,7 @@ impl<'a> Builder<'a> {
             && matches!(marker.as_bytes()[1], b' ' | b'x' | b'X')
     }
 
-    fn emit_code_block(
+    fn emit_code_block<'n>(
         &mut self,
         node: ComrakNode<'_>,
         nesting: Nesting,
@@ -1014,11 +1080,11 @@ impl<'a> Builder<'a> {
     /// `source` is comrak's paragraph, whose inline children are hung off the synthesized `inline`
     /// node. It is `None` only for the paragraph this file invents for a bare task marker, which
     /// comrak produced nothing for.
-    fn emit_paragraph(
+    fn emit_paragraph<'n>(
         &mut self,
         start: (u32, u32),
         end: (u32, u32),
-        source: Option<ComrakNode<'a>>,
+        source: Option<ComrakNode<'n>>,
     ) -> Vec<u32> {
         let mut out = Vec::new();
         let last_row = if end.1 == 0 {
@@ -1068,13 +1134,13 @@ impl<'a> Builder<'a> {
     /// `node_cache`; see [`Kind::is_inline`]. Rules opt in by walking, one at a time, so that
     /// switching a kind on cannot make a dead `match` arm fire alongside the regex path it is meant
     /// to replace — md039, md042, md044, md049, md050, md051, md052, md059 and md037 all have both.
-    fn emit_inline(&mut self, parent: u32, node: ComrakNode<'a>) {
+    fn emit_inline<'n>(&mut self, parent: u32, node: ComrakNode<'n>) {
         for child in node.children() {
             self.emit_inline_node(parent, child);
         }
     }
 
-    fn emit_inline_node(&mut self, parent: u32, node: ComrakNode<'a>) {
+    fn emit_inline_node<'n>(&mut self, parent: u32, node: ComrakNode<'n>) {
         // Taken before `kind` because both borrow the node's value and the borrow has to end before
         // `add` can take `&mut self`.
         let target = match &node.data().value {
@@ -1119,10 +1185,13 @@ impl<'a> Builder<'a> {
         let index = self.add(
             kind,
             (
-                (sourcepos.start.line - 1) as u32,
+                self.abs_row(sourcepos.start.line),
                 (sourcepos.start.column - 1) as u32,
             ),
-            ((sourcepos.end.line - 1) as u32, sourcepos.end.column as u32),
+            (
+                self.abs_row(sourcepos.end.line),
+                sourcepos.end.column as u32,
+            ),
         );
         if let Some(target) = target {
             self.link_targets.insert(index, target);
@@ -1131,13 +1200,13 @@ impl<'a> Builder<'a> {
         self.push(parent, index);
     }
 
-    fn emit_heading(
+    fn emit_heading<'n>(
         &mut self,
         heading: &NodeHeading,
         start: (u32, u32),
         end: (u32, u32),
         underline_row: u32,
-        source: ComrakNode<'a>,
+        source: ComrakNode<'n>,
     ) -> u32 {
         if heading.setext {
             self.emit_setext_heading(heading, start, end, underline_row, source)
@@ -1146,12 +1215,12 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn emit_atx_heading(
+    fn emit_atx_heading<'n>(
         &mut self,
         closed: bool,
         start: (u32, u32),
         end: (u32, u32),
-        source: ComrakNode<'a>,
+        source: ComrakNode<'n>,
     ) -> u32 {
         let index = self.add(Kind::AtxHeading, start, end);
         self.cover(index);
@@ -1176,13 +1245,13 @@ impl<'a> Builder<'a> {
 
     /// tree-sitter-md nests a `paragraph` inside a setext heading, and MD051 walks
     /// `setext_heading -> paragraph -> inline` to reach the heading text.
-    fn emit_setext_heading(
+    fn emit_setext_heading<'n>(
         &mut self,
         heading: &NodeHeading,
         start: (u32, u32),
         end: (u32, u32),
         underline_row: u32,
-        source: ComrakNode<'a>,
+        source: ComrakNode<'n>,
     ) -> u32 {
         let index = self.add(Kind::SetextHeading, start, end);
 
@@ -1205,12 +1274,12 @@ impl<'a> Builder<'a> {
         index
     }
 
-    fn emit_table(
+    fn emit_table<'n>(
         &mut self,
         start: (u32, u32),
         end: (u32, u32),
         rows: &[(u32, bool)],
-        table: ComrakNode<'a>,
+        table: ComrakNode<'n>,
     ) -> u32 {
         // Rows and cells come from `synth::table_rows`, not from comrak's `TableCell` children:
         // comrak autocompletes cells to the header width and its cell spans include the surrounding
@@ -1254,7 +1323,7 @@ impl<'a> Builder<'a> {
     /// One entry per comrak `TableCell` that has content: the byte offset its inline subtree starts
     /// at, the span that subtree covers, and the cell to take the children from. Cells comrak
     /// autocompleted for a short row have no children and are left out.
-    fn collect_cell_inlines(&self, table: ComrakNode<'a>) -> Vec<CellInline<'a>> {
+    fn collect_cell_inlines<'n>(&self, table: ComrakNode<'n>) -> Vec<CellInline<'n>> {
         let mut out = Vec::new();
         for row in table.children() {
             if !matches!(row.data().value, NodeValue::TableRow(_)) {
@@ -1268,10 +1337,13 @@ impl<'a> Builder<'a> {
                 for child in cell.children() {
                     let sourcepos = child.data().sourcepos;
                     let start = (
-                        (sourcepos.start.line - 1) as u32,
+                        self.abs_row(sourcepos.start.line),
                         (sourcepos.start.column - 1) as u32,
                     );
-                    let end = ((sourcepos.end.line - 1) as u32, sourcepos.end.column as u32);
+                    let end = (
+                        self.abs_row(sourcepos.end.line),
+                        sourcepos.end.column as u32,
+                    );
                     // Children are in source order, so the first one's start and the last one's end
                     // bracket the cell's content.
                     span = Some((span.map_or(start, |(first, _)| first), end));
@@ -1290,7 +1362,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Gives one synthesized `pipe_table_cell` the `inline` subtree comrak parsed for it.
-    fn emit_cell_inline(&mut self, cell: u32, inlines: &[CellInline<'a>]) {
+    fn emit_cell_inline<'n>(&mut self, cell: u32, inlines: &[CellInline<'n>]) {
         let (cell_start, cell_end) = {
             let node = &self.nodes[cell as usize];
             (
@@ -1383,6 +1455,14 @@ impl<'a> Builder<'a> {
             closed_headings,
         }
     }
+}
+
+/// Moves a span down by `by` rows, which is what puts a tail's own math regions where they sit in
+/// the document the tail came from.
+fn offset_rows(span: synth::Span, by: u32) -> synth::Span {
+    let (start_row, start_col) = span.start();
+    let (end_row, end_col) = span.end();
+    synth::Span::new((start_row + by, start_col), (end_row + by, end_col))
 }
 
 /// Whether the ordered list marker at `column` of `line` is the single digit `1`.

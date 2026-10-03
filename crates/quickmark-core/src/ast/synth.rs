@@ -97,6 +97,12 @@ impl<'a> LineIndex<'a> {
         &self.source[self.line_start_byte(row) as usize..self.content_end(row) as usize]
     }
 
+    /// The source of rows `from` through `to` inclusive, each with its terminator. This is what a
+    /// block's tail is handed to a nested parse as a document of its own.
+    pub fn rows(&self, from: usize, to: usize) -> &'a str {
+        &self.source[self.line_start_byte(from) as usize..self.line_start_byte(to + 1) as usize]
+    }
+
     pub fn byte_at(&self, row: usize, column: usize) -> u32 {
         self.line_start_byte(row) + column as u32
     }
@@ -249,10 +255,14 @@ pub fn plus_front_matter(source: &str, lines: &LineIndex<'_>) -> Option<Span> {
 /// One shape is known not to work: `text` immediately followed by `$$` with no blank line between
 /// keeps one comrak paragraph spanning both lines, so nothing *starts* inside the region and no
 /// `math_block` is emitted; splitting the paragraph would mean rewriting a comrak block's range
-/// mid-emission. Regions are also found here, where only lines are visible, and then clipped to the
-/// container they opened in by [`super::build`], because micromark's mathFlow dies with its
-/// container and a line-only scan cannot see one.
-pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
+/// mid-emission.
+///
+/// `containers` holds the first and last row of every block quote, list and list item in the
+/// document, because micromark's mathFlow dies with the container it opened in and a line-only scan
+/// cannot see one. Clipping has to happen *while* scanning rather than after it: the scan resumes
+/// past the region it just found, and resuming past an unclipped closer steps over a `$$` that
+/// micromark reads as the next region's opener.
+pub fn math_regions(lines: &LineIndex<'_>, containers: &[(u32, u32)]) -> Vec<Span> {
     let mut regions = Vec::new();
     let mut row = 0usize;
     while row < lines.line_count() {
@@ -274,6 +284,7 @@ pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
             })
         });
         let last = close.unwrap_or(lines.line_count() - 1);
+        let last = clip_to_container(row, last, containers);
         regions.push(Span::new(
             (row as u32, column as u32),
             lines.block_end_row(last as u32),
@@ -281,6 +292,17 @@ pub fn math_regions(lines: &LineIndex<'_>) -> Vec<Span> {
         row = last + 1;
     }
     regions
+}
+
+/// The last row a region opened on `opener` reaches. Containers holding a row form a chain, so the
+/// one that ends soonest is the innermost, and a region cannot outlive it.
+fn clip_to_container(opener: usize, last: usize, containers: &[(u32, u32)]) -> usize {
+    containers
+        .iter()
+        .filter(|&&(first, end)| first <= opener as u32 && opener as u32 <= end)
+        .map(|&(_, end)| end as usize)
+        .min()
+        .map_or(last, |end| last.min(end))
 }
 
 /// The `$…$` spans micromark's math extension forms over `source[from..to]`, as absolute byte ranges.
@@ -1025,12 +1047,34 @@ mod tests {
 
         for &(source, expected) in cases {
             let lines = LineIndex::new(source);
-            let actual: Vec<((u32, u32), (u32, u32))> = math_regions(&lines)
+            let actual: Vec<((u32, u32), (u32, u32))> = math_regions(&lines, &[])
                 .iter()
                 .map(|span| (span.start(), span.end()))
                 .collect();
             assert_eq!(actual, expected, "wrong regions for {source:?}");
         }
+    }
+
+    /// micromark's mathFlow dies with the container it opened in, and the scan has to resume where
+    /// the *clipped* region ended. Resuming past the closer the line scan found instead steps over a
+    /// `$$` micromark reads as the next region's opener, which then swallows real content.
+    ///
+    /// Both regions below are measured against micromark's token stream: `mathFlow L3:3-L5:1` inside
+    /// the list item and `mathFlow L6:1-L8:3` at document level.
+    #[test]
+    fn a_clipped_region_does_not_swallow_the_next_opener() {
+        // `- a` and its `$$`/`x` are one list item spanning rows 0..=3.
+        let source = "- a\n\n  $$\n  x\n\n$$\ny\n$$\n- item\n";
+        let lines = LineIndex::new(source);
+        let regions = |containers: &[(u32, u32)]| {
+            math_regions(&lines, containers)
+                .iter()
+                .map(|span| (span.start(), span.end()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(vec![((2, 2), (4, 0)), ((5, 0), (8, 0))], regions(&[(0, 3)]));
+        // Unclipped, the opener pairs with the `$$` on row 5 and the scan never sees it again.
+        assert_eq!(vec![((2, 2), (6, 0)), ((7, 0), (9, 0))], regions(&[]));
     }
     #[test]
     fn definition_shapes() {
