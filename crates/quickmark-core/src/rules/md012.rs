@@ -135,7 +135,8 @@ impl MD012Linter {
         maximum: usize,
     ) -> RuleViolation {
         let message = format!(
-            "Multiple consecutive blank lines [Expected: {maximum} or fewer; Actual: {consecutive_blanks}]"
+            "{} [Expected: {maximum}; Actual: {consecutive_blanks}]",
+            MD012.description
         );
 
         RuleViolation::new(

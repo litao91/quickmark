@@ -169,11 +169,15 @@ impl MD009Linter {
         trailing_spaces: usize,
         expected_spaces: usize,
     ) -> RuleViolation {
-        let message = if expected_spaces == 0 {
-            format!("Expected: 0 trailing spaces; Actual: {trailing_spaces}")
+        let expected = if expected_spaces == 0 {
+            "0".to_string()
         } else {
-            format!("Expected: 0 or {expected_spaces} trailing spaces; Actual: {trailing_spaces}")
+            format!("0 or {expected_spaces}")
         };
+        let message = format!(
+            "{} [Expected: {expected}; Actual: {trailing_spaces}]",
+            MD009.description
+        );
 
         let start_column = line.trim_end().len();
         let end_column = line.len();

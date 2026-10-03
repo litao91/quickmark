@@ -16,6 +16,9 @@ pub struct MD010HardTabsTable {
     #[serde(default)]
     pub ignore_code_languages: Vec<String>,
     #[serde(default)]
+    /// markdownlint uses this to size the text its fix inserts. Nothing here emits fixes, so it
+    /// changes nothing — but it stays in the schema, because a config written for markdownlint sets
+    /// it.
     pub spaces_per_tab: usize,
 }
 
@@ -76,8 +79,7 @@ impl MD010Linter {
             for (char_index, ch) in line.char_indices() {
                 let is_tab = ch == '\t';
                 if is_tab && !previous_was_tab {
-                    let violation =
-                        self.create_violation(line_index, char_index, settings.spaces_per_tab);
+                    let violation = self.create_violation(line_index, char_index);
                     self.violations.push(violation);
                 }
                 previous_was_tab = is_tab;
@@ -146,17 +148,8 @@ impl MD010Linter {
     }
 
     /// Creates a RuleViolation for a hard tab at the specified position.
-    fn create_violation(
-        &self,
-        line_index: usize,
-        tab_position: usize,
-        spaces_per_tab: usize,
-    ) -> RuleViolation {
-        let message = if spaces_per_tab == 1 {
-            "Hard tabs".to_string()
-        } else {
-            format!("Hard tabs (replace with {spaces_per_tab} spaces)")
-        };
+    fn create_violation(&self, line_index: usize, tab_position: usize) -> RuleViolation {
+        let message = format!("{} [Column: {}]", MD010.description, tab_position + 1);
 
         RuleViolation::new(
             &MD010,
@@ -350,7 +343,9 @@ mod test {
         assert_eq!(1, violations.len());
 
         let violation = &violations[0];
-        assert!(violation.message().contains("4")); // Should suggest 4 spaces
+        // markdownlint names the column, not the setting; `spaces_per_tab` only sizes the text its
+        // fix inserts, and this emits no fixes.
+        assert_eq!("Hard tabs [Column: 10]", violation.message());
     }
 
     #[test]

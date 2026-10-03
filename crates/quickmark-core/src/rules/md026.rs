@@ -81,7 +81,7 @@ impl MD026Linter {
 
         self.violations.push(RuleViolation::new(
             &MD026,
-            format!("Punctuation: '{}'", &heading[run..]),
+            format!("{} [Punctuation: '{}']", MD026.description, &heading[run..]),
             self.context.file_path.clone(),
             range_from_node_range(&crate::ast::NodeRange {
                 start_byte: 0,
@@ -205,9 +205,10 @@ mod test {
             .map(|violation| {
                 let run = violation
                     .message()
-                    .split_once("Punctuation: '")
-                    .map(|(_, rest)| rest.trim_end_matches('\'').to_string())
-                    .unwrap_or_default();
+                    .split_once("[Punctuation: '")
+                    .and_then(|(_, rest)| rest.strip_suffix("']"))
+                    .unwrap_or_default()
+                    .to_string();
                 (violation.location().range.start.line + 1, run)
             })
             .collect()

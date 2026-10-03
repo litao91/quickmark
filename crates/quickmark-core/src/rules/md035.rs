@@ -64,7 +64,10 @@ impl RuleLinter for MD035Linter {
             if text != expected.as_str() {
                 self.violations.push(RuleViolation::new(
                     &MD035,
-                    format!("Expected '{expected}', actual '{text}'"),
+                    format!(
+                        "{} [Expected: {expected}; Actual: {text}]",
+                        MD035.description
+                    ),
                     self.context.file_path.clone(),
                     range_from_node_range(&node.range()),
                 ));
@@ -144,7 +147,7 @@ More content"#;
         assert_eq!(1, violations.len());
         let violation = &violations[0];
         assert_eq!("MD035", violation.rule().id);
-        assert!(violation.message().contains("Expected '---', actual '***'"));
+        assert!(violation.message().contains("Expected: ---; Actual: ***"));
     }
 
     #[test]
@@ -173,10 +176,10 @@ Final content"#;
         assert_eq!("MD035", violations[1].rule().id);
         assert!(violations[0]
             .message()
-            .contains("Expected '---', actual '***'"));
+            .contains("Expected: ---; Actual: ***"));
         assert!(violations[1]
             .message()
-            .contains("Expected '---', actual '___'"));
+            .contains("Expected: ---; Actual: ___"));
     }
 
     #[test]
@@ -259,7 +262,7 @@ More content"#;
         assert_eq!(1, violations.len());
         assert!(violations[0]
             .message()
-            .contains("Expected '***', actual '* * *'"));
+            .contains("Expected: ***; Actual: * * *"));
     }
 
     #[test]

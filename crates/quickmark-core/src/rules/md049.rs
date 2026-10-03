@@ -131,7 +131,12 @@ impl MD049Linter {
 
         // markdownlint reports the opening and the closing delimiter separately, since each is its
         // own edit; match that so the violation counts agree.
-        let message = format!("Expected: {}; Actual: {}", expected.name(), marker.name());
+        let message = format!(
+            "{} [Expected: {}; Actual: {}]",
+            MD049.description,
+            expected.name(),
+            marker.name()
+        );
         let start_point = node.start_position();
         let end_point = node.end_position();
         for (marker_byte, from, to) in [
@@ -305,8 +310,8 @@ mod test {
         let messages = md049_messages("This has *emphasis* and _inconsistent_.");
         assert_eq!(
             vec![
-                "Expected: asterisk; Actual: underscore",
-                "Expected: asterisk; Actual: underscore"
+                "Emphasis style [Expected: asterisk; Actual: underscore]",
+                "Emphasis style [Expected: asterisk; Actual: underscore]"
             ],
             messages.iter().map(String::as_str).collect::<Vec<_>>()
         );
@@ -321,8 +326,8 @@ mod test {
         let messages = md049_messages("_a_\n\n| *b* | c |\n|---|---|\n");
         assert_eq!(
             vec![
-                "Expected: underscore; Actual: asterisk",
-                "Expected: underscore; Actual: asterisk"
+                "Emphasis style [Expected: underscore; Actual: asterisk]",
+                "Emphasis style [Expected: underscore; Actual: asterisk]"
             ],
             messages.iter().map(String::as_str).collect::<Vec<_>>()
         );
@@ -337,7 +342,7 @@ mod test {
         assert!(
             messages
                 .iter()
-                .all(|m| m == "Expected: underscore; Actual: asterisk"),
+                .all(|m| m == "Emphasis style [Expected: underscore; Actual: asterisk]"),
             "unexpected messages: {messages:?}"
         );
     }
@@ -378,7 +383,7 @@ mod test {
         assert_eq!(2, messages.len(), "unexpected: {messages:?}");
         assert!(messages
             .iter()
-            .all(|m| m == "Expected: asterisk; Actual: underscore"));
+            .all(|m| m == "Emphasis style [Expected: asterisk; Actual: underscore]"));
     }
 
     #[test]
@@ -388,7 +393,7 @@ mod test {
         assert_eq!(2, messages.len(), "unexpected: {messages:?}");
         assert!(messages
             .iter()
-            .all(|m| m == "Expected: underscore; Actual: asterisk"));
+            .all(|m| m == "Emphasis style [Expected: underscore; Actual: asterisk]"));
     }
 
     #[test]
@@ -399,7 +404,7 @@ mod test {
         assert_eq!(2, messages.len(), "unexpected: {messages:?}");
         assert!(messages
             .iter()
-            .all(|m| m == "Expected: underscore; Actual: asterisk"));
+            .all(|m| m == "Emphasis style [Expected: underscore; Actual: asterisk]"));
     }
 
     #[test]
@@ -408,7 +413,7 @@ mod test {
         assert_eq!(2, messages.len(), "unexpected: {messages:?}");
         assert!(messages
             .iter()
-            .all(|m| m == "Expected: asterisk; Actual: underscore"));
+            .all(|m| m == "Emphasis style [Expected: asterisk; Actual: underscore]"));
     }
 
     #[test]
@@ -430,7 +435,7 @@ mod test {
         assert!(
             messages
                 .iter()
-                .all(|m| m == "Expected: underscore; Actual: asterisk"),
+                .all(|m| m == "Emphasis style [Expected: underscore; Actual: asterisk]"),
             "unexpected: {messages:?}"
         );
     }

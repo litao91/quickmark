@@ -288,7 +288,7 @@ impl MD060Linter {
         for error in chosen {
             self.violations.push(RuleViolation::new(
                 &MD060,
-                error.message.to_string(),
+                format!("{} [{}]", MD060.description, error.message),
                 self.context.file_path.clone(),
                 range_from_node_range(&error.node.range()),
             ));

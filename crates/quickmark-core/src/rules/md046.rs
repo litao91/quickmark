@@ -23,6 +23,18 @@ impl Default for CodeBlockStyle {
     }
 }
 
+impl CodeBlockStyle {
+    /// The style's name in a message, which is markdownlint's `tokenTypeToStyle`. `Consistent` never
+    /// reaches one: it is resolved to whichever style came first.
+    fn name(&self) -> &'static str {
+        match self {
+            CodeBlockStyle::Consistent => "consistent",
+            CodeBlockStyle::Fenced => "fenced",
+            CodeBlockStyle::Indented => "indented",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone, Deserialize)]
 pub struct MD046CodeBlockStyleTable {
     #[serde(default)]
@@ -36,8 +48,6 @@ impl Default for MD046CodeBlockStyleTable {
         }
     }
 }
-
-const VIOLATION_MESSAGE: &str = "Code block style";
 
 pub(crate) struct MD046Linter {
     context: Rc<Context>,
@@ -122,7 +132,12 @@ impl MD046Linter {
 
             self.violations.push(RuleViolation::new(
                 &MD046,
-                VIOLATION_MESSAGE.to_string(),
+                format!(
+                    "{} [Expected: {}; Actual: {}]",
+                    MD046.description,
+                    expected_style.name(),
+                    block_style.name()
+                ),
                 self.context.file_path.clone(),
                 range,
             ));
