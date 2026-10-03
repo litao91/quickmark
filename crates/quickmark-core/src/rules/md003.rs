@@ -8,7 +8,7 @@ use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 use super::{Rule, RuleType};
 
 // MD003-specific configuration types
-#[derive(Debug, PartialEq, Clone, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Copy, Deserialize)]
 pub enum HeadingStyle {
     #[serde(rename = "consistent")]
     Consistent,
@@ -113,17 +113,6 @@ impl MD003Linter {
         }
     }
 
-    fn is_atx_closed(&self, node: &Node) -> bool {
-        // Use the idiomatic tree-sitter way to get the node's text.
-        // This is more efficient than slicing the whole document manually.
-        if let Ok(heading_text) = node.utf8_text(self.context.get_document_content().as_bytes()) {
-            // Trim trailing whitespace and check if the heading ends with '#'.
-            heading_text.trim_end().ends_with('#')
-        } else {
-            false
-        }
-    }
-
     fn add_violation(&mut self, node: &Node, expected: &str, actual: &Style) {
         self.violations.push(RuleViolation::new(
             &MD003,
@@ -140,14 +129,14 @@ impl MD003Linter {
 impl RuleLinter for MD003Linter {
     fn feed(&mut self, node: &Node) {
         let style = match node.kind() {
-            "atx_heading" => {
-                // Check if it's closed (has closing hashes)
-                if self.is_atx_closed(node) {
-                    Some(Style::AtxClosed)
-                } else {
-                    Some(Style::Atx)
-                }
-            }
+            // markdownlint counts a heading's `atxHeadingSequence` tokens: one is `atx`, two is
+            // `atx_closed`. A closing sequence has to be preceded by whitespace, so the `C#` in
+            // `# Dissecting the async methods in C#` is text and the heading is plain `atx`.
+            "atx_heading" => Some(if node.is_closed() {
+                Style::AtxClosed
+            } else {
+                Style::Atx
+            }),
             "setext_heading" => Some(Style::Setext),
             _ => None,
         };
@@ -215,7 +204,24 @@ mod test {
     use crate::linter::MultiRuleLinter;
     use crate::test_utils::test_helpers::test_config_with_settings;
 
-    fn test_config(style: HeadingStyle) -> crate::config::QuickmarkConfig {
+    const STYLES: [HeadingStyle; 6] = [
+        HeadingStyle::Consistent,
+        HeadingStyle::ATX,
+        HeadingStyle::ATXClosed,
+        HeadingStyle::Setext,
+        HeadingStyle::SetextWithATX,
+        HeadingStyle::SetextWithATXClosed,
+    ];
+
+    /// A report: the 1-based line, the style markdownlint expected and the one the heading has.
+    type Want = (usize, &'static str, &'static str);
+    type Found = (usize, String, String);
+
+    /// A case's name, its document, and the reports markdownlint makes under each of [`STYLES`], in
+    /// order.
+    type Case<'a> = (&'a str, &'a str, [&'a [Want]; 6]);
+
+    fn config(style: HeadingStyle) -> crate::config::QuickmarkConfig {
         test_config_with_settings(
             vec![
                 ("heading-style", RuleSeverity::Error),
@@ -228,522 +234,275 @@ mod test {
         )
     }
 
-    #[test]
-    fn test_heading_style_consistent_positive() {
-        let config = test_config(HeadingStyle::Consistent);
-
-        let input = "
-Setext level 1
---------------
-Setext level 2
-==============
-### ATX header level 3
-#### ATX header level 4
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 2);
+    fn owned(wants: &[Want]) -> Vec<Found> {
+        wants
+            .iter()
+            .map(|&(line, expected, actual)| (line, expected.to_string(), actual.to_string()))
+            .collect()
     }
 
-    #[test]
-    fn test_heading_style_consistent_negative_setext() {
-        let config = test_config(HeadingStyle::Consistent);
-
-        let input = "
-Setext level 1
---------------
-Setext level 2
-==============
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
+    fn reports(style: HeadingStyle, source: &str) -> Vec<Found> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config(style), source);
+        linter
+            .analyze()
+            .iter()
+            .filter_map(|violation| {
+                let (expected, actual) = violation
+                    .message()
+                    .split_once("[Expected: ")
+                    .and_then(|(_, rest)| rest.split_once("; Actual: "))?;
+                Some((
+                    violation.location().range.start.line + 1,
+                    expected.to_string(),
+                    actual.trim_end_matches(']').to_string(),
+                ))
+            })
+            .collect()
     }
 
+    /// Every expectation measured against markdownlint-cli2 v0.23.3, under all six configured
+    /// styles.
     #[test]
-    fn test_heading_style_consistent_negative_atx() {
-        let config = test_config(HeadingStyle::Consistent);
+    fn matches_markdownlint() {
+        let cases: &[Case] = &[
+            (
+                "a hash inside the text",
+                "# Dissecting the async methods in C#\n\n## The generated\n",
+                [
+                    &[],
+                    &[],
+                    &[(1, "atx_closed", "atx"), (3, "atx_closed", "atx")],
+                    &[(1, "setext", "atx"), (3, "setext", "atx")],
+                    &[(1, "setext", "atx"), (3, "setext", "atx")],
+                    &[(1, "setext", "atx"), (3, "setext", "atx")],
+                ],
+            ),
+            (
+                "open then closed",
+                "# Open ATX\n## Closed ATX ##\n",
+                [
+                    &[(2, "atx", "atx_closed")],
+                    &[(2, "atx", "atx_closed")],
+                    &[(1, "atx_closed", "atx")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx_closed")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx_closed")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx_closed")],
+                ],
+            ),
+            (
+                "text ending in a hash",
+                "# Text ending with hash#\n## Second\n",
+                [
+                    &[],
+                    &[],
+                    &[(1, "atx_closed", "atx"), (2, "atx_closed", "atx")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx")],
+                ],
+            ),
+            (
+                "a long closing run",
+                "### Unbalanced closing ########\n# Other\n",
+                [
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "atx", "atx_closed")],
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "atx", "atx_closed"), (2, "setext", "atx")],
+                    &[(2, "setext", "atx")],
+                ],
+            ),
+            (
+                "closed then open",
+                "# H #\n## H\n",
+                [
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "atx", "atx_closed")],
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                ],
+            ),
+            (
+                "an empty closed heading",
+                "# #\n## H\n",
+                [
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "atx", "atx_closed")],
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                ],
+            ),
+            (
+                "hashes only",
+                "###\n# H\n",
+                [
+                    &[],
+                    &[],
+                    &[(1, "atx_closed", "atx"), (2, "atx_closed", "atx")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx")],
+                    &[(2, "setext", "atx")],
+                    &[(1, "atx_closed", "atx"), (2, "setext", "atx")],
+                ],
+            ),
+            (
+                "setext then atx",
+                "Setext\n======\n\n# Atx\n",
+                [
+                    &[(4, "setext", "atx")],
+                    &[(1, "atx", "setext")],
+                    &[(1, "atx_closed", "setext"), (4, "atx_closed", "atx")],
+                    &[(4, "setext", "atx")],
+                    &[(4, "setext", "atx")],
+                    &[(4, "setext", "atx")],
+                ],
+            ),
+            (
+                "all closed",
+                "# A #\n## B ##\n### C ###\n",
+                [
+                    &[],
+                    &[
+                        (1, "atx", "atx_closed"),
+                        (2, "atx", "atx_closed"),
+                        (3, "atx", "atx_closed"),
+                    ],
+                    &[],
+                    &[
+                        (1, "setext", "atx_closed"),
+                        (2, "setext", "atx_closed"),
+                        (3, "setext", "atx_closed"),
+                    ],
+                    &[
+                        (1, "setext", "atx_closed"),
+                        (2, "setext", "atx_closed"),
+                        (3, "atx", "atx_closed"),
+                    ],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx_closed")],
+                ],
+            ),
+            (
+                "open, closed and setext",
+                "# A\n## B ##\nSetext\n======\n",
+                [
+                    &[(2, "atx", "atx_closed"), (3, "atx", "setext")],
+                    &[(2, "atx", "atx_closed"), (3, "atx", "setext")],
+                    &[(1, "atx_closed", "atx"), (3, "atx_closed", "setext")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx_closed")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx_closed")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx_closed")],
+                ],
+            ),
+            (
+                "trailing spaces after the close",
+                "## H ##   \n# G\n",
+                [
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "atx", "atx_closed")],
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                ],
+            ),
+            (
+                "plus signs in the text",
+                "# C++\n## D\n",
+                [
+                    &[],
+                    &[],
+                    &[(1, "atx_closed", "atx"), (2, "atx_closed", "atx")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx"), (2, "setext", "atx")],
+                ],
+            ),
+            (
+                "a closing run longer than the opening",
+                "# H ###\n## G\n",
+                [
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "atx", "atx_closed")],
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                ],
+            ),
+            (
+                "setext levels then atx levels",
+                "Setext L1\n=========\nSetext L2\n---------\n### L3 atx\n#### L4 closed ####\n",
+                [
+                    &[(5, "setext", "atx"), (6, "setext", "atx_closed")],
+                    &[
+                        (1, "atx", "setext"),
+                        (3, "atx", "setext"),
+                        (6, "atx", "atx_closed"),
+                    ],
+                    &[
+                        (1, "atx_closed", "setext"),
+                        (3, "atx_closed", "setext"),
+                        (5, "atx_closed", "atx"),
+                    ],
+                    &[(5, "setext", "atx"), (6, "setext", "atx_closed")],
+                    &[(6, "atx", "atx_closed")],
+                    &[(5, "atx_closed", "atx")],
+                ],
+            ),
+            (
+                "all open atx",
+                "# a\n## b\n### c\n",
+                [
+                    &[],
+                    &[],
+                    &[
+                        (1, "atx_closed", "atx"),
+                        (2, "atx_closed", "atx"),
+                        (3, "atx_closed", "atx"),
+                    ],
+                    &[
+                        (1, "setext", "atx"),
+                        (2, "setext", "atx"),
+                        (3, "setext", "atx"),
+                    ],
+                    &[(1, "setext", "atx"), (2, "setext", "atx")],
+                    &[
+                        (1, "setext", "atx"),
+                        (2, "setext", "atx"),
+                        (3, "atx_closed", "atx"),
+                    ],
+                ],
+            ),
+            (
+                "a tab after the closing run",
+                "# H #\t\n## G\n",
+                [
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "atx", "atx_closed")],
+                    &[(2, "atx_closed", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                    &[(1, "setext", "atx_closed"), (2, "setext", "atx")],
+                ],
+            ),
+        ];
 
-        let input = "
-# Atx heading 1
-## Atx heading 2
-### Atx heading 3
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_heading_style_atx_positive() {
-        let config = test_config(HeadingStyle::ATX);
-
-        let input = "
-Setext heading 1
-----------------
-Setext heading 2
-================
-### Atx heading 3
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 2);
-    }
-
-    #[test]
-    fn test_heading_style_atx_negative() {
-        let config = test_config(HeadingStyle::ATX);
-
-        let input = "
-# Atx heading 1
-## Atx heading 2
-### Atx heading 3
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_heading_style_setext_positive() {
-        let config = test_config(HeadingStyle::Setext);
-
-        let input = "
-# Atx heading 1
-Setext heading 1
-----------------
-Setext heading 2
-================
-### Atx heading 3
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 2);
-    }
-
-    #[test]
-    fn test_heading_style_setext_negative() {
-        let config = test_config(HeadingStyle::Setext);
-
-        let input = "
-Setext heading 1
-----------------
-Setext heading 2
-================
-Setext heading 2
-================
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_heading_style_atx_closed_positive() {
-        let config = test_config(HeadingStyle::ATXClosed);
-
-        let input = "
-# Open ATX heading 1
-## Open ATX heading 2 ##
-### ATX closed heading 3 ###
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 1);
-    }
-
-    #[test]
-    fn test_heading_style_atx_closed_negative() {
-        let config = test_config(HeadingStyle::ATXClosed);
-
-        let input = "
-# ATX closed heading 1 #
-## ATX closed heading 2 ##
-### ATX closed heading 3 ###
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_heading_style_setext_with_atx_positive() {
-        let config = test_config(HeadingStyle::SetextWithATX);
-
-        let input = "
-Setext heading 1
-----------------
-# Open ATX heading 2
-## ATX closed heading 3 ##
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Level-based: setext h2 should be used for level 2, open ATX for level 3
-        // Violations: ATX heading at level 2, closed ATX at level 3
-        assert_eq!(violations.len(), 2);
-    }
-
-    #[test]
-    fn test_heading_style_setext_with_atx_negative() {
-        let config = test_config(HeadingStyle::SetextWithATX);
-
-        let input = "
-Setext heading 1
-----------------
-Setext heading 2
-----------------
-### Open ATX heading 3
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Level-based: setext for 1-2, open ATX for 3+ - all correct
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_heading_style_setext_with_atx_closed_positive() {
-        let config = test_config(HeadingStyle::SetextWithATXClosed);
-
-        let input = "
-Setext heading 1
-----------------
-# Open ATX heading 2
-### Open ATX heading 3
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Level-based: setext for 1-2, closed ATX for 3+
-        // Violations: open ATX at level 2, open ATX at level 3 (should be closed)
-        assert_eq!(violations.len(), 2);
-    }
-
-    #[test]
-    fn test_heading_style_setext_with_atx_closed_negative() {
-        let config = test_config(HeadingStyle::SetextWithATXClosed);
-
-        let input = "
-Setext heading 1
-----------------
-Setext heading 2
-----------------
-### ATX closed heading 3 ###
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Level-based: setext for 1-2, closed ATX for 3+ - all correct
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_setext_with_atx_level_violations_comprehensive() {
-        let config = test_config(HeadingStyle::SetextWithATX);
-
-        let input = "
-# Level 1 ATX (should be setext)
-## Level 2 ATX (should be setext)
-### Level 3 ATX closed (should be open ATX) ###
-#### Level 4 ATX closed (should be open ATX) ####
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Expect 4 violations: 2 for wrong style at levels 1-2, 2 for closed ATX at levels 3-4
-        assert_eq!(violations.len(), 4);
-
-        // Check specific violation messages
-        assert!(violations[0]
-            .message()
-            .contains("Expected: setext; Actual: atx"));
-        assert!(violations[1]
-            .message()
-            .contains("Expected: setext; Actual: atx"));
-        assert!(violations[2]
-            .message()
-            .contains("Expected: atx; Actual: atx_closed"));
-        assert!(violations[3]
-            .message()
-            .contains("Expected: atx; Actual: atx_closed"));
-    }
-
-    #[test]
-    fn test_setext_with_atx_correct_level_usage() {
-        let config = test_config(HeadingStyle::SetextWithATX);
-
-        let input = "
-Main Title
-==========
-
-Subtitle
---------
-
-### Level 3 Open ATX
-#### Level 4 Open ATX
-##### Level 5 Open ATX
-###### Level 6 Open ATX
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Should have no violations - correct level-based usage
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_setext_with_atx_closed_level_violations_comprehensive() {
-        let config = test_config(HeadingStyle::SetextWithATXClosed);
-
-        let input = "
-# Level 1 ATX (should be setext)
-## Level 2 ATX (should be setext)
-### Level 3 open ATX (should be closed ATX)
-#### Level 4 open ATX (should be closed ATX)
-##### Level 5 closed ATX is correct #####
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Expect 4 violations: 2 for wrong style at levels 1-2, 2 for open ATX at levels 3-4
-        assert_eq!(violations.len(), 4);
-
-        // Check specific violation messages
-        assert!(violations[0]
-            .message()
-            .contains("Expected: setext; Actual: atx"));
-        assert!(violations[1]
-            .message()
-            .contains("Expected: setext; Actual: atx"));
-        assert!(violations[2]
-            .message()
-            .contains("Expected: atx_closed; Actual: atx"));
-        assert!(violations[3]
-            .message()
-            .contains("Expected: atx_closed; Actual: atx"));
-    }
-
-    #[test]
-    fn test_setext_with_atx_closed_correct_level_usage() {
-        let config = test_config(HeadingStyle::SetextWithATXClosed);
-
-        let input = "
-Main Title
-==========
-
-Subtitle
---------
-
-### Level 3 Closed ATX ###
-#### Level 4 Closed ATX ####
-##### Level 5 Closed ATX #####
-###### Level 6 Closed ATX ######
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Should have no violations - correct level-based usage
-        assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn test_mixed_atx_styles_comprehensive() {
-        let config = test_config(HeadingStyle::ATXClosed);
-
-        let input = "
-# Open ATX 1
-## Closed ATX 2 ##
-### Open ATX 3
-#### Closed ATX 4 ####
-##### Open ATX 5
-###### Closed ATX 6 ######
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Expect 3 violations for open ATX headings (levels 1, 3, 5)
-        assert_eq!(violations.len(), 3);
-
-        for violation in &violations {
-            assert!(violation
-                .message()
-                .contains("Expected: atx_closed; Actual: atx"));
+        let mut failures = Vec::new();
+        for (name, source, wants) in cases {
+            for (index, style) in STYLES.iter().enumerate() {
+                let (actual, expected) = (reports(*style, source), owned(wants[index]));
+                if actual != expected {
+                    failures.push(format!(
+                        "{name} [{style:?}]: expected {expected:?}, got {actual:?}"
+                    ));
+                }
+            }
         }
-    }
-
-    #[test]
-    fn test_consistent_style_with_mixed_atx_variations() {
-        let config = test_config(HeadingStyle::Consistent);
-
-        let input = "
-# First heading (sets the standard)
-## Open ATX 2
-### Closed ATX 3 ###
-#### Open ATX 4
-Setext heading
-==============
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Expect 2 violations: closed ATX and setext (both different from first open ATX)
-        assert_eq!(violations.len(), 2);
-
-        assert!(violations[0]
-            .message()
-            .contains("Expected: atx; Actual: atx_closed"));
-        assert!(violations[1]
-            .message()
-            .contains("Expected: atx; Actual: setext"));
-    }
-
-    #[test]
-    fn test_file_without_trailing_newline_edge_case() {
-        let config = test_config(HeadingStyle::Setext);
-
-        // Test string without trailing newline (like our original issue)
-        let input = "# ATX heading 1
-## ATX heading 2
-Final setext heading
---------------------";
-
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // Should catch all 3 violations, including the final setext heading
-        assert_eq!(violations.len(), 2); // Only ATX headings violate setext rule
-
-        for violation in &violations {
-            assert!(violation
-                .message()
-                .contains("Expected: setext; Actual: atx"));
-        }
-    }
-
-    #[test]
-    fn test_mix_of_styles() {
-        let config = test_config(HeadingStyle::SetextWithATX);
-
-        let input = "# Open ATX heading level 1
-
-## Open ATX heading level 2
-
-### Open ATX heading level 3 ###
-
-#### Closed ATX heading level 4 ####
-
-Setext heading level 1
-======================
-
-Setext heading level 2
-----------------------
-
-Another setext heading
-======================
-
-# Another open ATX
-
-## Another closed ATX ##
-
-Final setext heading
---------------------
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-        // - Level 1 ATX should be setext (1 violation)
-        // - Level 2 ATX should be setext (2 violations)
-        // - Level 3+ closed ATX should be open ATX (2 violations)
-        // - Level 2 closed ATX should be setext (1 violation)
-        // Total: 6 violations
-        assert_eq!(violations.len(), 6);
-    }
-
-    #[test]
-    fn test_atx_closed_detection_comprehensive() {
-        let config = test_config(HeadingStyle::ATXClosed);
-
-        let input = "# Open ATX
-# Open ATX with spaces
-## Open ATX level 2
-### Closed ATX level 3 ###
-#### Closed ATX with spaces ####
-##### Closed ATX no spaces #####
-###### Mixed closing hashes ##########
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect 3 open ATX violations (lines 1, 2, 3)
-        assert_eq!(violations.len(), 3);
-
-        for violation in &violations {
-            assert!(violation
-                .message()
-                .contains("Expected: atx_closed; Actual: atx"));
-        }
-    }
-
-    #[test]
-    fn test_atx_closed_detection_edge_cases() {
-        let config = test_config(HeadingStyle::ATX);
-
-        let input = "# Regular ATX
-## Closed ATX ##
-### Unbalanced closing ########
-#### Text with hash # in middle
-##### Text ending with hash#
-###### Actually closed ######
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Lines ending with # are considered closed: 2, 3, 5, 6
-        // So we expect 4 violations for closed ATX when expecting open ATX
-        assert_eq!(violations.len(), 4);
-
-        for violation in &violations {
-            assert!(violation
-                .message()
-                .contains("Expected: atx; Actual: atx_closed"));
-        }
-    }
-
-    #[test]
-    fn test_whitespace_handling_in_atx_closed_detection() {
-        let config = test_config(HeadingStyle::ATXClosed);
-
-        let input = "# Open ATX
-## Closed with trailing spaces ##
-### Closed with tabs ##
-#### Open with trailing spaces
-##### Closed no spaces #####
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect 2 open ATX violations (lines 1 and 4)
-        assert_eq!(violations.len(), 2);
-
-        for violation in &violations {
-            assert!(violation
-                .message()
-                .contains("Expected: atx_closed; Actual: atx"));
-        }
-    }
-
-    #[test]
-    fn test_setext_only_supports_levels_1_and_2() {
-        let config = test_config(HeadingStyle::Setext);
-
-        let input = "Setext Level 1
-==============
-
-Setext Level 2
---------------
-
-### Level 3 must be ATX ###
-#### Level 4 must be ATX ####
-";
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect 2 violations for ATX headings at levels 3-4
-        assert_eq!(violations.len(), 2);
-
-        for violation in &violations {
-            assert!(violation
-                .message()
-                .contains("Expected: setext; Actual: atx_closed"));
-        }
+        assert!(failures.is_empty(), "{}\n", failures.join("\n"));
     }
 }
