@@ -487,16 +487,86 @@ mod test {
         assert!(failures.is_empty(), "{}\n", failures.join("\n"));
     }
 
-    /// micromark keeps an indented code block open across a blank line, so a following `2. b` has
-    /// to interrupt it — and an ordered list that does not start at 1 may not. It becomes a
-    /// paragraph and there is no list to number. comrak closes the code block at the blank line and
-    /// reads `2. b` as a list, which is what the CommonMark reference does. markdownlint reports
-    /// nothing on this document; quickmark reports line 5.
+    /// micromark never clears the `interrupt` flag an indented code block sets, and its list
+    /// factory then accepts an ordered marker of exactly `1` and nothing else. So `2. b` straight
+    /// after an indented code block is paragraph text to markdownlint — comrak reads it as a list,
+    /// which is what the CommonMark reference does, and the facade rewrites it back. Blank lines
+    /// neither set nor clear the flag; every other kind of preceding block clears it.
+    ///
+    /// Each expectation is markdownlint-cli2 v0.23.3 output under the style named.
     #[test]
-    fn a_list_after_indented_code_is_a_known_difference() {
-        assert_eq!(
-            reports(OlPrefixStyle::OneOrOrdered, "x\n\n    code\n\n2. b\n"),
-            owned(&[(5, 1, 2, ONE)])
-        );
+    fn a_list_after_indented_code_is_a_paragraph() {
+        let none: &[Want] = &[];
+        let cases: &[Case] = &[
+            // A paragraph before the code block changes nothing.
+            (
+                "paragraph then code",
+                "x\n\n    code\n\n2. b\n",
+                [none, none, none, none],
+            ),
+            // Both lines fold into one paragraph, so neither is numbered.
+            (
+                "two items",
+                "    code\n\n2. b\n3. c\n",
+                [none, none, none, none],
+            ),
+            // `list.js` also wants a single digit, so `10.` and `01.` are refused too.
+            (
+                "two digits",
+                "    code\n\n10. b\n",
+                [none, none, none, none],
+            ),
+            (
+                "zero padded",
+                "    code\n\n01. b\n",
+                [none, none, none, none],
+            ),
+            (
+                "parenthesis",
+                "    code\n\n2) b\n",
+                [none, none, none, none],
+            ),
+            // `1.` may interrupt, so this is a list and its second item is judged normally.
+            (
+                "starts at one",
+                "    code\n\n1. b\n\n2. c\n",
+                [
+                    none,
+                    &[(5, 1, 2, ONE)],
+                    none,
+                    &[(3, 0, 1, ZERO), (5, 0, 2, ZERO)],
+                ],
+            ),
+            // An unordered list clears the flag, so the `2. b` after it is a one-item ordered list.
+            (
+                "unordered between",
+                "    code\n\n- x\n\n2. b\n",
+                [
+                    &[(5, 1, 2, ONE)],
+                    &[(5, 1, 2, ONE)],
+                    &[(5, 1, 2, ORDERED)],
+                    &[(5, 0, 2, ZERO)],
+                ],
+            ),
+            // The same inside a block quote, where the code block is the quote's own.
+            (
+                "in a block quote",
+                "> q\n>\n>     code\n>\n> 2. b\n",
+                [none, none, none, none],
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (name, source, wants) in cases {
+            for (index, style) in STYLES.iter().enumerate() {
+                let (actual, expected) = (reports(*style, source), owned(wants[index]));
+                if actual != expected {
+                    failures.push(format!(
+                        "{name} [{style:?}]: want {expected:?}, got {actual:?}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}\n", failures.join("\n"));
     }
 }

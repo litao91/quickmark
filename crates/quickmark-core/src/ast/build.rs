@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use comrak::nodes::{NodeHeading, NodeList, NodeValue};
+use comrak::nodes::{ListType, NodeHeading, NodeList, NodeValue};
 // `comrak::Node<'a>` is `&'a AstNode<'a>` — the shared-reference form that `children()` yields.
 use comrak::Node as ComrakNode;
 use comrak::{parse_document, Arena, Options};
@@ -636,9 +636,17 @@ impl<'a> Builder<'a> {
                 let index = self.emit_container(Kind::BlockQuote, node, nesting);
                 out.push(index);
             }
-            NodeValue::List(_) => {
-                let index = self.emit_container(Kind::List, node, nesting);
-                out.push(index);
+            NodeValue::List(list) => {
+                let list = *list;
+                let previous = out.last().copied();
+                drop(data);
+                match self.interrupted_list_paragraph(node, &list, previous, nesting) {
+                    Some(rewritten) => out.extend(rewritten),
+                    None => {
+                        let index = self.emit_container(Kind::List, node, nesting);
+                        out.push(index);
+                    }
+                }
             }
             NodeValue::Item(list) => {
                 let list = *list;
@@ -791,6 +799,66 @@ impl<'a> Builder<'a> {
 
         self.nodes[index as usize].children = children;
         index
+    }
+
+    /// A list micromark refuses to start, rewritten as the paragraph it is instead — or `None` when
+    /// comrak's list stands.
+    ///
+    /// micromark never clears the `interrupt` flag an indented code block sets: `code-indented.js`'s
+    /// `after` has the `tokenizer.interrupt = false` that would clear it commented out, with a
+    /// "feel free to interrupt" to-do beside it. `list.js` then accepts an ordered marker of exactly
+    /// `1` and nothing else, so `2. b` straight after an indented code block is paragraph text to
+    /// markdownlint and a list to comrak. Blank lines neither set nor clear the flag, and every
+    /// other kind of preceding block clears it.
+    ///
+    /// Only a list whose items hold nothing but paragraphs is rewritten: micromark folds the markers
+    /// into the paragraph's own data, and there is no faithful facade shape for a rewritten item
+    /// that also holds a nested list or a code block, so those keep comrak's reading.
+    fn interrupted_list_paragraph(
+        &mut self,
+        node: ComrakNode<'a>,
+        list: &NodeList,
+        previous: Option<u32>,
+        nesting: Nesting,
+    ) -> Option<Vec<u32>> {
+        if list.list_type != ListType::Ordered {
+            return None;
+        }
+        if previous.is_none_or(|index| self.nodes[index as usize].kind != Kind::IndentedCodeBlock) {
+            return None;
+        }
+        let (row, column) = self.start_of(node);
+        if marker_is_one(self.lines.content(row as usize).as_bytes(), column as usize) {
+            return None;
+        }
+
+        let mut paragraphs = Vec::new();
+        for item in node.children() {
+            if !matches!(item.data().value, NodeValue::Item(_)) {
+                return None;
+            }
+            for child in item.children() {
+                if !matches!(child.data().value, NodeValue::Paragraph) {
+                    return None;
+                }
+                paragraphs.push(child);
+            }
+        }
+        if paragraphs.is_empty() {
+            return None;
+        }
+
+        let start = self.start_col(node, nesting);
+        let end = self.block_end(node);
+        let out = self.emit_paragraph(start, end, None);
+        let inline = self.nodes[*out.last()? as usize]
+            .children
+            .first()
+            .copied()?;
+        for paragraph in paragraphs {
+            self.emit_inline(inline, paragraph);
+        }
+        Some(out)
     }
 
     fn emit_list_item(&mut self, node: ComrakNode<'a>, list: &NodeList, nesting: Nesting) -> u32 {
@@ -1315,6 +1383,20 @@ impl<'a> Builder<'a> {
             closed_headings,
         }
     }
+}
+
+/// Whether the ordered list marker at `column` of `line` is the single digit `1`.
+///
+/// That is the only value micromark's `list.js` accepts while its `interrupt` flag is set —
+/// `!self.interrupt || code === codes.digit1` on the first digit and `!self.interrupt || size < 2`
+/// on the value's length, so `01.` is refused too.
+fn marker_is_one(line: &[u8], column: usize) -> bool {
+    line.get(column) == Some(&b'1')
+        && line[column..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count()
+            == 1
 }
 
 /// How many leading columns of `row` are container prefixes still enclosing `paragraph`.

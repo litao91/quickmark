@@ -754,6 +754,28 @@ const CASES: &[(&str, &str, &str)] = &[
 )
 "#,
     ),
+    (
+        // micromark leaves its `interrupt` flag set after an indented code block, so an ordered
+        // marker other than `1` starts no list there and the line is paragraph text. The inline
+        // children survive the rewrite; only the `2. ` marker, which is literal text to micromark,
+        // is outside them.
+        "an ordered list micromark refuses to start is a paragraph",
+        "    code\n\n2. b https://x.com *e*\n",
+        r#"(document 0:0-3:0 0-33
+  (section 0:0-3:0 0-33
+    (indented_code_block 0:0-1:0 0-9)
+    (paragraph 2:0-3:0 10-33
+      (inline 2:0-2:22 10-32
+        (text 2:3-2:19 13-29)
+        (emphasis 2:19-2:22 29-32
+          (text 2:20-2:21 30-31)
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
 ];
 
 #[test]
