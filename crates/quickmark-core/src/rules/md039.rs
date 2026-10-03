@@ -1,30 +1,16 @@
 use std::rc::Rc;
 
 use crate::ast::Node;
-use once_cell::sync::Lazy;
-use regex::Regex;
 
 use crate::{
-    linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
+    rules::{Rule, RuleType},
 };
-
-// Using once_cell::sync::Lazy for safe, one-time compilation of regexes.
-// Regular inline links: [text](url) - but NOT images ![text](url)
-static RE_INLINE_LINK: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?:^|[^!])\[([^\]]*)\]\(([^)]+)\)").unwrap());
-
-// Reference links: [text][ref] - but NOT images ![text][ref]
-static RE_REF_LINK: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?:^|[^!])\[([^\]]*)\]\[([^\]]+)\]").unwrap());
-
-// Collapsed reference links: [text][] - but NOT images ![text][]
-static RE_COLLAPSED_REF_LINK: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?:^|[^!])\[([^\]]+)\]\[\]").unwrap());
 
 /// MD039 - Spaces inside link text
 ///
-/// This rule checks for unnecessary spaces at the beginning or end of link text.
+/// Reports the whitespace just inside a link's `[` and `]`. An image's label is left alone, and so
+/// is a bracket run that never became a link — `[ b ]` with no `[b]` defined is text.
 pub(crate) struct MD039Linter {
     context: Rc<Context>,
     violations: Vec<RuleViolation>,
@@ -37,123 +23,205 @@ impl MD039Linter {
             violations: Vec::new(),
         }
     }
+
+    /// Walks the inline subtree, which `feed` never descends into because inline kinds are filtered
+    /// out of dispatch.
+    fn walk(&mut self, root: Node) {
+        let mut cursor = root.walk();
+        let mut depth = 0;
+        loop {
+            let node = cursor.node();
+            if node.kind() == "link" {
+                self.check(node);
+            }
+            if cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+            loop {
+                if depth == 0 {
+                    return;
+                }
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                cursor.goto_parent();
+                depth -= 1;
+            }
+        }
+    }
+
+    fn check(&mut self, link: Node) {
+        let Some(label) = label_span(link, &self.context.document_content.borrow()) else {
+            return;
+        };
+
+        let (context, found) = {
+            let source = self.context.document_content.borrow();
+            let text = &source[label.from..label.to];
+            let found = [
+                // markdownlint asks `trimStart`/`trimEnd`, which count every whitespace character,
+                // but reports the run of *horizontal* whitespace — and when the label starts or ends
+                // with a line break there is no such run, so it names the line beside it instead.
+                (text.len() != text.trim_start().len()).then(|| {
+                    let run = horizontal_run(text, true);
+                    Side::Leading.at(self.context.point_at(label.from), run)
+                }),
+                (text.len() != text.trim_end().len()).then(|| {
+                    let run = horizontal_run(text, false);
+                    Side::Trailing.at(self.context.point_at(label.to), run)
+                }),
+            ];
+            (ellipsify(&source[label.from - 1..=label.to]), found)
+        };
+
+        for side in found.into_iter().flatten() {
+            self.violations.push(RuleViolation::new(
+                &MD039,
+                format!(
+                    "{} [Context: \"{}\"]",
+                    MD039.description,
+                    ellipsified(&context, side)
+                ),
+                self.context.file_path.clone(),
+                range_from_node_range(&crate::ast::NodeRange {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_point: crate::ast::Point {
+                        row: side.row,
+                        column: side.column,
+                    },
+                    end_point: crate::ast::Point {
+                        row: side.row,
+                        column: side.column + side.width,
+                    },
+                }),
+            ));
+        }
+    }
+}
+
+/// Which end of the label a report is about, and where it lands.
+#[derive(Clone, Copy)]
+enum Side {
+    Leading,
+    Trailing,
+}
+
+impl Side {
+    /// The row and column markdownlint names, and the width of the run there. Without a horizontal
+    /// run the report moves one line towards the label's middle and covers nothing.
+    fn at(self, end: crate::ast::Point, run: usize) -> Placed {
+        let (row, column) = match (self, run) {
+            (Self::Leading, 0) => (end.row + 1, 0),
+            (Self::Trailing, 0) => (end.row.saturating_sub(1), 0),
+            (Self::Leading, _) => (end.row, end.column),
+            (Self::Trailing, run) => (end.row, end.column.saturating_sub(run)),
+        };
+        Placed {
+            row,
+            column,
+            width: run,
+            trailing: matches!(self, Self::Trailing),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Placed {
+    row: usize,
+    column: usize,
+    width: usize,
+    trailing: bool,
+}
+
+/// The byte range of a link's label — what sits between the `[` the node starts at and its matching
+/// `]`. Counted rather than taken from the node's children, because a label of nothing but
+/// whitespace has no children and one holding a code span has several.
+fn label_span(link: Node, source: &str) -> Option<Label> {
+    let bytes = source.as_bytes();
+    let from = link.start_byte();
+    if bytes.get(from) != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut at = from;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'[' => {
+                depth += 1;
+                at += 1;
+            }
+            b']' => {
+                depth -= 1;
+                at += 1;
+                if depth == 0 {
+                    return Some(Label {
+                        from: from + 1,
+                        to: at - 1,
+                    });
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+struct Label {
+    from: usize,
+    to: usize,
+}
+
+/// How many whitespace characters that are neither `\r` nor `\n` sit at the start (`leading`) or the
+/// end of `text` — markdownlint's `[^\S\r\n]`.
+fn horizontal_run(text: &str, leading: bool) -> usize {
+    let is_horizontal = |ch: char| ch.is_whitespace() && ch != '\n' && ch != '\r';
+    let width = |chars: &mut dyn Iterator<Item = char>| {
+        chars
+            .take_while(|&ch| is_horizontal(ch))
+            .map(char::len_utf8)
+            .sum()
+    };
+    if leading {
+        width(&mut text.chars())
+    } else {
+        width(&mut text.chars().rev())
+    }
+}
+
+/// The label with every whitespace run collapsed to one space, which is what markdownlint puts in
+/// the message before [`ellipsified`] shortens it.
+fn ellipsify(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// markdownlint's `ellipsify`: over thirty characters, a leading report keeps the start and a
+/// trailing one the end.
+fn ellipsified(text: &str, side: Placed) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= 30 {
+        return text.to_string();
+    }
+    let head = |count: usize| chars.iter().take(count).collect::<String>();
+    let tail = |count: usize| chars.iter().skip(chars.len() - count).collect::<String>();
+    if side.trailing {
+        format!("...{}", tail(30))
+    } else {
+        format!("{}...", head(30))
+    }
 }
 
 impl RuleLinter for MD039Linter {
     fn feed(&mut self, node: &Node) {
-        // Process different possible link node types
-        if node.kind() == "link" {
-            self.check_link_for_spaces(node);
-        } else if node.kind() == "inline" {
-            // Check if this inline node contains links
-            self.check_inline_for_links(node);
+        if node.kind() == "inline" {
+            self.walk(*node);
         }
     }
 
     fn finalize(&mut self) -> Vec<RuleViolation> {
         std::mem::take(&mut self.violations)
-    }
-}
-
-impl MD039Linter {
-    fn check_inline_for_links(&mut self, inline_node: &Node) {
-        // Look for links within inline content using the text
-        let link_text = {
-            let document_content = self.context.document_content.borrow();
-            inline_node
-                .utf8_text(document_content.as_bytes())
-                .unwrap_or("")
-                .to_string()
-        };
-
-        // Parse the inline content for markdown links
-        // Look for patterns like [text](url), [text][ref], [ref][], [ref]
-        self.check_text_for_link_patterns(&link_text, inline_node);
-    }
-
-    fn check_text_for_link_patterns(&mut self, text: &str, node: &Node) {
-        for caps in RE_INLINE_LINK.captures_iter(text) {
-            if let Some(label_match) = caps.get(1) {
-                let label_text = label_match.as_str();
-                self.check_label_for_spaces(label_text, node);
-            }
-        }
-
-        for caps in RE_REF_LINK.captures_iter(text) {
-            if let Some(label_match) = caps.get(1) {
-                let label_text = label_match.as_str();
-                self.check_label_for_spaces(label_text, node);
-            }
-        }
-
-        for caps in RE_COLLAPSED_REF_LINK.captures_iter(text) {
-            if let Some(label_match) = caps.get(1) {
-                let label_text = label_match.as_str();
-                self.check_label_for_spaces(label_text, node);
-            }
-        }
-
-        // Shortcut reference links: [text] - but only if there's a matching reference definition
-        // We need to be careful here to not match arbitrary brackets
-        // For now, let's only process shortcut links in specific contexts or skip them
-        // since they require document-level analysis to verify the reference exists
-    }
-
-    fn check_label_for_spaces(&mut self, label_text: &str, node: &Node) {
-        // Check for leading spaces
-        if label_text.len() != label_text.trim_start().len() {
-            self.create_space_violation(node, true);
-        }
-
-        // Check for trailing spaces
-        if label_text.len() != label_text.trim_end().len() {
-            self.create_space_violation(node, false);
-        }
-    }
-
-    fn check_link_for_spaces(&mut self, link_node: &Node) {
-        // Look for the link text within the link node
-        // In tree-sitter markdown, links have different structures
-        // We need to find the text content and check for leading/trailing spaces
-
-        let link_text = {
-            let document_content = self.context.document_content.borrow();
-            link_node
-                .utf8_text(document_content.as_bytes())
-                .unwrap_or("")
-                .to_string()
-        };
-
-        // Find the bracket part [text] in the link
-        if let Some(bracket_start) = link_text.find('[') {
-            if let Some(bracket_end) = link_text.find(']') {
-                if bracket_end > bracket_start {
-                    let label_text = &link_text[bracket_start + 1..bracket_end];
-
-                    // Check for leading spaces
-                    if label_text.len() != label_text.trim_start().len() {
-                        self.create_space_violation(link_node, true);
-                    }
-
-                    // Check for trailing spaces
-                    if label_text.len() != label_text.trim_end().len() {
-                        self.create_space_violation(link_node, false);
-                    }
-                }
-            }
-        }
-    }
-
-    fn create_space_violation(&mut self, node: &Node, is_leading: bool) {
-        let space_type = if is_leading { "leading" } else { "trailing" };
-        let message = format!("Spaces inside link text ({space_type})");
-
-        self.violations.push(RuleViolation::new(
-            &MD039,
-            message,
-            self.context.file_path.clone(),
-            range_from_node_range(&node.range()),
-        ));
     }
 }
 
@@ -163,7 +231,7 @@ pub const MD039: Rule = Rule {
     tags: &["whitespace", "links"],
     description: "Spaces inside link text",
     rule_type: RuleType::Token,
-    required_nodes: &["link", "inline"], // We need link nodes to check for spaces in link text
+    required_nodes: &["inline"],
     new_linter: |context| Box::new(MD039Linter::new(context)),
 };
 
@@ -184,130 +252,213 @@ mod test {
         ])
     }
 
-    #[test]
-    fn test_no_spaces_in_link_text() {
-        let input = "[link text](https://example.com)";
+    /// Every case below is followed by these two definitions, so the reference links among them
+    /// resolve and become links rather than text.
+    const DEFS: &str = "\n[r]: /u\n[a]: /u\n";
 
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
+    /// A report: the 1-based line and column of the whitespace run, and the label markdownlint puts
+    /// in the message.
+    type Report = (usize, usize, &'static str);
+    type Found = (usize, usize, String);
 
-        assert_eq!(0, violations.len());
+    /// A case's name, its document without [`DEFS`], and the reports markdownlint makes on it.
+    type Case = (&'static str, &'static str, &'static [Report]);
+
+    fn owned(reports: &[Report]) -> Vec<Found> {
+        reports
+            .iter()
+            .map(|&(line, column, context)| (line, column, context.to_string()))
+            .collect()
     }
 
-    #[test]
-    fn test_leading_space_in_link_text() {
-        let input = "[ link text](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-        let violation = &violations[0];
-        assert_eq!("MD039", violation.rule().id);
-        assert!(violation.message().contains("Spaces inside link text"));
+    fn reports(body: &str) -> Vec<Found> {
+        let mut linter = MultiRuleLinter::new_for_document(
+            PathBuf::from("test.md"),
+            test_config(),
+            &format!("{body}{DEFS}"),
+        );
+        linter
+            .analyze()
+            .iter()
+            .filter(|violation| violation.rule().id == "MD039")
+            .map(|violation| {
+                let context = violation
+                    .message()
+                    .split_once("[Context: \"")
+                    .and_then(|(_, rest)| rest.strip_suffix("\"]"))
+                    .unwrap_or_default();
+                let range = &violation.location().range;
+                (
+                    range.start.line + 1,
+                    range.start.character + 1,
+                    context.to_string(),
+                )
+            })
+            .collect()
     }
 
+    /// Every expectation measured against markdownlint-cli2 v0.23.3, which reports the whitespace
+    /// run itself — so a label padded both sides is two reports, and one whose padding is a line
+    /// break moves to the line beside it.
     #[test]
-    fn test_trailing_space_in_link_text() {
-        let input = "[link text ](https://example.com)";
+    fn matches_markdownlint() {
+        let cases: &[Case] = &[
+            (
+                "leading and trailing",
+                "[ link ](url)\n",
+                &[(1, 2, "[ link ]"), (1, 7, "[ link ]")],
+            ),
+            ("no spaces", "[link](url)\n", &[]),
+            ("an image is left alone", "![ img ](i)\n", &[]),
+            (
+                "a full reference",
+                "[ a ][r]\n",
+                &[(1, 2, "[ a ]"), (1, 4, "[ a ]")],
+            ),
+            (
+                "a collapsed reference",
+                "[ a ][]\n",
+                &[(1, 2, "[ a ]"), (1, 4, "[ a ]")],
+            ),
+            (
+                "a shortcut reference",
+                "[ a ]\n",
+                &[(1, 2, "[ a ]"), (1, 4, "[ a ]")],
+            ),
+            ("an undefined shortcut is not a link", "[ b ]\n", &[]),
+            ("an empty label", "[](url)\n", &[]),
+            (
+                "a label of one space",
+                "[ ](url)\n",
+                &[(1, 2, "[ ]"), (1, 2, "[ ]")],
+            ),
+            (
+                "nested brackets",
+                "[a [b] c ](u)\n",
+                &[(1, 9, "[a [b] c ]")],
+            ),
+            (
+                "two spaces each side",
+                "[  a  ](u)\n",
+                &[(1, 2, "[ a ]"), (1, 5, "[ a ]")],
+            ),
+            ("a trailing tab", "[a\t](u)\n", &[(1, 3, "[a ]")]),
+            (
+                "trailing space on the second line",
+                "[a\n b ](u)\n",
+                &[(2, 3, "[a b ]")],
+            ),
+            (
+                "leading space on the first line",
+                "[ a\nb](u)\n",
+                &[(1, 2, "[ a b]")],
+            ),
+            (
+                "a trailing space before a line break",
+                "[a \n](u)\n",
+                &[(1, 1, "[a ]")], // markdownlint names no column here
+            ),
+            (
+                "a trailing space after a line break",
+                "[a\n ](u)\n",
+                &[(2, 1, "[a ]")],
+            ),
+            (
+                "in a heading",
+                "# [ a ](u)\n",
+                &[(1, 4, "[ a ]"), (1, 6, "[ a ]")],
+            ),
+            (
+                "in a table cell",
+                "| x |\n| - |\n| [ a ](u) |\n",
+                &[(3, 4, "[ a ]"), (3, 6, "[ a ]")],
+            ),
+            ("an autolink has no label", "<https://x.com>\n", &[]),
+            (
+                "a code span in the label",
+                "[ `a` ](u)\n",
+                &[(1, 2, "[ `a` ]"), (1, 6, "[ `a` ]")],
+            ),
+            (
+                "two links",
+                "[ a ](u) and [ b ](v)\n",
+                &[
+                    (1, 2, "[ a ]"),
+                    (1, 4, "[ a ]"),
+                    (1, 15, "[ b ]"),
+                    (1, 17, "[ b ]"),
+                ],
+            ),
+            (
+                "a label over thirty characters",
+                "[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ](u)\n",
+                &[(1, 40, "...aaaaaaaaaaaaaaaaaaaaaaaaaaaa ]")],
+            ),
+            (
+                "in a block quote",
+                "> [ a ](u)\n",
+                &[(1, 4, "[ a ]"), (1, 6, "[ a ]")],
+            ),
+            ("a title", "[link](url \"title\")\n", &[]),
+            ("an image reference", "![ img ][r]\n", &[]),
+            ("an image inside a link", "[![ img ](i)](u)\n", &[]),
+            (
+                "an image inside a padded label",
+                "[ ![i](x) ](u)\n",
+                &[(1, 2, "[ ![i](x) ]"), (1, 10, "[ ![i](x) ]")],
+            ),
+            (
+                "escaped brackets in the label",
+                "[ \\[ a \\] ](u)\n",
+                &[(1, 2, "[ \\[ a \\] ]"), (1, 10, "[ \\[ a \\] ]")],
+            ),
+            (
+                "in a list item",
+                "- [ a ](u)\n",
+                &[(1, 4, "[ a ]"), (1, 6, "[ a ]")],
+            ),
+            (
+                "on the second line",
+                "[a](u)\n[ b ](v)\n",
+                &[(2, 2, "[ b ]"), (2, 4, "[ b ]")],
+            ),
+            (
+                "a label of two spaces",
+                "[  ](u)\n",
+                &[(1, 2, "[ ]"), (1, 2, "[ ]")],
+            ),
+            (
+                "tabs both sides",
+                "[\ta\t](u)\n",
+                &[(1, 2, "[ a ]"), (1, 4, "[ a ]")],
+            ),
+        ];
 
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        assert_eq!(1, violations.len());
-        let violation = &violations[0];
-        assert_eq!("MD039", violation.rule().id);
-        assert!(violation.message().contains("Spaces inside link text"));
+        let failures: Vec<String> = cases
+            .iter()
+            .filter(|&&(name, body, expected)| {
+                let actual = reports(body);
+                if actual == owned(expected) {
+                    return false;
+                }
+                println!("{name}: expected {:?}, got {actual:?}", owned(expected));
+                true
+            })
+            .map(|&(name, _, _)| name.to_string())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {} cases disagree with markdownlint: {failures:?}",
+            failures.len(),
+            cases.len()
+        );
     }
 
+    /// When the whitespace beside a label is a line break there is no horizontal run to point at, so
+    /// markdownlint passes no range and markdownlint-cli2 prints the line alone. quickmark always
+    /// has a range, and puts it at the start of that line.
     #[test]
-    fn test_both_leading_and_trailing_spaces() {
-        let input = "[ link text ](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should report both leading and trailing space violations
-        assert_eq!(2, violations.len());
-        for violation in &violations {
-            assert_eq!("MD039", violation.rule().id);
-            assert!(violation.message().contains("Spaces inside link text"));
-        }
-    }
-
-    #[test]
-    fn test_reference_link_with_spaces() {
-        let input = "[ link text ][ref]\n\n[ref]: https://example.com";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect spaces in reference link text
-        assert_eq!(2, violations.len());
-        for violation in &violations {
-            assert_eq!("MD039", violation.rule().id);
-        }
-    }
-
-    #[test]
-    fn test_shortcut_reference_link_with_spaces() {
-        let input = "[ link text ][]\n\n[link text]: https://example.com";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect spaces in collapsed reference link
-        assert_eq!(2, violations.len());
-        for violation in &violations {
-            assert_eq!("MD039", violation.rule().id);
-        }
-    }
-
-    #[test]
-    fn test_image_not_affected() {
-        let input = "![ image alt text ](image.jpg)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Images should not be affected by this rule
-        assert_eq!(0, violations.len());
-    }
-
-    #[test]
-    fn test_empty_link_text_with_spaces() {
-        let input = "[ ](https://example.com)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should detect spaces in empty link text
-        assert_eq!(2, violations.len());
-        for violation in &violations {
-            assert_eq!("MD039", violation.rule().id);
-        }
-    }
-
-    #[test]
-    fn test_multiple_links() {
-        let input = "[good link](url1) and [ bad link ](url2) and [another good](url3)";
-
-        let config = test_config();
-        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
-        let violations = linter.analyze();
-
-        // Should only detect violations in the bad link
-        assert_eq!(2, violations.len());
-        for violation in &violations {
-            assert_eq!("MD039", violation.rule().id);
-        }
+    fn a_line_break_inside_the_label_has_no_column() {
+        assert_eq!(reports("[a \n](u)\n"), vec![(1, 1, "[a ]".to_string())]);
     }
 }
