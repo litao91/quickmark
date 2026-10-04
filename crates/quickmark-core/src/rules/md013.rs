@@ -7,7 +7,10 @@ use linkify::{LinkFinder, LinkKind};
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{md034::is_gfm_autolink, Context, Rule, RuleLinter, RuleType},
+    rules::{
+        md034::{gfm_emails, is_gfm_autolink},
+        Context, Rule, RuleLinter, RuleType,
+    },
 };
 
 // MD013-specific configuration types
@@ -185,11 +188,28 @@ impl MD013Linter {
 
     /// The GFM autolink literals in `text`, as sorted non-overlapping byte spans.
     fn autolinks(&self, text: &str) -> Vec<(usize, usize)> {
-        self.finder
+        let mut spans: Vec<(usize, usize)> = self
+            .finder
             .links(text)
             .filter(|link| *link.kind() == LinkKind::Email || is_gfm_autolink(link.as_str()))
             .map(|link| (link.start(), link.end()))
-            .collect()
+            // linkify reads `oss://key:secret@host/path` as one URL whose scheme GFM does not
+            // autolink, so the address inside it is invisible to the finder above. micromark's
+            // `literalAutolink` covers it, which is what makes a long table cell holding an
+            // `oss://` credential nothing but a link.
+            .chain(gfm_emails(text))
+            .collect();
+        spans.sort_unstable();
+        // `has_text_outside` walks the spans in order, so one that starts inside its predecessor has
+        // to be folded into it rather than left to move the cursor backwards.
+        spans.dedup_by(|later, kept| {
+            if later.0 <= kept.1 {
+                kept.1 = kept.1.max(later.1);
+                return true;
+            }
+            false
+        });
+        spans
     }
 
     /// Runs once every node has been fed, so it lives in `finalize` rather than in `feed`.
@@ -855,6 +875,16 @@ mod test {
         );
         // In a paragraph the space between two URLs is the paragraph's own text.
         assert_eq!(vec![1], reports(&format!("{url} {url}\n")));
+
+        // An address inside a URL whose scheme GFM does not autolink is still a `literalAutolink` to
+        // micromark. linkify swallows it into the URL, so it has to be found separately — and folding
+        // does not spare this row, whose last run of non-whitespace is the closing pipe.
+        let credential = "oss://LTAI5tKUdt5adv4sdhfwQr7y:\
+                          ynFqbeSNumdWyJerfTa5I2a1DsfXZS@oss-cn-shanghai.aliyuncs.com/bak";
+        assert!(
+            reports(&format!("| a | b |\n|---|---|\n| {credential} | x |\n")).is_empty(),
+            "a 102-column row"
+        );
     }
 
     /// markdownlint strips front matter from the content before it parses, so no rule measures those

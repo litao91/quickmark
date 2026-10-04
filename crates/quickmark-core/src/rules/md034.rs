@@ -170,7 +170,11 @@ pub(crate) fn is_gfm_autolink(url: &str) -> bool {
 /// directions — it wants a two-letter alphabetic TLD, so it misses `a@b.c` and `a@b.1x`, and it
 /// trims a trailing `-` or `_`, so it reports `a@b.com` for `a@b.com-` where micromark consumes the
 /// `-` and then rejects the whole literal.
-fn gfm_emails(text: &str) -> Vec<(usize, usize)> {
+///
+/// MD013 needs this too: micromark's `literalAutolink` covers an address inside a URL whose scheme
+/// GFM does not autolink, which is what makes a long table cell holding an `oss://` credential
+/// nothing but a link.
+pub(crate) fn gfm_emails(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
     for (at_sign, &byte) in bytes.iter().enumerate() {
