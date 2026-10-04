@@ -498,6 +498,21 @@ mod test {
         ("a <b>https://example.com c\n", &[(1, 6, 19)]),
         ("# see https://example.com\n", &[(1, 7, 19)]),
         ("| a |\n|---|\n| https://example.com |\n", &[(3, 3, 19)]),
+        // comrak parses a table cell's content with `\|` collapsed to `|`, so the columns it reports
+        // inside one are short by an escape each. Without the correction the underline loses its last
+        // character and a URL after a second escape is missed entirely.
+        (
+            "| x \\| y https://example.com | z |\n| - | - |\n| a | b |\n",
+            &[(1, 10, 19)],
+        ),
+        (
+            "| x \\| y https://a.com \\| z https://b.com | w |\n| - | - |\n| a | b |\n",
+            &[(1, 10, 13), (1, 29, 13)],
+        ),
+        (
+            "| no escape https://example.com | z |\n| - | - |\n| a | b |\n",
+            &[(1, 13, 19)],
+        ),
         ("> https://example.com\n", &[(1, 3, 19)]),
         ("- https://example.com\n", &[(1, 3, 19)]),
         ("- [x] https://example.com\n", &[(1, 7, 19)]),

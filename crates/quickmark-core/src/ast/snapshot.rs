@@ -805,6 +805,61 @@ const CASES: &[(&str, &str, &str)] = &[
 "#,
     ),
     (
+        // comrak hands each table cell's content to the inline parser with `\|` collapsed to `|`, so
+        // the columns it reports inside a cell are short by one per collapse before them. Only `\|`
+        // is affected and the shift is per cell, so the second column's first code span is unshifted
+        // and its second one is shifted once rather than twice.
+        "escaped pipes in table cells",
+        "| a | b |\n| - | - |\n| x \\| y `z` | `p` \\| `q` |\n",
+        r#"(document 0:0-3:0 0-48
+  (section 0:0-3:0 0-48
+    (pipe_table 0:0-3:0 0-48
+      (pipe_table_header 0:0-0:9 0-9
+        (| 0:0-0:1 0-1)
+        (pipe_table_cell 0:2-0:4 2-4
+          (inline 0:2-0:3 2-3
+            (text 0:2-0:3 2-3)
+          )
+        )
+        (| 0:4-0:5 4-5)
+        (pipe_table_cell 0:6-0:8 6-8
+          (inline 0:6-0:7 6-7
+            (text 0:6-0:7 6-7)
+          )
+        )
+        (| 0:8-0:9 8-9)
+      )
+      (pipe_table_delimiter_row 1:0-1:9 10-19
+        (| 1:0-1:1 10-11)
+        (pipe_table_delimiter_cell 1:2-1:3 12-13)
+        (| 1:4-1:5 14-15)
+        (pipe_table_delimiter_cell 1:6-1:7 16-17)
+        (| 1:8-1:9 18-19)
+      )
+      (pipe_table_row 2:0-2:27 20-47
+        (| 2:0-2:1 20-21)
+        (pipe_table_cell 2:2-2:13 22-33
+          (inline 2:2-2:12 22-32
+            (text 2:2-2:9 22-29)
+            (code_span 2:9-2:12 29-32)
+          )
+        )
+        (| 2:13-2:14 33-34)
+        (pipe_table_cell 2:15-2:26 35-46
+          (inline 2:15-2:25 35-45
+            (code_span 2:15-2:18 35-38)
+            (text 2:18-2:22 38-42)
+            (code_span 2:22-2:25 42-45)
+          )
+        )
+        (| 2:26-2:27 46-47)
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
         // micromark leaves its `interrupt` flag set after an indented code block, so an ordered
         // marker other than `1` starts no list there and the line is paragraph text. The inline
         // children survive the rewrite; only the `2. ` marker, which is literal text to micromark,

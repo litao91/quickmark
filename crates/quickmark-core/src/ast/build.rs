@@ -33,6 +33,7 @@ pub fn parse(source: &str) -> FacadeTree {
         link_targets: HashMap::new(),
         in_footnote_definition: false,
         closed_headings: HashSet::new(),
+        cell_columns: None,
         origin_row: 0,
     };
     let math = math_regions(&builder.lines, root);
@@ -156,6 +157,54 @@ struct CellInline<'n> {
     source: ComrakNode<'n>,
 }
 
+/// How a table cell's columns map back onto its line.
+///
+/// comrak hands each cell's content to the inline parser with `\|` collapsed to `|`
+/// (`parser/table.rs`'s `unescape_pipes`), so every column it reports inside a cell counts an escape
+/// as one character and comes out short by one per collapse before it. Only `\|` is affected — `\*`,
+/// `\_` and `\\` keep their sourcepos, and a pipe whose backslash is itself escaped is a real cell
+/// delimiter, not a collapse. The shift is per cell, so an escape in one cell leaves its neighbours
+/// alone.
+///
+/// `real[i]` is the line column of collapsed column `base + i`, with one entry past the end so an
+/// exclusive end maps too.
+struct CellColumns {
+    row: u32,
+    base: u32,
+    real: Vec<u32>,
+}
+
+impl CellColumns {
+    fn new(lines: &LineIndex<'_>, row: u32, base: u32, end: u32) -> Self {
+        let text = lines.content(row as usize).as_bytes();
+        let mut real = Vec::new();
+        let mut at = base as usize;
+        let mut escaped = false;
+        while at < end as usize && at < text.len() {
+            // The second byte of a collapse belongs to the character before it, so it gets no entry.
+            if escaped && text[at] == b'|' {
+                escaped = false;
+                at += 1;
+                continue;
+            }
+            real.push(at as u32);
+            escaped = text[at] == b'\\';
+            at += 1;
+        }
+        real.push(at as u32);
+        Self { row, base, real }
+    }
+
+    /// A column outside the cell, or on another row, is returned as it came.
+    fn real_column(&self, row: u32, column: u32) -> u32 {
+        if row != self.row || column < self.base {
+            return column;
+        }
+        let index = (column - self.base) as usize;
+        self.real.get(index).copied().unwrap_or(column)
+    }
+}
+
 struct Builder<'a> {
     lines: LineIndex<'a>,
     nodes: Vec<Node>,
@@ -181,6 +230,9 @@ struct Builder<'a> {
     in_footnote_definition: bool,
     /// Build-time indices of the closed `atx_heading` nodes, rekeyed by [`Builder::flatten`].
     closed_headings: HashSet<u32>,
+    /// Column correction for the table cell whose inline subtree is being emitted — see
+    /// [`CellColumns`].
+    cell_columns: Option<CellColumns>,
     /// Row added to every position the comrak tree being emitted reports. Zero except while
     /// [`Builder::emit_math_tail`] emits a block's tail, which is parsed as a document of its own and
     /// so counts rows from its own first line. Columns need no offset: a tail always starts at a line
@@ -232,6 +284,13 @@ impl<'a> Builder<'a> {
     /// comrak's 1-based line as this document's 0-based row.
     fn abs_row(&self, line: usize) -> u32 {
         (line - 1) as u32 + self.origin_row
+    }
+
+    /// A column comrak reported, moved back onto the line when it came from inside a table cell.
+    fn real_col(&self, row: u32, column: u32) -> u32 {
+        self.cell_columns
+            .as_ref()
+            .map_or(column, |cell| cell.real_column(row, column))
     }
 
     /// A block's end, normalized to tree-sitter-md's convention of swallowing the trailing newline:
@@ -1100,16 +1159,17 @@ impl<'a> Builder<'a> {
         };
 
         let sourcepos = node.data().sourcepos;
+        let (start_row, end_row) = (
+            self.abs_row(sourcepos.start.line),
+            self.abs_row(sourcepos.end.line),
+        );
         let index = self.add(
             kind,
             (
-                self.abs_row(sourcepos.start.line),
-                (sourcepos.start.column - 1) as u32,
+                start_row,
+                self.real_col(start_row, (sourcepos.start.column - 1) as u32),
             ),
-            (
-                self.abs_row(sourcepos.end.line),
-                sourcepos.end.column as u32,
-            ),
+            (end_row, self.real_col(end_row, sourcepos.end.column as u32)),
         );
         if let Some(target) = target {
             self.link_targets.insert(index, target);
@@ -1281,23 +1341,28 @@ impl<'a> Builder<'a> {
 
     /// Gives one synthesized `pipe_table_cell` the `inline` subtree comrak parsed for it.
     fn emit_cell_inline<'n>(&mut self, cell: u32, inlines: &[CellInline<'n>]) {
-        let (cell_start, cell_end) = {
+        let (row, base, cell_end_col) = {
             let node = &self.nodes[cell as usize];
-            (
-                self.lines
-                    .byte_at(node.start_row as usize, node.start_col as usize),
-                self.lines
-                    .byte_at(node.end_row as usize, node.end_col as usize),
-            )
+            (node.start_row, node.start_col, node.end_col)
         };
+        let cell_start = self.lines.byte_at(row as usize, base as usize);
+        let cell_end = self.lines.byte_at(row as usize, cell_end_col as usize);
+        // The graft key is the first child's start, which no collapse precedes — the cell's content
+        // is trimmed, so nothing sits before it — and is already a real column.
         let Some(found) = inlines.iter().find(|candidate| {
             candidate.start_byte >= cell_start && candidate.start_byte < cell_end
         }) else {
             return;
         };
         let (start, end, source) = (found.start, found.end, found.source);
+
+        let columns = CellColumns::new(&self.lines, row, base, cell_end_col);
+        let start = (start.0, columns.real_column(start.0, start.1));
+        let end = (end.0, columns.real_column(end.0, end.1));
+        self.cell_columns = Some(columns);
         let inline = self.add(Kind::Inline, start, end);
         self.emit_inline(inline, source);
+        self.cell_columns = None;
         self.push(cell, inline);
     }
 
