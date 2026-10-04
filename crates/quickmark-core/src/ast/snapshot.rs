@@ -190,9 +190,9 @@ const CASES: &[(&str, &str, &str)] = &[
     (list 7:0-8:0 37-48
       (list_item 7:0-8:0 37-48
         (list_marker_minus 7:0-7:2 37-39)
-        (paragraph 7:6-8:0 43-48
-          (inline 7:6-7:10 43-47
-            (text 7:6-7:10 43-47)
+        (paragraph 7:2-8:0 39-48
+          (inline 7:2-7:10 39-47
+            (text 7:2-7:10 39-47)
           )
         )
       )
@@ -748,6 +748,56 @@ const CASES: &[(&str, &str, &str)] = &[
       (atx_h1_marker 5:0-5:1 18-19)
       (inline 5:2-5:3 20-21
         (text 5:2-5:3 20-21)
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        // micromark has no task marker token: `[x] ` stays in the paragraph, as two `data` tokens and
+        // an undefined shortcut reference. comrak's `tasklist` extension strips it and starts the
+        // paragraph after it, which is why the extension is off — MD013 reads a paragraph's `data`
+        // children to tell a line that is nothing but a link from one that has prose on it.
+        "task list items",
+        "- [x] done\n- [ ] [label](u)\n- [x]\n- [x]no space\n",
+        r#"(document 0:0-4:0 0-48
+  (section 0:0-4:0 0-48
+    (list 0:0-4:0 0-48
+      (list_item 0:0-1:0 0-11
+        (list_marker_minus 0:0-0:2 0-2)
+        (paragraph 0:2-1:0 2-11
+          (inline 0:2-0:10 2-10
+            (text 0:2-0:10 2-10)
+          )
+        )
+      )
+      (list_item 1:0-2:0 11-28
+        (list_marker_minus 1:0-1:2 11-13)
+        (paragraph 1:2-2:0 13-28
+          (inline 1:2-1:16 13-27
+            (text 1:2-1:6 13-17)
+            (link 1:6-1:16 17-27
+              (text 1:7-1:12 18-23)
+            )
+          )
+        )
+      )
+      (list_item 2:0-3:0 28-34
+        (list_marker_minus 2:0-2:2 28-30)
+        (paragraph 2:2-3:0 30-34
+          (inline 2:2-2:5 30-33
+            (text 2:2-2:5 30-33)
+          )
+        )
+      )
+      (list_item 3:0-4:0 34-48
+        (list_marker_minus 3:0-3:2 34-36)
+        (paragraph 3:2-4:0 36-48
+          (inline 3:2-3:13 36-47
+            (text 3:2-3:13 36-47)
+          )
+        )
       )
     )
   )

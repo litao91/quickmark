@@ -27,9 +27,7 @@ pub fn parse(source: &str) -> FacadeTree {
         lines,
         nodes: Vec::new(),
         covered,
-        enclosing_list: None,
         pending_item_start: None,
-        pending_paragraph_start: None,
         math: Vec::new(),
         math_emitted: Vec::new(),
         link_targets: HashMap::new(),
@@ -56,10 +54,7 @@ fn math_regions(lines: &LineIndex<'_>, root: ComrakNode<'_>) -> Vec<synth::Span>
         .filter(|node| {
             matches!(
                 node.data().value,
-                NodeValue::BlockQuote
-                    | NodeValue::List(_)
-                    | NodeValue::Item(_)
-                    | NodeValue::TaskItem(_)
+                NodeValue::BlockQuote | NodeValue::List(_) | NodeValue::Item(_)
             )
         })
         .map(|node| node.data().sourcepos)
@@ -82,9 +77,10 @@ fn math_regions(lines: &LineIndex<'_>, root: ComrakNode<'_>) -> Vec<synth::Span>
 /// - `front_matter_delimiter`, because without it `---\ntitle: x\n---` parses as a thematic break
 ///   plus a setext heading, and MD041 then reports a missing top-level heading on every file that
 ///   has front matter.
-/// - `tasklist` on, because it moves the item's paragraph start past `[x] `, which is where
-///   tree-sitter-md put it. The task marker node itself is deliberately not reproduced — no rule
-///   reads it.
+/// - `tasklist` off, because it moves the item's paragraph start past `[x] `. micromark has no task
+///   marker token at all: `[x] ` stays in the paragraph, as two `data` tokens and an undefined
+///   shortcut reference, and MD013 reads those to tell a line that is nothing but a link from one
+///   that has prose on it.
 /// - `footnotes` on, because markdownlint parses with micromark's GFM footnote extension, so `[^a]`
 ///   is a call and `[^a]: …` a definition rather than a shortcut reference and a paragraph. comrak
 ///   drops every definition nothing refers to, and [`synth::is_footnote_definition_line`] puts those
@@ -92,7 +88,6 @@ fn math_regions(lines: &LineIndex<'_>, root: ComrakNode<'_>) -> Vec<synth::Span>
 pub fn comrak_options() -> Options<'static> {
     let mut options = Options::default();
     options.extension.table = true;
-    options.extension.tasklist = true;
     options.extension.front_matter_delimiter = Some("---".into());
     // markdownlint parses with micromark's `math()` at its defaults, so `$…$` is a math token there
     // and its contents are never emphasis, HTML or a link. Without this, comrak leaves the `$` as
@@ -168,15 +163,10 @@ struct Builder<'a> {
     /// line no block claimed, so containers deliberately do not claim theirs — their content might be
     /// a definition comrak detached.
     covered: Vec<bool>,
-    /// The payload of the list whose items are being emitted, for task list items that carry none.
-    enclosing_list: Option<NodeList>,
     /// Start position forced onto the next list item. tree-sitter-md begins a list's *first* item at
     /// the list's own column, which for an indented top-level list is column 0 rather than the
     /// marker's; every later item starts at its marker.
     pending_item_start: Option<(u32, u32)>,
-    /// Start position forced onto the next paragraph. Set for a list item whose task marker is not
-    /// followed by whitespace — see [`Builder::bare_task_marker`].
-    pending_paragraph_start: Option<(u32, u32)>,
     /// The `$$…$$` regions of the document, and whether each one's node has been emitted yet — see
     /// [`Builder::math_at`].
     math: Vec<synth::Span>,
@@ -683,11 +673,7 @@ impl<'a> Builder<'a> {
                 out.push(index);
             }
             NodeValue::Paragraph => {
-                let forced = self.pending_paragraph_start.take();
-                let (start, end) = (
-                    forced.unwrap_or_else(|| self.start_col(node, nesting)),
-                    self.block_end(node),
-                );
+                let (start, end) = (self.start_col(node, nesting), self.block_end(node));
                 drop(data);
                 out.extend(self.emit_paragraph(start, end, Some(node)));
             }
@@ -718,23 +704,6 @@ impl<'a> Builder<'a> {
             }
             // comrak resolves reference definitions into its private refmap and emits nothing here.
             NodeValue::TableRow(_) | NodeValue::TableCell => {}
-            // comrak replaces `Item` with `TaskItem` in a task list, and it carries no marker
-            // details, so the enclosing list's payload supplies them. tree-sitter-md additionally
-            // emits a `task_list_marker_checked`/`_unchecked` sibling; no rule reads it and no rule
-            // indexes a list item's children positionally, so it is not reproduced. That is the one
-            // intentional node-set divergence from tree-sitter-md.
-            NodeValue::TaskItem(_) => {
-                let Some(list) = self.enclosing_list else {
-                    drop(data);
-                    for child in node.children() {
-                        self.emit_block(child, nesting, out);
-                    }
-                    return;
-                };
-                drop(data);
-                let index = self.emit_list_item(node, &list, nesting);
-                out.push(index);
-            }
             other => {
                 let description = format!("{other:?}");
                 drop(data);
@@ -765,14 +734,6 @@ impl<'a> Builder<'a> {
         let index = self.add(kind, start, self.block_end(node));
         let mut children = Vec::new();
 
-        // A task list's items are `TaskItem`, which carries no marker details, so the enclosing
-        // list's payload has to be handed down for the marker to be synthesized at all.
-        let saved = self.enclosing_list.take();
-        if kind == Kind::List {
-            if let NodeValue::List(payload) = &node.data().value {
-                self.enclosing_list = Some(*payload);
-            }
-        }
         let list_start = self.nodes[index as usize].start();
         let child_nesting = match kind {
             // A list's children are its items, which start at their own markers.
@@ -787,10 +748,7 @@ impl<'a> Builder<'a> {
         };
         let mut awaiting_first_item = kind == Kind::List;
         for child in node.children() {
-            let is_item = matches!(
-                child.data().value,
-                NodeValue::Item(_) | NodeValue::TaskItem(_)
-            );
+            let is_item = matches!(child.data().value, NodeValue::Item(_));
             if is_item && awaiting_first_item {
                 awaiting_first_item = false;
                 self.pending_item_start = Some(list_start);
@@ -800,7 +758,6 @@ impl<'a> Builder<'a> {
             }
             self.emit_block(child, child_nesting, &mut children);
         }
-        self.enclosing_list = saved;
         self.pending_item_start = None;
 
         self.nodes[index as usize].children = children;
@@ -890,39 +847,16 @@ impl<'a> Builder<'a> {
 
         // The item's content column is the marker's column plus the list's padding — *not* where the
         // marker node ends, because an empty item's marker is clamped to the line and a continuation
-        // line still has to reach the full indent. It is also not where a task item's paragraph
-        // starts, since `[x] ` sits between them.
+        // line still has to reach the full indent.
         let item_content_col = content_col;
         self.nodes[index as usize].content_col = content_col;
 
-        // GFM only makes `[x]` a task marker when whitespace follows it, so `- [x]` at end of line is
-        // an ordinary item whose paragraph starts at the `[` and holds it as literal text. comrak
-        // strips the marker either way: it reports the paragraph three columns to the right, and
-        // drops it entirely when no later line carries the item's content.
-        let bare = matches!(node.data().value, NodeValue::TaskItem(_))
-            && self.bare_task_marker(start.0, item_content_col);
-
         let mut children = Vec::new();
-        if bare {
-            self.pending_paragraph_start = Some((start.0, item_content_col));
-        }
         for child in node.children() {
             if self.math_at(child, false, &mut children) {
                 continue;
             }
             self.emit_block(child, Nesting::Content(item_content_col), &mut children);
-        }
-        self.pending_paragraph_start = None;
-        if bare
-            && !children
-                .iter()
-                .any(|&child| self.nodes[child as usize].kind == Kind::Paragraph)
-        {
-            // The paragraph is the marker's own line and nothing more: whatever follows belongs to
-            // the item's next block, not to the text `[x]`.
-            let end = self.lines.block_end_row(start.0);
-            let paragraph = self.emit_paragraph((start.0, item_content_col), end, None);
-            children.splice(0..0, paragraph);
         }
 
         self.push(index, marker_node);
@@ -951,10 +885,7 @@ impl<'a> Builder<'a> {
         let holds_region = row == self.math[slot].start().0
             && matches!(
                 child.data().value,
-                NodeValue::BlockQuote
-                    | NodeValue::List(_)
-                    | NodeValue::Item(_)
-                    | NodeValue::TaskItem(_)
+                NodeValue::BlockQuote | NodeValue::List(_) | NodeValue::Item(_)
             );
         if holds_region {
             return false;
@@ -1024,20 +955,7 @@ impl<'a> Builder<'a> {
         self.math_emitted = saved_emitted;
     }
 
-    /// Whether the task marker at `column` on `row` is the whole line, which is what stops GFM from
-    /// treating it as a marker at all.
-    fn bare_task_marker(&self, row: u32, column: u32) -> bool {
-        let Some(rest) = self.lines.content(row as usize).get(column as usize..) else {
-            return false;
-        };
-        let marker = rest.trim_end_matches([' ', '\t']);
-        marker.len() == 3
-            && marker.starts_with('[')
-            && marker.ends_with(']')
-            && matches!(marker.as_bytes()[1], b' ' | b'x' | b'X')
-    }
-
-    fn emit_code_block<'n>(
+    fn emit_code_block(
         &mut self,
         node: ComrakNode<'_>,
         nesting: Nesting,

@@ -885,6 +885,15 @@ mod test {
             reports(&format!("| a | b |\n|---|---|\n| {credential} | x |\n")).is_empty(),
             "a 102-column row"
         );
+
+        // A task item's `[x] ` is two `data` tokens of the paragraph to micromark, which has no task
+        // marker token at all, so the line holds prose and folding is the only thing that could spare
+        // it — and the label's own spaces are past the limit, so it does not.
+        assert_eq!(
+            vec![1],
+            reports("  - [x] [to #61124615, make KEPLER_CSTORE_PARTITION_XIHE_MERGED show \
+                     \"LOCAL\" for LOCAL_SYNC](https://code.alibaba-inc.com/garuda/adb/codereview/19220742)\n")
+        );
     }
 
     /// markdownlint strips front matter from the content before it parses, so no rule measures those
