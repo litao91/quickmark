@@ -83,7 +83,11 @@ impl MD010Linter {
                     tabs.next();
                     length += 1;
                 }
-                let violation = self.create_violation(line_index, at, length);
+                // The quoted column counts UTF-16 code units the way markdownlint's does, which is
+                // not the byte offset the range carries — a zero-width space before the tab makes the
+                // two differ by two.
+                let column = line[..at].chars().map(char::len_utf16).sum::<usize>() + 1;
+                let violation = self.create_violation(line_index, at, column, length);
                 self.violations.push(violation);
             }
         }
@@ -149,14 +153,16 @@ impl MD010Linter {
             .map(|s| s.to_lowercase())
     }
 
-    /// Creates a RuleViolation for a run of `length` hard tabs starting at `tab_position`.
+    /// Creates a RuleViolation for a run of `length` hard tabs starting at byte `tab_position`,
+    /// quoted in the message at the 1-based UTF-16 `column`.
     fn create_violation(
         &self,
         line_index: usize,
         tab_position: usize,
+        column: usize,
         length: usize,
     ) -> RuleViolation {
-        let message = format!("{} [Column: {}]", MD010.description, tab_position + 1);
+        let message = format!("{} [Column: {column}]", MD010.description);
 
         RuleViolation::new(
             &MD010,
@@ -276,6 +282,44 @@ mod test {
         ];
         for &(name, source, expected) in cases {
             assert_eq!(expected, ranges(source).as_slice(), "{name}");
+        }
+    }
+
+    /// The column quoted in the message counts UTF-16 code units, the way markdownlint's does, while
+    /// the range carries the byte offset every other quickmark range carries. An astral character is
+    /// two units and four bytes, so the two disagree by two per such character.
+    /// Every expectation is markdownlint v0.41.1's `errorDetail`, read back through `lintSync`.
+    #[test]
+    fn the_quoted_column_counts_utf16_units() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("ascii", "ab\tc\n", "Hard tabs [Column: 3]"),
+            (
+                "a zero width space before the tab",
+                "\u{200b}\tx\n",
+                "Hard tabs [Column: 2]",
+            ),
+            (
+                "two zero width spaces",
+                "\u{200b}\u{200b}\tx\n",
+                "Hard tabs [Column: 3]",
+            ),
+            (
+                "a cjk character before the tab",
+                "好\tx\n",
+                "Hard tabs [Column: 2]",
+            ),
+            (
+                "an astral character before the tab",
+                "😀\tx\n",
+                "Hard tabs [Column: 3]",
+            ),
+        ];
+        for &(name, source, expected) in cases {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), source);
+            let violations = linter.analyze();
+            assert_eq!(1, violations.len(), "{name}");
+            assert_eq!(expected, violations[0].message(), "{name}");
         }
     }
 
