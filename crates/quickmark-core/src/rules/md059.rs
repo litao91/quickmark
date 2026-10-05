@@ -141,13 +141,14 @@ impl MD059Linter {
     }
 
     fn violation(&self, label: Label, source: &str) -> RuleViolation {
-        // markdownlint quotes the label brackets and all, and points at what is between them.
+        // markdownlint quotes the label brackets and all, and underlines only what is between them —
+        // micromark's `labelText` token stops at the `]`.
         let quoted = source.get(label.from - 1..=label.to).unwrap_or_default();
         let start = self.context.point_at(label.from);
         let end_byte = {
             let lines = self.context.lines.borrow();
             let line_end = self.context.line_start_byte(start.row) + lines[start.row].len();
-            (label.to + 1).min(line_end)
+            label.to.min(line_end)
         };
         RuleViolation::new(
             &MD059,
@@ -428,6 +429,43 @@ mod test {
                 range.end.character
             )
         );
+    }
+
+    /// A case's name, its document, and the `(line, column, width)` of each report, all 1-based.
+    type RangeCase = (&'static str, &'static str, &'static [(usize, usize, usize)]);
+
+    fn ranges(input: &str) -> Vec<(usize, usize, usize)> {
+        let config = test_config(&DEFAULT);
+        let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let range = &violation.location().range;
+                (
+                    range.start.line + 1,
+                    range.start.character + 1,
+                    range.end.character - range.start.character,
+                )
+            })
+            .collect()
+    }
+
+    /// markdownlint underlines micromark's `labelText` — what sits between the brackets, not the
+    /// brackets or the `]` after it.
+    /// Every tuple is markdownlint v0.41.1's `errorRange`, read back through its `lintSync` API.
+    #[test]
+    fn matches_markdownlints_error_range() {
+        let cases: &[RangeCase] = &[
+            ("a link label used once", "[here](x)\n", &[(1, 2, 4)]),
+            ("a label with a space", "[click here](x)\n", &[(1, 2, 10)]),
+            ("an indented label", "  [here](x)\n", &[(1, 4, 4)]),
+            ("an image label is not this rule's", "![here](x)\n", &[]),
+            ("a reference label", "[here][r]\n\n[r]: /u\n", &[(1, 2, 4)]),
+        ];
+        for &(name, source, expected) in cases {
+            assert_eq!(expected, ranges(source).as_slice(), "{name}");
+        }
     }
 
     #[test]

@@ -71,16 +71,20 @@ impl MD010Linter {
                 continue;
             }
 
-            // markdownlint matches /\t+/g, so a contiguous run of tabs is a single violation while
-            // tabs separated by other content are reported separately.
-            let mut previous_was_tab = false;
-            for (char_index, ch) in line.char_indices() {
-                let is_tab = ch == '\t';
-                if is_tab && !previous_was_tab {
-                    let violation = self.create_violation(line_index, char_index);
-                    self.violations.push(violation);
+            // markdownlint matches /\t+/g, so a contiguous run of tabs is a single violation whose
+            // range covers the whole run, while tabs separated by other content are reported apart.
+            let mut tabs = line.char_indices().peekable();
+            while let Some((at, ch)) = tabs.next() {
+                if ch != '\t' {
+                    continue;
                 }
-                previous_was_tab = is_tab;
+                let mut length = 1;
+                while let Some(&(_, '\t')) = tabs.peek() {
+                    tabs.next();
+                    length += 1;
+                }
+                let violation = self.create_violation(line_index, at, length);
+                self.violations.push(violation);
             }
         }
     }
@@ -145,8 +149,13 @@ impl MD010Linter {
             .map(|s| s.to_lowercase())
     }
 
-    /// Creates a RuleViolation for a hard tab at the specified position.
-    fn create_violation(&self, line_index: usize, tab_position: usize) -> RuleViolation {
+    /// Creates a RuleViolation for a run of `length` hard tabs starting at `tab_position`.
+    fn create_violation(
+        &self,
+        line_index: usize,
+        tab_position: usize,
+        length: usize,
+    ) -> RuleViolation {
         let message = format!("{} [Column: {}]", MD010.description, tab_position + 1);
 
         RuleViolation::new(
@@ -165,7 +174,7 @@ impl MD010Linter {
                 },
                 end_point: crate::ast::Point {
                     row: line_index,
-                    column: tab_position + 1,
+                    column: tab_position + length,
                 },
             }),
         )
@@ -228,6 +237,46 @@ mod test {
                 ..Default::default()
             },
         )
+    }
+
+    /// A case's name, its document, and the `(line, column, width)` of each report, all 1-based.
+    type Case = (&'static str, &'static str, &'static [(usize, usize, usize)]);
+
+    fn ranges(input: &str) -> Vec<(usize, usize, usize)> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let range = &violation.location().range;
+                (
+                    range.start.line + 1,
+                    range.start.character + 1,
+                    range.end.character - range.start.character,
+                )
+            })
+            .collect()
+    }
+
+    /// markdownlint matches `/\t+/g`, so one report covers a whole run of tabs rather than each tab.
+    /// Every tuple is markdownlint v0.41.1's `errorRange`, read back through its `lintSync` API.
+    #[test]
+    fn matches_markdownlints_error_range() {
+        let cases: &[Case] = &[
+            ("one tab at line start", "\ta\n", &[(1, 1, 1)]),
+            (
+                "a run of five tabs at line start",
+                "\t\t\t\t\t<td>No</td>\n",
+                &[(1, 1, 5)],
+            ),
+            ("two runs on a line", "a\tb\t\tc\n", &[(1, 2, 1), (1, 4, 2)]),
+            ("a tab mid-line", "ab\tcd\n", &[(1, 3, 1)]),
+            ("tabs inside a fence", "```\n\tx\n```\n", &[(2, 1, 1)]),
+        ];
+        for &(name, source, expected) in cases {
+            assert_eq!(expected, ranges(source).as_slice(), "{name}");
+        }
     }
 
     #[test]

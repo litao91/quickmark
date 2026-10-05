@@ -148,6 +148,25 @@ pub(crate) struct Label {
     pub to: usize,
 }
 
+/// Where a `list_marker_*` node's glyph starts and how many bytes it covers.
+///
+/// The node spans the whole prefix — indentation, glyph and the whitespace after it — because
+/// [`crate::rules::md023`] needs its end to be the item's content column. micromark's
+/// `listItemMarker` is only the glyph, so a rule that reports on the marker itself has to narrow it.
+/// The width comes from the node's kind rather than from trimming its text: a tab after the marker
+/// makes the span reach *past* the content, so the text holds more than the prefix.
+pub(crate) fn marker_glyph(marker: crate::ast::Node, text: &str) -> (usize, usize) {
+    let trimmed = text.trim_start();
+    let start = marker.start_position().column + (text.len() - trimmed.len());
+    let len = match marker.kind() {
+        "list_marker_dot" | "list_marker_parenthesis" => {
+            trimmed.bytes().take_while(u8::is_ascii_digit).count() + 1
+        }
+        _ => 1,
+    };
+    (start, len)
+}
+
 /// The label of a link or image — what sits between the `[` the node starts at and its matching `]`.
 /// Counted rather than taken from the node's children, because a label of nothing but whitespace has
 /// no children and one holding a code span has several.

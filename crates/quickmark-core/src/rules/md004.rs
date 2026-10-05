@@ -6,7 +6,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    rules::{marker_glyph, Context, Rule, RuleLinter, RuleType},
 };
 
 // MD004-specific configuration types
@@ -140,9 +140,10 @@ impl MD004Linter {
         // Extract marker information immediately to avoid lifetime issues
         let marker_info: Vec<(crate::ast::NodeRange, char)> = {
             let markers = self.find_list_item_markers(node);
+            let document_content = self.context.document_content.borrow();
             markers
                 .into_iter()
-                .map(|(node, marker)| (node.range(), marker))
+                .map(|(node, marker)| (glyph_range(node, &document_content), marker))
                 .collect()
         };
 
@@ -260,6 +261,20 @@ impl MD004Linter {
         }
         false
     }
+}
+
+/// A `list_marker_*` node narrowed to its glyph, which is micromark's `listItemMarker` and so what
+/// markdownlint underlines. The node itself spans the whole prefix — indentation, glyph and the
+/// whitespace after it.
+fn glyph_range(node: Node, source: &str) -> crate::ast::NodeRange {
+    let mut range = node.range();
+    let Ok(text) = node.utf8_text(source.as_bytes()) else {
+        return range;
+    };
+    let (start, len) = marker_glyph(node, text);
+    range.start_point.column = start;
+    range.end_point.column = start + len;
+    range
 }
 
 pub const MD004: Rule = Rule {
@@ -565,6 +580,52 @@ mod test {
         let mut linter = MultiRuleLinter::new_for_document(PathBuf::from("test.md"), config, input);
         let violations = linter.analyze();
         assert_eq!(0, violations.len());
+    }
+
+    /// A case's name, its document, and the `(line, column, width)` of each report, all 1-based.
+    type RangeCase = (&'static str, &'static str, &'static [(usize, usize, usize)]);
+
+    fn ranges(input: &str) -> Vec<(usize, usize, usize)> {
+        let mut linter =
+            MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+        linter
+            .analyze()
+            .iter()
+            .map(|violation| {
+                let range = &violation.location().range;
+                (
+                    range.start.line + 1,
+                    range.start.character + 1,
+                    range.end.character - range.start.character,
+                )
+            })
+            .collect()
+    }
+
+    /// markdownlint underlines micromark's `listItemMarker` — the glyph alone, one column wide, at
+    /// the glyph's own column. The facade's `list_marker_*` node spans the whole prefix instead,
+    /// because MD023 needs its end to be the item's content column.
+    /// Every tuple is markdownlint v0.41.1's `errorRange`, read back through its `lintSync` API.
+    #[test]
+    fn matches_markdownlints_error_range() {
+        let cases: &[RangeCase] = &[
+            ("a plus after a dash", "- a\n+ b\n", &[(2, 1, 1)]),
+            (
+                "an indented plus after a dash",
+                "- a\n  + b\n",
+                &[(2, 3, 1)],
+            ),
+            ("a nested plus", "* a\n  + b\n", &[(2, 3, 1)]),
+            ("an ordered marker is not this rule's", "- a\n\n1. b\n", &[]),
+            (
+                "two wrong markers",
+                "* a\n+ b\n- c\n",
+                &[(2, 1, 1), (3, 1, 1)],
+            ),
+        ];
+        for &(name, source, expected) in cases {
+            assert_eq!(expected, ranges(source).as_slice(), "{name}");
+        }
     }
 
     #[test]
