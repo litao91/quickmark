@@ -860,6 +860,63 @@ const CASES: &[(&str, &str, &str)] = &[
 "#,
     ),
     (
+        // comrak does not split a cell on `\\|`, where markdownlint and `synth::table_rows` both
+        // read the backslash as escaped and the pipe as a real delimiter. The synthesized cells are
+        // right, so comrak's one cell is grafted onto the first of them and its `inline` runs past
+        // that cell's end, leaving the second with none. Measured unobservable: a ten-probe sweep
+        // with every rule but MD013 enabled agrees with markdownlint on all 24 reports, because the
+        // over-long inline still holds every child at its real position.
+        "an escaped backslash before a real table delimiter",
+        "| a | b |\n| - | - |\n| m \\\\| `c` | q |\n",
+        r#"(document 0:0-3:0 0-38
+  (section 0:0-3:0 0-38
+    (pipe_table 0:0-3:0 0-38
+      (pipe_table_header 0:0-0:9 0-9
+        (| 0:0-0:1 0-1)
+        (pipe_table_cell 0:2-0:4 2-4
+          (inline 0:2-0:3 2-3
+            (text 0:2-0:3 2-3)
+          )
+        )
+        (| 0:4-0:5 4-5)
+        (pipe_table_cell 0:6-0:8 6-8
+          (inline 0:6-0:7 6-7
+            (text 0:6-0:7 6-7)
+          )
+        )
+        (| 0:8-0:9 8-9)
+      )
+      (pipe_table_delimiter_row 1:0-1:9 10-19
+        (| 1:0-1:1 10-11)
+        (pipe_table_delimiter_cell 1:2-1:3 12-13)
+        (| 1:4-1:5 14-15)
+        (pipe_table_delimiter_cell 1:6-1:7 16-17)
+        (| 1:8-1:9 18-19)
+      )
+      (pipe_table_row 2:0-2:17 20-37
+        (| 2:0-2:1 20-21)
+        (pipe_table_cell 2:2-2:6 22-26
+          (inline 2:2-2:11 22-31
+            (text 2:2-2:8 22-28)
+            (code_span 2:8-2:11 28-31)
+          )
+        )
+        (| 2:6-2:7 26-27)
+        (pipe_table_cell 2:8-2:12 28-32)
+        (| 2:12-2:13 32-33)
+        (pipe_table_cell 2:14-2:16 34-36
+          (inline 2:14-2:15 34-35
+            (text 2:14-2:15 34-35)
+          )
+        )
+        (| 2:16-2:17 36-37)
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
         // micromark leaves its `interrupt` flag set after an indented code block, so an ordered
         // marker other than `1` starts no list there and the line is paragraph text. The inline
         // children survive the rewrite; only the `2. ` marker, which is literal text to micromark,

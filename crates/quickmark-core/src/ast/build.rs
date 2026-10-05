@@ -181,14 +181,19 @@ impl CellColumns {
         let mut at = base as usize;
         let mut escaped = false;
         while at < end as usize && at < text.len() {
-            // The second byte of a collapse belongs to the character before it, so it gets no entry.
-            if escaped && text[at] == b'|' {
+            let byte = text[at];
+            if escaped {
                 escaped = false;
-                at += 1;
-                continue;
+                // The second byte of a collapse belongs to the character before it, so it gets no
+                // entry of its own.
+                if byte == b'|' {
+                    at += 1;
+                    continue;
+                }
+            } else if byte == b'\\' {
+                escaped = true;
             }
             real.push(at as u32);
-            escaped = text[at] == b'\\';
             at += 1;
         }
         real.push(at as u32);
