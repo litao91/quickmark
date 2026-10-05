@@ -5,7 +5,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{Context, Rule, RuleLinter, RuleType},
+    rules::{marker_glyph, Context, Rule, RuleLinter, RuleType},
 };
 
 // MD030-specific configuration types
@@ -127,19 +127,7 @@ impl MD030Linter {
         let Ok(text) = marker.utf8_text(document_content.as_bytes()) else {
             return;
         };
-        // The first item of a list absorbs the list's own indentation into its marker node, so the
-        // glyph's column is not always the marker node's.
-        let trimmed = text.trim_start();
-        let start = marker.start_position().column + (text.len() - trimmed.len());
-        // The glyph's length comes from the marker's kind, not from the node's span: a tab after the
-        // marker makes comrak's span reach past the content, and trimming it would count the tab and
-        // the content as part of the glyph.
-        let glyph_len = match marker.kind() {
-            "list_marker_dot" | "list_marker_parenthesis" => {
-                trimmed.bytes().take_while(u8::is_ascii_digit).count() + 1
-            }
-            _ => 1,
-        };
+        let (start, glyph_len) = marker_glyph(*marker, text);
         let content_column = content.start_position().column;
         // micromark stops a prefix at four spaces after the marker; past that the item's content is
         // indented code starting one space in. comrak's tree already says so, which is what makes
