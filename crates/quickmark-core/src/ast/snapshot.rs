@@ -966,6 +966,84 @@ const CASES: &[(&str, &str, &str)] = &[
 )
 "#,
     ),
+    (
+        // MD030 reads a list's line count, so the shapes that decide it are worth pinning: comrak
+        // folds trailing blank lines into the last item, which micromark's `list.endLine` does not.
+        "trailing blank lines inside a list",
+        "-  a\n-  b\n\n\ntext\n",
+        r#"(document 0:0-5:0 0-17
+  (section 0:0-5:0 0-17
+    (list 0:0-4:0 0-12
+      (list_item 0:0-1:0 0-5
+        (list_marker_minus 0:0-0:3 0-3)
+        (paragraph 0:3-1:0 3-5
+          (inline 0:3-0:4 3-4
+            (text 0:3-0:4 3-4)
+          )
+        )
+      )
+      (list_item 1:0-4:0 5-12
+        (list_marker_minus 1:0-1:3 5-8)
+        (paragraph 1:3-2:0 8-10
+          (inline 1:3-1:4 8-9
+            (text 1:3-1:4 8-9)
+          )
+        )
+      )
+    )
+    (paragraph 4:0-5:0 12-17
+      (inline 4:0-4:4 12-16
+        (text 4:0-4:4 12-16)
+      )
+    )
+  )
+)
+"#,
+    ),
+    (
+        // The first item of a list absorbs the list's own indentation into its marker node, while a
+        // later item's marker starts at the glyph. Five spaces after a marker push the content out to
+        // indented code, which is how micromark's four-space prefix cap reaches MD030.
+        "marker nodes for indented and over-padded items",
+        "  - text\n   -  text\n-     text\n1)  x\n",
+        r#"(document 0:0-4:0 0-37
+  (section 0:0-4:0 0-37
+    (list 0:0-3:0 0-31
+      (list_item 0:0-1:3 0-12
+        (list_marker_minus 0:0-0:4 0-4)
+        (paragraph 0:4-1:0 4-9
+          (inline 0:4-0:8 4-8
+            (text 0:4-0:8 4-8)
+          )
+        )
+      )
+      (list_item 1:3-2:0 12-20
+        (list_marker_minus 1:3-1:6 12-15)
+        (paragraph 1:6-2:0 15-20
+          (inline 1:6-1:10 15-19
+            (text 1:6-1:10 15-19)
+          )
+        )
+      )
+      (list_item 2:0-3:0 20-31
+        (list_marker_minus 2:0-2:2 20-22)
+        (indented_code_block 2:2-3:0 22-31)
+      )
+    )
+    (list 3:0-4:0 31-37
+      (list_item 3:0-4:0 31-37
+        (list_marker_parenthesis 3:0-3:4 31-35)
+        (paragraph 3:4-4:0 35-37
+          (inline 3:4-3:5 35-36
+            (text 3:4-3:5 35-36)
+          )
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
 ];
 
 #[test]
