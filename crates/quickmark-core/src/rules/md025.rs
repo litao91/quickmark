@@ -5,7 +5,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{ellipsify, Rule, RuleType},
+    rules::{ellipsify, heading_text_span, one_line, Rule, RuleType},
 };
 
 // MD025-specific configuration types
@@ -77,25 +77,10 @@ impl MD025Linter {
 
     fn extract_heading_content(&self, node: &Node) -> String {
         let source = self.context.get_document_content();
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let full_text = &source[start_byte..end_byte];
-
-        match node.kind() {
-            "atx_heading" => full_text
-                .trim_start_matches('#')
-                .trim()
-                .trim_end_matches('#')
-                .trim()
-                .to_string(),
-            "setext_heading" => {
-                if let Some(line) = full_text.lines().next() {
-                    line.trim().to_string()
-                } else {
-                    String::new()
-                }
-            }
-            _ => String::new(),
+        match heading_text_span(*node) {
+            // markdownlint turns every line break in a heading into a space before it quotes it.
+            Some((start, end)) => one_line(&source[start..end]),
+            None => String::new(),
         }
     }
 
@@ -310,6 +295,74 @@ mod test {
                 ..Default::default()
             },
         )
+    }
+
+    /// markdownlint quotes `getHeadingText` — the heading's own text, with any closing `#` sequence
+    /// and any container prefix gone. Slicing the heading node's range instead picks up the next
+    /// line's `>` for a heading inside a block quote, because comrak ends that node past its own line.
+    /// Every expectation is markdownlint v0.41.1's `errorContext` via `lintSync`.
+    #[test]
+    fn the_context_is_the_heading_text_alone() {
+        fn contexts(input: &str) -> Vec<String> {
+            let mut linter = MultiRuleLinter::new_for_document(
+                PathBuf::from("test.md"),
+                test_config(1, ""),
+                input,
+            );
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD025")
+                .map(|v| {
+                    v.message()
+                        .split_once("[Context: \"")
+                        .and_then(|(_, rest)| rest.strip_suffix("\"]"))
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("two top level headings", "# One\n\n# Two\n", &["Two"]),
+            (
+                "a heading then a quoted one",
+                "# One\n\n> # Two\n>\n",
+                &["Two"],
+            ),
+            (
+                "a heading then two quoted ones",
+                "# One\n\n> # Two\n>\n> # Three\n",
+                &["Two", "Three"],
+            ),
+            (
+                "a quoted heading after prose",
+                "# One\n\ntext\n\n> # Two\n",
+                &["Two"],
+            ),
+            ("a closed atx heading", "# One\n\n# Two ##\n", &["Two"]),
+            ("a setext heading", "One\n===\n\nTwo\n===\n", &["Two"]),
+            (
+                "a two line setext heading",
+                "One\ntwo\n===\n\nThree\n===\n",
+                &["Three"],
+            ),
+            // A heading's line breaks become spaces, which is what `one_line` does to the inline
+            // child's text.
+            (
+                "a duplicate two line setext heading",
+                "One\ntwo\n===\n\nOne\ntwo\n===\n",
+                &["One two"],
+            ),
+            (
+                "a duplicate setext after an atx heading",
+                "# One two\n\nOne\ntwo\n===\n",
+                &["One two"],
+            ),
+        ];
+        for &(name, source, expected) in cases {
+            assert_eq!(expected, contexts(source).as_slice(), "{name}");
+        }
     }
 
     /// markdownlint gives this rule two names and a config may spell either, so both have to reach

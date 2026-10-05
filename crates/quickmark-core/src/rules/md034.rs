@@ -5,7 +5,7 @@ use linkify::{LinkFinder, LinkKind};
 
 use crate::{
     linter::{range_from_node_range, RuleViolation},
-    rules::{md037::is_escaped, Context, Rule, RuleLinter, RuleType},
+    rules::{ellipsify, md037::is_escaped, Context, Rule, RuleLinter, RuleType},
 };
 
 /// Inline subtrees to stay out of. micromark tokenizes a link or image label as a *label*, and does
@@ -146,7 +146,13 @@ impl MD034Linter {
         };
         self.violations.push(RuleViolation::new(
             &MD034,
-            format!("{} [Context: \"{}\"]", MD034.description, url),
+            // markdownlint reaches this through `addErrorContext`, which ellipsifies at 30
+            // characters; the plain `addError` that MD037, MD051 and MD052 use does not.
+            format!(
+                "{} [Context: \"{}\"]",
+                MD034.description,
+                ellipsify(url, false, false)
+            ),
             self.context.file_path.clone(),
             range_from_node_range(&range),
         ));
@@ -673,6 +679,44 @@ mod test {
         assert_eq!(vec![(1, 5, 15)], urls("see https://x.org/a;\\\nmore\n"));
         // markdownlint: [(1, 17, 15)]
         assert_eq!(vec![(1, 17, 13)], urls("see $(a $b curl https://x.com$c\n"));
+    }
+
+    /// markdownlint reports MD034 through `addErrorContext`, which ellipsifies at thirty characters.
+    /// Every expectation is markdownlint v0.41.1's `errorContext` via `lintSync`.
+    #[test]
+    fn a_long_url_is_ellipsified_in_the_context() {
+        fn contexts(input: &str) -> Vec<String> {
+            let mut linter =
+                MultiRuleLinter::new_for_document(PathBuf::from("test.md"), test_config(), input);
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD034")
+                .map(|v| {
+                    v.message()
+                        .split_once("[Context: \"")
+                        .and_then(|(_, rest)| rest.strip_suffix("\"]"))
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            vec!["https://example.com/abcdef"],
+            contexts("see https://example.com/abcdef\n"),
+            "a short url is quoted whole"
+        );
+        assert_eq!(
+            vec!["https://github.com/ClickHouse/..."],
+            contexts("see https://github.com/ClickHouse/ClickHouse/pull/65887\n"),
+            "a long url is cut at thirty"
+        );
+        assert_eq!(
+            vec!["https://github.com/ClickHouse/..."],
+            contexts("https://github.com/ClickHouse/ClickHouse/pull/65887\n"),
+            "and on its own line too"
+        );
     }
 
     #[test]

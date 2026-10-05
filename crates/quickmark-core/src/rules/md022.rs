@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::linter::{range_from_node_range, Context, RuleLinter, RuleViolation};
 
-use super::{ellipsify, is_blank_line, Rule, RuleType};
+use super::{is_blank_line, Rule, RuleType};
 
 // MD022-specific configuration types
 #[derive(Debug, PartialEq, Clone, Deserialize)]
@@ -185,7 +185,7 @@ impl MD022Linter {
                             MD022.description,
                             required_above,
                             actual_above,
-                            ellipsify(lines[actual_start_line].trim(), false, false)
+                            lines[actual_start_line].trim()
                         ),
                         self.context.file_path.clone(),
                         range_from_node_range(&node.range()),
@@ -231,7 +231,7 @@ impl MD022Linter {
                             MD022.description,
                             required_below,
                             actual_below,
-                            ellipsify(lines[actual_start_line].trim(), false, false)
+                            lines[actual_start_line].trim()
                         ),
                         self.context.file_path.clone(),
                         range_from_node_range(&node.range()),
@@ -303,6 +303,49 @@ mod test {
                 ..Default::default()
             },
         )
+    }
+
+    /// markdownlint reports MD022 through `addErrorDetailIf`, which passes its context straight to
+    /// `addError` — so unlike the rules that go through `addErrorContext`, a heading longer than
+    /// thirty characters is quoted whole. Every expectation is markdownlint v0.41.1's `errorContext`
+    /// read back through its `lintSync` API.
+    #[test]
+    fn the_context_is_not_ellipsified() {
+        fn contexts(input: &str) -> Vec<String> {
+            let mut linter = MultiRuleLinter::new_for_document(
+                PathBuf::from("test.md"),
+                test_config_with_blanks(MD022HeadingsBlanksTable::default()),
+                input,
+            );
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD022")
+                .map(|v| {
+                    v.message()
+                        .split_once("[Context: \"")
+                        .and_then(|(_, rest)| rest.strip_suffix("\"]"))
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            vec!["# abcdefghijklmnopqrstuvwxyz abc"],
+            contexts("# abcdefghijklmnopqrstuvwxyz abc\nnext\n"),
+            "exactly thirty characters"
+        );
+        assert_eq!(
+            vec!["# abcdefghijklmnopqrstuvwxyz abcd"],
+            contexts("# abcdefghijklmnopqrstuvwxyz abcd\nnext\n"),
+            "thirty one characters"
+        );
+        assert_eq!(
+            vec!["# abcdefghijklmnopqrstuvwxyz abcdef"],
+            contexts("# abcdefghijklmnopqrstuvwxyz abcdef\nnext\n"),
+            "thirty five characters"
+        );
     }
 
     #[test]

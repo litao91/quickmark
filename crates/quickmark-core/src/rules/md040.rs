@@ -36,31 +36,38 @@ impl MD040Linter {
     /// takes micromark's `codeFencedFenceInfo`, which stops at the first space and keeps everything
     /// else, so `` ```py{#id} `` specifies `py{#id}` and `` ```{.python .numberLines} `` specifies
     /// `{.python`. Cutting either at a `{` reads a language that is not there.
-    fn extract_code_block_language<'a>(&self, line: &'a str) -> (Option<&'a str>, bool) {
+    fn fence<'a>(&self, line: &'a str) -> Option<Fence<'a>> {
         // A fenced block inside a block quote or a list item opens on a line that starts with that
         // container's prefix, so `- ```sql` and `> ```java` need it skipped before the fence. The
         // indent limit is unlimited because the tree has already settled that this line opens a
         // fence: inside a list item the fence sits at the item's content column, which is further
         // right than the three spaces CommonMark allows at document level.
-        let content = &line[crate::ast::synth::content_column(line.as_bytes(), usize::MAX)..];
-        let bytes = content.as_bytes();
-        let Some(marker) = bytes.first().copied().filter(|&b| b == b'`' || b == b'~') else {
-            return (None, false);
-        };
+        let text = &line[crate::ast::synth::content_column(line.as_bytes(), usize::MAX)..];
+        let bytes = text.as_bytes();
+        let marker = bytes.first().copied().filter(|&b| b == b'`' || b == b'~')?;
 
         // The fence is the whole run, not the first three characters: ```` opens a four-backtick
         // fence whose info string starts after the fourth, and taking only three left a stray
         // backtick behind and read it as the language.
         let run = bytes.iter().take_while(|&&b| b == marker).count();
-        let info_string = content[run..].trim();
+        let info_string = text[run..].trim();
 
         let mut parts = info_string.split_whitespace();
-        match parts.next() {
-            // An empty info string has no first token, which is the missing language this reports.
-            None => (None, false),
-            Some(language) => (Some(language), parts.next().is_some()),
-        }
+        let language = parts.next();
+        Some(Fence {
+            text,
+            language,
+            has_extra_info: language.is_some() && parts.next().is_some(),
+        })
     }
+}
+
+/// What micromark's `codeFencedFence` token holds: the opening line with its container prefix
+/// stripped, trailing whitespace and all, plus the language and info-string split out of it.
+struct Fence<'a> {
+    text: &'a str,
+    language: Option<&'a str>,
+    has_extra_info: bool,
 }
 
 impl RuleLinter for MD040Linter {
@@ -90,8 +97,9 @@ impl RuleLinter for MD040Linter {
         if let Some(fenced_code_blocks) = node_cache.get("fenced_code_block") {
             for node_info in fenced_code_blocks {
                 if let Some(first_line) = lines.get(node_info.line_start) {
-                    let (language_opt, has_extra_info) =
-                        self.extract_code_block_language(first_line);
+                    let Some(fence) = self.fence(first_line) else {
+                        continue;
+                    };
 
                     let range = Range {
                         start: CharPosition {
@@ -104,7 +112,7 @@ impl RuleLinter for MD040Linter {
                         },
                     };
 
-                    let language = match language_opt {
+                    let language = match fence.language {
                         Some(lang) => lang,
                         None => {
                             self.violations.push(RuleViolation::new(
@@ -112,7 +120,7 @@ impl RuleLinter for MD040Linter {
                                 format!(
                                     "{} [Context: \"{}\"]",
                                     MD040.description,
-                                    ellipsify(first_line.trim(), false, false)
+                                    ellipsify(fence.text, false, false)
                                 ),
                                 self.context.file_path.clone(),
                                 range,
@@ -134,7 +142,7 @@ impl RuleLinter for MD040Linter {
                     }
 
                     // Check if language_only is true and there's extra metadata
-                    if config.language_only && has_extra_info {
+                    if config.language_only && fence.has_extra_info {
                         let range = Range {
                             start: CharPosition {
                                 line: node_info.line_start,
@@ -147,10 +155,11 @@ impl RuleLinter for MD040Linter {
                         };
                         let violation = RuleViolation::new(
                             &MD040,
+                            // markdownlint builds this one with `addError`, which does not
+                            // ellipsify, and quotes the whole fence line rather than a context.
                             format!(
                                 "{} [Info string contains more than language: \"{}\"]",
-                                MD040.description,
-                                first_line.trim()
+                                MD040.description, fence.text
                             ),
                             self.context.file_path.clone(),
                             range,
@@ -578,6 +587,69 @@ def hello():
         assert_eq!(vec![0], rows("> ```\n> x\n"));
         assert_eq!(vec![0], rows("- ```\n  x\n"));
         assert_eq!(vec![0], rows("   ```\n   x\n"));
+    }
+
+    /// markdownlint quotes micromark's `codeFencedFence` token, which is the fence line with its
+    /// container prefix stripped and its trailing whitespace kept — not the raw line, and not a
+    /// trimmed one. Every expectation is markdownlint v0.41.1's `errorContext` via `lintSync`.
+    #[test]
+    fn the_context_is_the_fence_without_its_container_prefix() {
+        fn contexts(input: &str) -> Vec<String> {
+            let mut linter = MultiRuleLinter::new_for_document(
+                PathBuf::from("test.md"),
+                test_config_default(),
+                input,
+            );
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD040")
+                .map(|v| {
+                    v.message()
+                        .split_once("[Context: \"")
+                        .and_then(|(_, rest)| rest.strip_suffix("\"]"))
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("a bare fence", "```\nx\n```\n", &["```"]),
+            (
+                "a fenced block in a block quote",
+                "> ```\n> x\n> ```\n",
+                &["```"],
+            ),
+            (
+                "a four backtick fence in a block quote",
+                "> ````\n> x\n> ````\n",
+                &["````"],
+            ),
+            (
+                "a fenced block in a list item",
+                "- ```\n  x\n- ```\n",
+                &["```", "```"],
+            ),
+            (
+                "a tilde fence in a block quote",
+                "> ~~~\n> x\n> ~~~\n",
+                &["~~~"],
+            ),
+            (
+                "a nested block quote",
+                "> > ```\n> > x\n> > ```\n",
+                &["```"],
+            ),
+            (
+                "trailing spaces after the fence",
+                "> ```   \n> x\n> ```\n",
+                &["```   "],
+            ),
+        ];
+        for &(name, source, expected) in cases {
+            assert_eq!(expected, contexts(source).as_slice(), "{name}");
+        }
     }
 
     /// The language is the info string's whole first token, so an allow-list has to name it whole

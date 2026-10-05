@@ -116,6 +116,39 @@ pub(crate) fn one_line(text: &str) -> String {
         .replace('\n', " ")
 }
 
+/// The byte span of a heading's own text, or `None` for a heading that has none (`##`).
+///
+/// markdownlint's `getHeadingText` reads the heading's text tokens, and the heading node's range is
+/// not a substitute for them. Inside a block quote comrak ends the node past its own line, so a slice
+/// of it picks up the next line's `>`; an ATX heading's range also covers its `#` run and any closing
+/// sequence. The synthesized `inline` child is exactly the text.
+pub(crate) fn heading_text_span(node: crate::ast::Node) -> Option<(usize, usize)> {
+    let mut cursor = node.walk();
+    let inline = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "inline")
+        .or_else(|| {
+            // A setext heading's text sits under the paragraph its underline converted.
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .find(|child| child.kind() == "paragraph")
+                .and_then(|paragraph| {
+                    let mut cursor = paragraph.walk();
+                    paragraph
+                        .children(&mut cursor)
+                        .find(|child| child.kind() == "inline")
+                })
+        })?;
+    Some((inline.start_byte(), inline.end_byte()))
+}
+
+/// Shorten a quoted context the way markdownlint's `ellipsify` does.
+///
+/// Only a rule that reports through `addErrorContext` gets this: that helper ellipsifies before it
+/// calls `addError`, while a rule calling `addError` or `addErrorDetailIf` passes its context
+/// through at full length. Getting it wrong in either direction is invisible to every gate except a
+/// byte-for-byte comparison of the printed message — MD034 was missing this and MD022 had it, on
+/// 1187 and 13 reports respectively.
 pub(crate) fn ellipsify(text: &str, start: bool, end: bool) -> String {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let chars: Vec<char> = text.chars().collect();

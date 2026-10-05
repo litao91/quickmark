@@ -1044,6 +1044,32 @@ const CASES: &[(&str, &str, &str)] = &[
 )
 "#,
     ),
+    (
+        // A heading inside a block quote ends past its own line — `atx_heading 0:2-1:1` reaches into
+        // row 1's `>` — so MD024 and MD025 take their quoted text from the `inline` child, which
+        // stops at the heading's own last character.
+        "a heading inside a block quote",
+        "> # Important Discovery!\n>\n> # Again\n",
+        r#"(document 0:0-3:0 0-37
+  (section 0:0-3:0 0-37
+    (block_quote 0:0-3:0 0-37
+      (atx_heading 0:2-1:1 2-26
+        (atx_h1_marker 0:2-0:3 2-3)
+        (inline 0:4-0:24 4-24
+          (text 0:4-0:24 4-24)
+        )
+      )
+      (atx_heading 2:2-3:0 29-37
+        (atx_h1_marker 2:2-2:3 29-30)
+        (inline 2:4-2:9 31-36
+          (text 2:4-2:9 31-36)
+        )
+      )
+    )
+  )
+)
+"#,
+    ),
 ];
 
 #[test]

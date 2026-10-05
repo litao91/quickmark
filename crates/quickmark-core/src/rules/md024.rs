@@ -5,7 +5,7 @@ use crate::ast::Node;
 
 use crate::{
     linter::{range_from_node_range, Context, RuleLinter, RuleViolation},
-    rules::{ellipsify, Rule, RuleType},
+    rules::{ellipsify, heading_text_span, Rule, RuleType},
 };
 
 // MD024-specific configuration types
@@ -41,35 +41,14 @@ impl MD024Linter {
     }
 
     fn extract_heading_content(&self, node: &Node) -> String {
-        // Extract text content from heading node
         let source = self.context.get_document_content();
-        let start_byte = node.start_byte();
-        let end_byte = node.end_byte();
-        let full_text = &source[start_byte..end_byte];
-
-        // Remove markdown syntax and trim
-        match node.kind() {
-            "atx_heading" => {
-                // Remove leading #s and trailing #s if present
-                let text = full_text
-                    .trim_start_matches('#')
-                    .trim()
-                    .trim_end_matches('#')
-                    .trim();
-                // Normalize whitespace: replace multiple spaces with single space
-                text.split_whitespace().collect::<Vec<_>>().join(" ")
-            }
-            "setext_heading" => {
-                // For setext, take first line (before underline)
-                if let Some(line) = full_text.lines().next() {
-                    let trimmed = line.trim();
-                    // Normalize whitespace: replace multiple spaces with single space
-                    trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
-                } else {
-                    String::new()
-                }
-            }
-            _ => String::new(),
+        match heading_text_span(*node) {
+            // Whitespace is collapsed because this text is a duplicate-detection key, not a quote.
+            Some((start, end)) => source[start..end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => String::new(),
         }
     }
 
@@ -206,6 +185,51 @@ mod test {
                 ..Default::default()
             },
         )
+    }
+
+    /// markdownlint quotes `getHeadingText` through `addErrorContext`, so a heading over thirty
+    /// characters is ellipsified and a heading inside a block quote carries no `>` — slicing the
+    /// heading node's range would give both, because comrak ends that node past its own line.
+    /// Every expectation is markdownlint v0.41.1's `errorContext` via `lintSync`.
+    #[test]
+    fn the_context_is_the_heading_text_alone() {
+        fn contexts(input: &str) -> Vec<String> {
+            let mut linter = MultiRuleLinter::new_for_document(
+                PathBuf::from("test.md"),
+                test_config(false, false),
+                input,
+            );
+            linter
+                .analyze()
+                .iter()
+                .filter(|v| v.rule().id == "MD024")
+                .map(|v| {
+                    v.message()
+                        .split_once("[Context: \"")
+                        .and_then(|(_, rest)| rest.strip_suffix("\"]"))
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        let long = "abcdefghijklmnopqrstuvwxyz abcdef";
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("a duplicate heading", "# One\n\n# One\n", &["One"]),
+            (
+                "a duplicate heading in a block quote",
+                "# One\n\n> # One\n",
+                &["One"],
+            ),
+            (
+                "a duplicate long heading",
+                &format!("# {long}\n\n# {long}\n"),
+                &["abcdefghijklmnopqrstuvwxyz abc..."],
+            ),
+        ];
+        for (name, source, expected) in cases {
+            assert_eq!(*expected, contexts(source).as_slice(), "{name}");
+        }
     }
 
     #[test]
